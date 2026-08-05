@@ -1,0 +1,23 @@
+{
+  "name": "@recon/cli",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "bin": { "recon": "./dist/index.js" },
+  "exports": { ".": "./src/index.ts" },
+  "scripts": {
+    "build": "vite build",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.0.0-alpha.4",
+    "@recon/recond": "workspace:*",
+    "@recon/shared": "workspace:*",
+    "incur": "0.4.26",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "vite": "8.1.5"
+  }
+}

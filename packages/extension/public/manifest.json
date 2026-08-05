@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "Recon Capture",
+  "version": "0.1.0",
+  "description": "Record authenticated dashboard traffic and relay tool calls from Claude.",
+  "minimum_chrome_version": "116",
+  "permissions": ["scripting", "storage", "alarms", "tabs", "webRequest", "notifications"],
+  "optional_permissions": ["debugger"],
+  "optional_host_permissions": ["https://*/*", "http://*/*"],
+  "host_permissions": [],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "icons": { "16": "icon16.png", "48": "icon48.png", "128": "icon128.png" },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Recon",
+    "default_icon": { "16": "icon16.png", "48": "icon48.png", "128": "icon128.png" }
+  }
+}

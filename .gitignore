@@ -1,0 +1,7 @@
+node_modules
+dist
+.recon
+*.log
+test-results
+playwright-report
+.DS_Store

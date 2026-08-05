@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Recon</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body {
+        width: 320px;
+        margin: 0;
+        padding: 12px;
+        font: 13px/1.4 system-ui, sans-serif;
+      }
+      h1 { font-size: 13px; margin: 0 0 8px; display: flex; justify-content: space-between; }
+      .dot { font-weight: 400; opacity: 0.7; }
+      label { display: block; margin: 8px 0 3px; font-size: 11px; opacity: 0.75; }
+      input, textarea, button { width: 100%; box-sizing: border-box; font: inherit; }
+      input, textarea { padding: 5px; border-radius: 5px; border: 1px solid rgba(128,128,128,0.5); background: transparent; color: inherit; }
+      button { padding: 6px; margin-top: 8px; border-radius: 5px; border: 0; background: #1f6feb; color: #fff; cursor: pointer; }
+      button.secondary { background: rgba(128,128,128,0.25); color: inherit; }
+      button:disabled { opacity: 0.5; cursor: default; }
+      .row { display: flex; gap: 8px; align-items: center; }
+      .row input[type='checkbox'] { width: auto; }
+      .count { font-size: 22px; font-weight: 600; }
+      .muted { opacity: 0.65; font-size: 11px; word-break: break-all; }
+      .error { color: #d1242f; font-size: 11px; margin-top: 6px; }
+      details { margin-top: 10px; }
+      summary { cursor: pointer; font-size: 11px; opacity: 0.75; }
+      hr { border: 0; border-top: 1px solid rgba(128,128,128,0.3); margin: 10px 0; }
+    </style>
+  </head>
+  <body>
+    <h1>Recon <span class="dot" id="connection">…</span></h1>
+
+    <section id="idle" hidden>
+      <label for="name">Session name</label>
+      <input id="name" placeholder="orders" autocomplete="off" />
+      <div class="muted" id="origin"></div>
+      <div class="row"><input type="checkbox" id="use-debugger" /><label for="use-debugger" style="margin:8px 0 0">Debugger capture (shows a browser banner)</label></div>
+      <button id="start">Start recording</button>
+    </section>
+
+    <section id="active" hidden>
+      <div class="muted" id="session-name"></div>
+      <div class="count"><span id="count">0</span> <span class="muted">exchanges</span></div>
+      <label for="note">Note for exchanges since the last note</label>
+      <textarea id="note" rows="2" placeholder="transitions an issue to done"></textarea>
+      <button class="secondary" id="annotate">Attach note</button>
+      <button id="stop">Stop recording</button>
+    </section>
+
+    <p class="error" id="error" hidden></p>
+
+    <details>
+      <summary>Daemon connection</summary>
+      <label for="port">Port</label>
+      <input id="port" type="number" inputmode="numeric" />
+      <label for="token">Install token (~/.recon/token)</label>
+      <input id="token" type="password" autocomplete="off" />
+      <button class="secondary" id="save">Save</button>
+    </details>
+
+    <details>
+      <summary>Noise list additions</summary>
+      <label for="noise">Extra hosts to exclude, one per line. Applies to the next session.</label>
+      <textarea id="noise" rows="3" placeholder="metrics.internal.example"></textarea>
+      <button class="secondary" id="save-noise">Save noise list</button>
+    </details>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

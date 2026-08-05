@@ -1,0 +1,18 @@
+{
+  "name": "@recon/extension",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "vite build",
+    "test": "vitest run",
+    "smoke": "node smoke.mjs"
+  },
+  "dependencies": {
+    "@recon/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/chrome": "0.2.2",
+    "vite": "8.1.5"
+  }
+}

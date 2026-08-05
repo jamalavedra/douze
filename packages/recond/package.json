@@ -1,0 +1,22 @@
+{
+  "name": "@recon/recond",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "exports": { ".": "./src/index.ts" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@recon/shared": "workspace:*",
+    "chokidar": "5.0.0",
+    "hono": "4.12.32",
+    "ws": "8.18.3",
+    "yaml": "2.9.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/ws": "8.18.1"
+  }
+}
