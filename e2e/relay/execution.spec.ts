@@ -100,7 +100,7 @@ test.describe('COV_EXE_001: Browser relay', () => {
 
   test.afterEach(async () => {
     await browser?.dispose()
-    douzed?.stop()
+    await douzed?.stop()
     await app?.stop()
   })
 
@@ -121,7 +121,7 @@ test.describe('COV_EXE_001: Browser relay', () => {
     const log = await app.log()
     const relayed = log.find((r) => r.path === '/api/orders' && r.method === 'GET')
     expect(relayed).toBeTruthy()
-    expect(relayed!.headers.cookie).toContain('fixture_session=s3ssion-fixture-value')
+    expect(relayed!.headers['cookie']).toContain('fixture_session=s3ssion-fixture-value')
   })
 
   test('@COV_EXE_001.2 should carry a page-state credential when the recipe declares one', async () => {
@@ -135,7 +135,7 @@ test.describe('COV_EXE_001: Browser relay', () => {
     const relayed = log.find((r) => r.path === '/api/orders' && r.method === 'GET')
     expect(relayed).toBeTruthy()
     // Both the bearer token and the CSRF header were read from page state and attached.
-    expect(relayed!.headers.authorization).toBe('Bearer page-state-bearer-token-value')
+    expect(relayed!.headers['authorization']).toBe('Bearer page-state-bearer-token-value')
     expect(relayed!.headers['x-csrf-token']).toBe('csrf-fixture-value')
 
     // AC-EXE-001.3 / TR-6 — neither value was persisted anywhere.

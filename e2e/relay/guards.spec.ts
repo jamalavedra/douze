@@ -59,7 +59,7 @@ test.describe('COV_EXE_003: Call guards', () => {
   })
 
   test.afterEach(async () => {
-    douzed.stop()
+    await douzed.stop()
     await app.stop()
   })
 

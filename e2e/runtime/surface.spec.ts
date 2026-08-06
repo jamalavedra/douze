@@ -107,7 +107,7 @@ test.describe('COV_RUN_004: Result shaping', () => {
 
   test.afterAll(async () => {
     await browser?.dispose()
-    douzed?.stop()
+    await douzed?.stop()
     await app?.stop()
   })
 

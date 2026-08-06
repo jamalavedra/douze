@@ -88,9 +88,9 @@ test.describe('COV_REC_002: Promotion gating and live propagation', () => {
     await client.initialize()
   })
 
-  test.afterEach(() => {
+  test.afterEach(async () => {
     client.kill()
-    douzed.stop()
+    await douzed.stop()
   })
 
   test('@COV_REC_002.3 should reach a running client without a restart', async () => {

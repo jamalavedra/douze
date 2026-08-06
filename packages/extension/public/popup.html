@@ -106,11 +106,13 @@
       <section id="watching" hidden>
         <h1 id="watching-name"></h1>
         <p class="live">Recording</p>
-        <p class="count" id="count"></p>
+        <!-- The count is the only thing that moves while recording, so it is the only thing a
+             screen-reader user has to tell them Douze is still watching. -->
+        <p class="count" id="count" aria-live="polite"></p>
         <label for="note">What did you just do?</label>
         <textarea id="note" rows="2" placeholder="moved a task to Done"></textarea>
         <button class="quiet" id="add-note">Add note</button>
-        <p class="note" id="noted" hidden>Noted.</p>
+        <p class="note" id="noted" role="status" hidden>Noted.</p>
         <button class="primary" id="done">Done</button>
       </section>
 

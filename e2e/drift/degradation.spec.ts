@@ -161,7 +161,7 @@ test.describe('COV_DRF_002: Degradation propagation', () => {
   test.afterEach(async () => {
     client?.kill()
     await browser?.dispose()
-    douzed?.stop()
+    await douzed?.stop()
     await app?.stop()
   })
 

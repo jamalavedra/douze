@@ -27,7 +27,7 @@ test.describe('COV_RUN_003: Daemon lifecycle', () => {
     const listeners = execFileSync('bash', ['-c', `lsof -nP -iTCP:${douzed.port} -sTCP:LISTEN | tail -n +2 | wc -l`])
     expect(Number(String(listeners).trim())).toBe(1)
 
-    douzed.stop()
+    await douzed.stop()
   })
 
   test('@COV_RUN_003.2 should auto-start from a client and survive a restart', async () => {
@@ -42,7 +42,10 @@ test.describe('COV_RUN_003: Daemon lifecycle', () => {
     const cli = (args: string[]) =>
       new Promise<{ code: number; out: string }>((resolve) => {
         const child = spawn(TSX, [join(REPO, 'packages/cli/src/bin.ts'), ...args], {
-          env: { ...process.env, DOUZE_HOME: home, DOUZE_START_TIMEOUT_MS: '120000' },
+          // DOUZE_PORT=0 for the same reason the harness sets it: this spec auto-starts real
+          // daemons, and one that outlives the run would otherwise squat 8787 — the port the
+          // shipped extension probes first — for every later spec and for the developer.
+          env: { ...process.env, DOUZE_HOME: home, DOUZE_START_TIMEOUT_MS: '120000', DOUZE_PORT: '0' },
         })
         let out = ''
         child.stdout.on('data', (c) => (out += String(c)))
@@ -85,6 +88,6 @@ test.describe('COV_RUN_003: Daemon lifecycle', () => {
     } catch {
       // already gone
     }
-    douzed.stop()
+    await douzed.stop()
   })
 })

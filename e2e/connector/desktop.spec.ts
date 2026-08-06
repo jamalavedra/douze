@@ -194,7 +194,7 @@ test.describe('COV_CON_001: Claude Desktop connector', () => {
   test.afterAll(async () => {
     client?.kill()
     await browser?.dispose()
-    douzed?.stop()
+    await douzed?.stop()
     await app?.stop()
   })
 

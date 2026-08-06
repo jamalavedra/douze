@@ -37,7 +37,7 @@ test.describe('COV_CAP_007: Usage annotation', () => {
 
   test.afterEach(async () => {
     await browser.dispose()
-    douzed.stop()
+    await douzed.stop()
     await app.stop()
   })
 
@@ -117,7 +117,9 @@ test.describe('COV_CAP_007: Usage annotation', () => {
     // AC-CAP-007.3 / .5 — and the span reaches the candidates, which is the point of recording it.
     const candidates = infer({
       exchanges: exchanges as InferenceInput['exchanges'],
-      annotations: annotations as InferenceInput['annotations'],
+      // NonNullable: the property is optional, and exactOptionalPropertyTypes refuses the
+      // `| undefined` that indexing an optional property hands back.
+      annotations: annotations as NonNullable<InferenceInput['annotations']>,
     })
     const created = candidates.find((c) => c.tool.request.method === 'POST' && c.tool.request.path === '/api/orders')
     const listed = candidates.find((c) => c.tool.request.method === 'GET' && c.tool.request.path === '/api/orders')

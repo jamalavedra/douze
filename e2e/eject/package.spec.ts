@@ -120,7 +120,7 @@ test.describe('COV_EJT_001: Standalone package emission', () => {
 
   test.afterAll(async () => {
     await browser?.dispose()
-    douzed?.stop()
+    await douzed?.stop()
     await app?.stop()
     rmSync(EJECT_ROOT, { recursive: true, force: true })
   })

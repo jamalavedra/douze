@@ -188,7 +188,7 @@ test.describe('COV_DRF_001: Doctor runs', () => {
 
   test.afterEach(async () => {
     await browser?.dispose()
-    douzed?.stop()
+    await douzed?.stop()
     await app?.stop()
   })
 

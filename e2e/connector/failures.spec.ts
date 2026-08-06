@@ -44,7 +44,7 @@ test.describe('COV_CON_004: Legible failure', () => {
 
   test.afterEach(async () => {
     await browser?.dispose()
-    douzed?.stop()
+    await douzed?.stop()
     await app?.stop()
   })
 

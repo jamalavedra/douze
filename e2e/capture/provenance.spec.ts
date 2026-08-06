@@ -34,7 +34,7 @@ test.describe('COV_CAP_003: Provenance attribution', () => {
 
   test.afterEach(async () => {
     await browser.dispose()
-    douzed.stop()
+    await douzed.stop()
     await app.stop()
   })
 

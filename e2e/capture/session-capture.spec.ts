@@ -33,7 +33,7 @@ test.describe('COV_CAP_001: Scoped session capture with bodies', () => {
 
   test.afterEach(async () => {
     await browser.dispose()
-    douzed.stop()
+    await douzed.stop()
     await app.stop()
   })
 

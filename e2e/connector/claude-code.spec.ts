@@ -172,7 +172,7 @@ test.describe('COV_CON_002: Claude Code registration', () => {
       expect(listed).toContain('douze')
       expect(listed).toMatch(/douze:.*Connected/)
     } finally {
-      douzed.stop()
+      await douzed.stop()
     }
   })
 })
@@ -273,7 +273,7 @@ test.describe('COV_CON_003: Long-running calls', () => {
   test.afterAll(async () => {
     client?.kill()
     await browser?.dispose()
-    douzed?.stop()
+    await douzed?.stop()
     await app?.stop()
   })
 

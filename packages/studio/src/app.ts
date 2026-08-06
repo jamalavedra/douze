@@ -20,8 +20,12 @@ ${STYLE}
 </style>
 </head>
 <body>
-<h1 id="title">What Claude can do</h1>
-<p class="sub" id="sub">Working out what this site can do&hellip;</p>
+<!-- Both lines are rewritten in place when the list loads and again after saving, and that
+     rewrite IS the confirmation the save worked — so it has to be announced, not just shown. -->
+<div aria-live="polite">
+  <h1 id="title">What Claude can do</h1>
+  <p class="sub" id="sub">Working out what this site can do&hellip;</p>
+</div>
 <ul id="list"></ul>
 <div class="actions" id="actions" hidden>
   <button type="button" class="primary" id="go" disabled>Nothing selected</button>

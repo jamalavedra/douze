@@ -136,7 +136,11 @@ export class Douzed {
 
   async start(): Promise<void> {
     this.process = spawn(TSX, [join(REPO, 'packages/douzed/src/bin.ts')], {
-      env: { ...process.env, DOUZE_HOME: this.home },
+      // DOUZE_PORT=0 keeps specs off the 8787-8791 range the shipped daemon walks. Without it
+      // every scratch daemon — including the detached ones a client auto-starts, which inherit
+      // this env — competes for 8787 with each other and with whatever is really running on the
+      // developer's machine. The harness reads the port back from the runtime file regardless.
+      env: { ...process.env, DOUZE_HOME: this.home, DOUZE_PORT: '0' },
       stdio: 'inherit',
     })
     await waitFor(async () => {
@@ -164,9 +168,43 @@ export class Douzed {
     })
   }
 
-  stop(): void {
-    this.process?.kill()
+  /**
+   * Awaited, like the fixture's: douzed now walks a fixed port range rather than taking an
+   * ephemeral port, so a daemon still shutting down squats a port every later spec needs, and
+   * five leaked ones fill the range outright.
+   *
+   * The detached kill is the load-bearing half. A client that auto-starts douzed spawns it
+   * `detached` and unref'd (see DaemonClient.startDetached), so it is not `this.process` and
+   * survives the kill below — the runtime file it wrote is the only handle anyone has on it.
+   */
+  async stop(): Promise<void> {
+    const detached = (await this.runtime())?.pid
+    if (this.process) {
+      const exited = new Promise<void>((resolve) => this.process?.once('exit', () => resolve()))
+      this.process.kill()
+      await exited
+      this.process = undefined as never
+    }
+    if (detached !== undefined && detached !== process.pid) await reap(detached)
     rmSync(this.home, { recursive: true, force: true })
+  }
+}
+
+/** SIGTERM and then wait for the pid to actually go, so its port is free for the next spec. */
+async function reap(pid: number, timeoutMs = 5_000): Promise<void> {
+  try {
+    process.kill(pid, 'SIGTERM')
+  } catch {
+    return // already gone
+  }
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0)
+    } catch {
+      return
+    }
+    await new Promise((r) => setTimeout(r, 50))
   }
 }
 
