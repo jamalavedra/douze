@@ -1,4 +1,4 @@
-import type { CredentialSource, RelayRequest, RelayResponse } from '@recon/shared'
+import type { CredentialSource, RelayRequest, RelayResponse } from '@douze/shared'
 
 /**
  * ADR-004 / REQ-EXE-001 — execute through the browser instead of extracting credentials.
@@ -167,10 +167,18 @@ const parseBody = (text: string, contentType: string | undefined): unknown => {
   return text
 }
 
-async function findTab(origin: string): Promise<chrome.tabs.Tab | undefined> {
+/**
+ * The Executor Tab must not be the tab currently being recorded. A relayed request issued there
+ * is observed by the webRequest oracle and ingested as a captured exchange, so Douze would infer
+ * candidates from its own replays — and a `doctor` run mid-recording would poison the very
+ * session it is meant to validate. Any other tab on the origin will do; if there is none, the
+ * caller opens a dedicated one.
+ */
+async function findTab(origin: string, excludeTabId?: number): Promise<chrome.tabs.Tab | undefined> {
   const tabs = await chrome.tabs.query({})
   return tabs.find((tab) => {
     if (!tab.url || tab.id === undefined) return false
+    if (excludeTabId !== undefined && tab.id === excludeTabId) return false
     try {
       return new URL(tab.url).origin === origin
     } catch {
@@ -201,6 +209,8 @@ async function openExecutorTab(origin: string): Promise<chrome.tabs.Tab> {
 export interface RelayDeps {
   /** AC-EXE-002.3 — surface an expired session with a link to the target's login page. */
   notifyExpired: (origin: string, loginUrl: string) => void
+  /** The tab being recorded, if any. Never used as an Executor Tab — see findTab. */
+  recordingTabId?: number | undefined
 }
 
 /** REQ-EXE-001 — runs one relayed request and shapes the protocol response. */
@@ -215,7 +225,7 @@ export async function executeRelay(request: RelayRequest, deps: RelayDeps): Prom
     redirected_to_login: false,
   })
 
-  let tab = await findTab(request.origin)
+  let tab = await findTab(request.origin, deps.recordingTabId)
   let ephemeral = false
   if (!tab) {
     try {

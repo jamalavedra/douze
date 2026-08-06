@@ -54,19 +54,19 @@ export interface GestureEvent {
 export type PageEvent = RequestEvent | ResponseEvent | FailureEvent | GestureEvent
 
 export interface CaptureBatch {
-  type: 'recon:capture'
+  type: 'douze:capture'
   frameUrl: string
   batch: PageEvent[]
 }
 
 /** Popup → service worker. */
 export type PopupCommand =
-  | { type: 'recon:start'; name: string; origins: string[]; tabId?: number; useDebugger: boolean }
-  | { type: 'recon:stop' }
-  | { type: 'recon:annotate'; note: string }
-  | { type: 'recon:status' }
+  | { type: 'douze:start'; name: string; origins: string[]; tabId?: number; useDebugger: boolean }
+  | { type: 'douze:stop' }
+  | { type: 'douze:annotate'; note: string }
+  | { type: 'douze:status' }
   /** AC-CAP-004.3 — additions to the bundled noise list, applied to subsequent sessions. */
-  | { type: 'recon:noise'; hosts: string[] }
+  | { type: 'douze:noise'; hosts: string[] }
 
 export interface PopupStatus {
   session: { id: string; name: string; origins: string[] } | null

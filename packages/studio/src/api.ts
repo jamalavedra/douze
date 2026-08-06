@@ -1,6 +1,5 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { Hono } from 'hono'
 import {
   RECIPE_VERSION,
   Recipe,
@@ -8,8 +7,7 @@ import {
   serializeRecipe,
   type Exchange,
   type Tool,
-} from '@recon/shared'
-import { REVIEW_APP_HTML } from './app.js'
+} from '@douze/shared'
 import { readFixtures, toFixture, writeFixture, type Fixture } from './fixtures.js'
 import { infer, type InferenceInput } from './inference/engine.js'
 import { mergeRecipe, setField, MERGEABLE_FIELDS, type MergeReport } from './merge.js'
@@ -59,8 +57,8 @@ export interface SaveReport extends MergeReport {
 }
 
 /**
- * #ReviewApp state. Holds candidates in memory for the life of a `recon studio` run and writes
- * only to the recipe and fixture directories (ADR-006).
+ * #ReviewApp state. Holds candidates in memory for the life of a review and writes only to the
+ * recipe and fixture directories (ADR-006) — douzed keeps one of these per capture session.
  */
 export class StudioSession {
   readonly paths: StudioPaths
@@ -199,57 +197,3 @@ export function baseUrlFrom(exchanges: Exchange[]): string {
   return top?.[0] ?? 'http://localhost'
 }
 
-interface EditBody {
-  field?: EditableField
-  value?: unknown
-}
-
-export function createApi(session: StudioSession): Hono {
-  const app = new Hono()
-
-  app.get('/', (c) => c.html(REVIEW_APP_HTML))
-  app.get('/api/state', (c) =>
-    c.json({ recipe: session.config.recipeName, base_url: session.config.baseUrl, candidates: session.view() }),
-  )
-
-  app.post('/api/candidates/:name/edit', async (c) => {
-    const body = (await c.req.json()) as EditBody
-    if (body.field === undefined) return c.json({ error: 'field is required' }, 400)
-    try {
-      const candidate = session.edit(c.req.param('name'), body.field, body.value)
-      // AC-REC-002.2 — the edit goes to the recipe, not just to this session, so #RecipeRegistry
-      // picks it up by hot reload without the user remembering to press Save (AC-REC-002.3).
-      const path = session.save().path
-      return c.json({ ok: true, user_edited: candidate.tool.flags.user_edited, path })
-    } catch (cause) {
-      return c.json({ error: (cause as Error).message }, 400)
-    }
-  })
-
-  app.post('/api/candidates/:name/approve', (c) => {
-    try {
-      const candidate = session.approve(c.req.param('name'))
-      return c.json({ ok: true, input_schema: candidate.tool.request.input_schema })
-    } catch (cause) {
-      return c.json({ error: (cause as Error).message }, 400)
-    }
-  })
-
-  app.post('/api/candidates/:name/unapprove', (c) => {
-    session.unapprove(c.req.param('name'))
-    return c.json({ ok: true })
-  })
-
-  // AC-REC-002.3 — the bulk route cannot approve a write, whatever the client sends.
-  app.post('/api/approve-reads', (c) => c.json(session.approveReads()))
-
-  app.post('/api/save', (c) => {
-    try {
-      return c.json(session.save())
-    } catch (cause) {
-      return c.json({ error: (cause as Error).message }, 400)
-    }
-  })
-
-  return app
-}

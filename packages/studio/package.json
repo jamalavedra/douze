@@ -1,5 +1,5 @@
 {
-  "name": "@recon/studio",
+  "name": "@douze/studio",
   "version": "0.1.0",
   "type": "module",
   "private": true,
@@ -7,13 +7,12 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.build.json",
     "test": "vitest run",
     "eval": "vitest run src/eval.test.ts --silent=false --reporter=verbose"
   },
   "dependencies": {
-    "@recon/shared": "workspace:*",
-    "hono": "4.12.32",
+    "@douze/shared": "workspace:*",
     "yaml": "2.9.0",
     "zod": "4.4.3"
   },

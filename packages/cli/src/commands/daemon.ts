@@ -1,10 +1,9 @@
 import { readFileSync } from 'node:fs'
-import { createServer } from 'node:net'
 import { resolve } from 'node:path'
 import { z } from 'incur'
-import { isAlive, readRuntime, startDaemon } from '@recon/recond'
-import { DEFAULT_PORT } from '@recon/shared'
-import { DaemonClient, startDetached, waitForDaemon } from '../daemon-client.js'
+import { isAlive, readRuntime, startDaemon } from '@douze/douzed'
+import { DEFAULT_PORT, PORT_RANGE } from '@douze/shared'
+import { DaemonClient, startDetached } from '../daemon-client.js'
 
 type ErrorFn = (options: { code: string; message: string; exitCode?: number }) => never
 
@@ -14,37 +13,37 @@ type ErrorFn = (options: { code: string; message: string; exitCode?: number }) =
  */
 export function register(cli: { command: (name: string, definition: unknown) => unknown }): void {
   cli.command('start', {
-    description: 'Start the Recon relay daemon (recond)',
+    description: 'Start the Douze relay daemon (douzed)',
     options: z.object({
-      // AC-CON-001.2 — an installed .mcpb holds the relay URL the user typed into a form once,
-      // so the daemon has to come back on the same port every time rather than an ephemeral one.
-      port: z.number().int().default(DEFAULT_PORT).describe('Port for the relay to bind'),
+      // Left unset, douzed walks PORT_RANGE — the ports the extension probes — and only then an
+      // ephemeral one. Naming a port here means you want that port: it binds or it fails.
+      port: z.number().int().optional().describe('Port for the relay to bind'),
     }),
     mcp: false,
-    async run(c: { options: { port: number }; error: ErrorFn }) {
-      // The detached child re-enters here with RECON_FOREGROUND set and never returns.
-      if (process.env['RECON_FOREGROUND'] === '1') return runForeground(c.options.port, c.error)
+    async run(c: { options: { port?: number }; error: ErrorFn }) {
+      // The detached child re-enters here with DOUZE_FOREGROUND set and never returns.
+      if (process.env['DOUZE_FOREGROUND'] === '1') return runForeground(c.options.port, c.error)
 
       const running = readRuntime()
-      // AC-RUN-003.2 — a second daemon reports the first rather than binding another port.
-      if (isAlive(running)) {
-        return c.error({
-          code: 'ALREADY_RUNNING',
-          message: `recond is already running (pid ${running.pid}, port ${running.port}).`,
-          exitCode: 1,
-        })
-      }
+      // Auto-start is the norm now — the connector starts the daemon when Claude Desktop
+      // launches — so finding one already up is the expected outcome of asking for one, not a
+      // failure. AC-RUN-003.2 still holds where it matters: `runForeground` refuses to bind a
+      // second time, so this reports the first instance instead of racing it.
+      if (isAlive(running)) return { started: false, pid: running.pid, port: running.port }
+      // The daemon runs in a detached child, so the flag has to travel to it the way DOUZE_PORT
+      // already does — the child inherits this environment. Without it `--port` bound nothing.
+      if (c.options.port !== undefined) process.env['DOUZE_PORT'] = String(c.options.port)
       const runtime = await startDetached()
       return { started: true, pid: runtime.pid, port: runtime.port }
     },
   })
 
   cli.command('stop', {
-    description: 'Stop the Recon relay daemon',
+    description: 'Stop the Douze relay daemon',
     mcp: false,
     run(c: { error: ErrorFn }) {
       const running = readRuntime()
-      if (!isAlive(running)) return c.error({ code: 'NOT_RUNNING', message: 'recond is not running.', exitCode: 1 })
+      if (!isAlive(running)) return c.error({ code: 'NOT_RUNNING', message: 'douzed is not running.', exitCode: 1 })
       process.kill(running.pid, 'SIGTERM')
       return { stopped: true, pid: running.pid }
     },
@@ -54,7 +53,7 @@ export function register(cli: { command: (name: string, definition: unknown) => 
     description: 'Report daemon, extension, and tool-surface state',
     mcp: { annotations: { readOnlyHint: true } },
     async run() {
-      // AC-RUN-003.3/.4 — status starts recond if it is down and reports the daemon that is up
+      // AC-RUN-003.3/.4 — status starts douzed if it is down and reports the daemon that is up
       // afterwards, so a killed daemon is recovered by the next command with no user action.
       const daemon = new DaemonClient()
       const [health, registry] = await Promise.all([daemon.health(), daemon.registry()])
@@ -63,6 +62,16 @@ export function register(cli: { command: (name: string, definition: unknown) => 
         running: isAlive(running),
         pid: running?.pid,
         port: running?.port,
+        // The extension probes PORT_RANGE and nothing else. Inside the range this is a note;
+        // outside it the extension will never find the daemon, which is the only real failure.
+        ...(running && running.port !== DEFAULT_PORT
+          ? {
+              port_warning: (PORT_RANGE as readonly number[]).includes(running.port)
+                ? `Something else is using ${DEFAULT_PORT}, so Douze took ${running.port}. The Chrome extension still finds it.`
+                : `Douze is on port ${running.port}, which the Chrome extension does not check. Free up one of ` +
+                  `${PORT_RANGE.join(', ')} and restart Douze, or the extension will report it as not running.`,
+            }
+          : {}),
         extension_connected: health.extension_connected,
         revision: registry.revision,
         tools: registry.tools.length,
@@ -101,10 +110,12 @@ export function register(cli: { command: (name: string, definition: unknown) => 
 }
 
 /** The daemon process itself: start, write the runtime file, and stay up until signalled. */
-async function runForeground(port: number, error: ErrorFn): Promise<never> {
+async function runForeground(port: number | undefined, error: ErrorFn): Promise<never> {
   let daemon
   try {
-    daemon = await startDaemon({ port: await bindable(port) })
+    // No probe-then-bind here: startDaemon walks the range itself, and a probe would only add a
+    // window for something else to take the port between the check and the bind.
+    daemon = await startDaemon(port === undefined ? {} : { port })
   } catch (cause) {
     return error({ code: 'ALREADY_RUNNING', message: (cause as Error).message, exitCode: 1 })
   }
@@ -116,25 +127,3 @@ async function runForeground(port: number, error: ErrorFn): Promise<never> {
   await new Promise(() => undefined)
   throw new Error('unreachable')
 }
-
-/**
- * Returns `port` if it is free, else 0 for an ephemeral one. A second `RECON_HOME` — an E2E
- * scratch root alongside a real install — is still entitled to a daemon, and every client reads
- * the port back out of `recond.json`, so only the `.mcpb` default URL can go stale.
- *
- * The probe is here rather than a catch around `startDaemon` because recond's WebSocketServer
- * emits EADDRINUSE as an unhandled error event that takes the process down first.
- *
- * ponytail: probe-then-bind races if something takes the port in between. The loser is a
- * daemon that fails to start and is retried by the next command; a retry loop is not worth it.
- */
-async function bindable(port: number): Promise<number> {
-  if (port === 0) return 0
-  const probe = createServer()
-  return new Promise((resolve) => {
-    probe.once('error', () => resolve(0))
-    probe.listen(port, '127.0.0.1', () => probe.close(() => resolve(port)))
-  })
-}
-
-export { waitForDaemon }

@@ -1,4 +1,4 @@
-import type { Exchange } from '@recon/shared'
+import type { Exchange } from '@douze/shared'
 
 /**
  * REQ-INF-001 — requests that differ only by identifier collapse into one Endpoint Template,

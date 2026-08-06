@@ -1,5 +1,5 @@
 import { test, expect, type Page } from '@playwright/test'
-import { FixtureApp, Recond, launchHelium } from '../harness.js'
+import { FixtureApp, Douzed, launchHelium } from '../harness.js'
 
 /**
  * COV_CAP_001 — the first thing a user does. Everything downstream is built on these exchanges,
@@ -7,7 +7,7 @@ import { FixtureApp, Recond, launchHelium } from '../harness.js'
  */
 test.describe('COV_CAP_001: Scoped session capture with bodies', () => {
   let app: FixtureApp
-  let recond: Recond
+  let douzed: Douzed
   let browser: Awaited<ReturnType<typeof launchHelium>>
   let page: Page
 
@@ -16,13 +16,13 @@ test.describe('COV_CAP_001: Scoped session capture with bodies', () => {
     await app.start()
     await app.reset()
 
-    recond = new Recond()
-    await recond.start()
+    douzed = new Douzed()
+    await douzed.start()
 
     browser = await launchHelium()
     await browser.serviceWorker.evaluate(
-      ([port, token]) => (globalThis as never as ReconTestApi).__recon.connect(Number(port), String(token)),
-      [String(recond.port), recond.token] as const,
+      ([port, token]) => (globalThis as never as DouzeTestApi).__douze.connect(Number(port), String(token)),
+      [String(douzed.port), douzed.token] as const,
     )
 
     page = await browser.context.newPage()
@@ -33,8 +33,8 @@ test.describe('COV_CAP_001: Scoped session capture with bodies', () => {
 
   test.afterEach(async () => {
     await browser.dispose()
-    recond.stop()
-    app.stop()
+    douzed.stop()
+    await app.stop()
   })
 
   /**
@@ -44,18 +44,18 @@ test.describe('COV_CAP_001: Scoped session capture with bodies', () => {
    */
   const startSession = async (name: string): Promise<string> => {
     const id = await browser.serviceWorker.evaluate(
-      ([name, origin]) => (globalThis as never as ReconTestApi).__recon.startSession(String(name), [String(origin)]),
+      ([name, origin]) => (globalThis as never as DouzeTestApi).__douze.startSession(String(name), [String(origin)]),
       [name, app.origin] as const,
     )
     await page.waitForSelector('#create')
-    await page.waitForFunction(() => (window as unknown as { __recon_interceptor__?: boolean }).__recon_interceptor__ === true)
+    await page.waitForFunction(() => (window as unknown as { __douze_interceptor__?: boolean }).__douze_interceptor__ === true)
     return id
   }
 
   const stopSession = () =>
-    browser.serviceWorker.evaluate(() => (globalThis as never as ReconTestApi).__recon.stopSession())
+    browser.serviceWorker.evaluate(() => (globalThis as never as DouzeTestApi).__douze.stopSession())
 
-  const badge = () => browser.serviceWorker.evaluate(() => (globalThis as never as ReconTestApi).__recon.badgeCount())
+  const badge = () => browser.serviceWorker.evaluate(() => (globalThis as never as DouzeTestApi).__douze.badgeCount())
 
   test('@COV_CAP_001.1 should capture request and response bodies for in-scope traffic', async () => {
     const sessionId = await startSession('orders')
@@ -70,7 +70,7 @@ test.describe('COV_CAP_001: Scoped session capture with bodies', () => {
     const { retained } = await stopSession()
     expect(retained).toBeGreaterThanOrEqual(2)
 
-    const detail = await (await recond.api(`/sessions/${sessionId}`)).json()
+    const detail = await (await douzed.api(`/sessions/${sessionId}`)).json()
     const create = detail.exchanges.find((e: { method: string }) => e.method === 'POST')
     const list = detail.exchanges.find(
       (e: { method: string; url: string }) => e.method === 'GET' && e.url.endsWith('/api/orders'),
@@ -95,7 +95,7 @@ test.describe('COV_CAP_001: Scoped session capture with bodies', () => {
     await expect.poll(badge, { timeout: 15_000 }).toBeGreaterThanOrEqual(1)
 
     await stopSession()
-    const detail = await (await recond.api(`/sessions/${sessionId}`)).json()
+    const detail = await (await douzed.api(`/sessions/${sessionId}`)).json()
     const urls = detail.exchanges.map((e: { url: string }) => e.url)
 
     expect(urls.some((u: string) => u.includes('google-analytics'))).toBe(false)
@@ -117,7 +117,7 @@ test.describe('COV_CAP_001: Scoped session capture with bodies', () => {
     await expect.poll(badge, { timeout: 15_000 }).toBeGreaterThanOrEqual(1)
     await stopSession()
 
-    const detail = await (await recond.api(`/sessions/${sessionId}`)).json()
+    const detail = await (await douzed.api(`/sessions/${sessionId}`)).json()
     const exchange = detail.exchanges.find((e: { method: string }) => e.method === 'POST')
 
     expect(exchange.request_headers.authorization).toMatch(/^«redacted:string:\d+»$/)
@@ -130,14 +130,28 @@ test.describe('COV_CAP_001: Scoped session capture with bodies', () => {
     expect(serialized).not.toContain('hunter2')
   })
 
-  test('@COV_CAP_001.2b should reject a session with an empty name', async () => {
-    await expect(startSession('')).rejects.toThrow()
+  /**
+   * A session must always carry a name a user can recognise it by. That used to be enforced by
+   * refusing an empty one, which blocked the recording on a text field; it is now enforced by
+   * naming the session after the site. The guarantee is the same — the assertion is on what
+   * douzed actually persisted, not on what the popup prefilled.
+   */
+  test('@COV_CAP_001.2b should name a session after the site when no name is given', async () => {
+    const sessionId = await startSession('   ')
+    expect(sessionId).not.toBe('')
+
+    await page.click('#list')
+    await expect.poll(badge, { timeout: 15_000 }).toBeGreaterThanOrEqual(1)
+    await stopSession()
+
+    const { session } = await (await douzed.api(`/sessions/${sessionId}`)).json()
+    expect(session.name).toBe(new URL(app.origin).hostname)
   })
 })
 
 /** The service-worker surface the extension exposes for the suite. */
-interface ReconTestApi {
-  __recon: {
+interface DouzeTestApi {
+  __douze: {
     connect(port: number, token: string): Promise<void>
     startSession(name: string, origins: string[]): Promise<string>
     stopSession(): Promise<{ retained: number }>

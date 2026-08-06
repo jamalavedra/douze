@@ -3,7 +3,7 @@ import { Exchange, AnnotationSpan, CaptureSession } from './capture.js'
 import { CredentialSource } from './recipe.js'
 
 /**
- * ADR-003 — the JSON protocol the extension speaks to recond over `ws://127.0.0.1:<port>`.
+ * ADR-003 — the JSON protocol the extension speaks to douzed over `ws://127.0.0.1:<port>`.
  * Two families: `exchange.*` flows extension → daemon (capture), `relay.*` flows
  * daemon → extension and back (execution).
  */
@@ -56,9 +56,16 @@ export type ServerMessage = z.infer<typeof ServerMessage>
 export type RelayRequest = z.infer<typeof RelayRequest>
 export type RelayResponse = z.infer<typeof RelayResponse>
 
-/** ADR-003 — recond pings well inside Chrome's 30-second service-worker idle timeout. */
+/** ADR-003 — douzed pings well inside Chrome's 30-second service-worker idle timeout. */
 export const HEARTBEAT_MS = 20_000
-export const DEFAULT_PORT = 8787
+
+/**
+ * The extension can only find douzed by probing loopback, so both sides walk this range in order.
+ * 8787 is not ours alone — RStudio Server's default is exactly that — and a squatter on it must
+ * move the daemon one port along rather than out of the extension's reach entirely.
+ */
+export const PORT_RANGE = [8787, 8788, 8789, 8790, 8791] as const
+export const DEFAULT_PORT = PORT_RANGE[0]
 
 /**
  * REQ-CON-004 — the four failure states a chat client must be able to explain without a
@@ -75,14 +82,14 @@ export const RelayErrorCode = z.enum([
 ])
 export type RelayErrorCode = z.infer<typeof RelayErrorCode>
 
-export class ReconError extends Error {
+export class DouzeError extends Error {
   constructor(
     readonly code: RelayErrorCode,
     message: string,
     readonly detail: Record<string, unknown> = {},
   ) {
     super(message)
-    this.name = 'ReconError'
+    this.name = 'DouzeError'
   }
 
   toResult(): { error: RelayErrorCode; message: string } & Record<string, unknown> {

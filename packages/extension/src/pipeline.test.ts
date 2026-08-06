@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { Exchange, NOISE_HOSTS } from '@recon/shared'
+import { Exchange, NOISE_HOSTS } from '@douze/shared'
 import type { GestureEvent } from './messages.js'
 import {
   PROVENANCE_WINDOW_MS,
@@ -176,18 +176,47 @@ describe('Reconciler (T-002.6)', () => {
 
   it('does not collapse two genuine calls to the same URL', () => {
     const r = new Reconciler()
-    r.accept(draft(), 0)
-    r.accept(draft(), 5)
-    r.accept(draft({ source: 'debugger' }), 6)
-    r.accept(draft({ source: 'debugger' }), 7)
+    // Two MAIN-world emissions bank two credits, so both debugger drafts are accounted for.
+    expect(r.accept(draft({ started_at: 1_000 }), 0)).toHaveLength(1)
+    expect(r.accept(draft({ started_at: 1_500 }), 5)).toHaveLength(1)
+    r.accept(draft({ source: 'debugger', started_at: 1_000 }), 6)
+    r.accept(draft({ source: 'debugger', started_at: 1_500 }), 7)
+    expect(r.due(RECONCILE_GRACE_MS + 10)).toHaveLength(0)
+  })
+
+  /**
+   * AC-CAP-002.3 — the oracle observes a SUPERSET of MAIN-world traffic (service workers,
+   * sendBeacon), so a URL can carry oracle-only traffic AND page traffic in one session. The
+   * oracle-only exchange is the headers-only record the AC exists to guarantee, and it must
+   * survive. This is the interleaving that a per-source ordinal scheme silently drops.
+   */
+  it('keeps an oracle-only exchange when the page later calls the same URL', () => {
+    const r = new Reconciler()
+    // The page's service worker fetches /api/orders — the interceptor cannot see it.
+    r.accept(draft({ source: 'web_request', body_missing: true, body_missing_reason: 'interceptor_miss', started_at: 1_000 }), 0)
+    // 200 ms later the page itself fetches the same URL, which the interceptor does see.
+    expect(r.accept(draft({ started_at: 1_200 }), 200)).toHaveLength(1)
+
+    const emitted = r.due(RECONCILE_GRACE_MS + 300)
+    expect(emitted).toHaveLength(1)
+    expect(emitted[0]?.source).toBe('web_request')
+    expect(emitted[0]?.body_missing).toBe(true)
+  })
+
+  it('suppresses an oracle draft the interceptor already captured', () => {
+    const r = new Reconciler()
+    // Same request seen by both paths: the body-bearing capture wins, once.
+    // Both paths report the same start instant, give or take observation jitter.
+    expect(r.accept(draft({ started_at: 1_000 }), 0)).toHaveLength(1)
+    r.accept(draft({ source: 'web_request', body_missing: true, started_at: 1_004 }), 5)
     expect(r.due(RECONCILE_GRACE_MS + 10)).toHaveLength(0)
   })
 
   it('emits the second debugger capture when the interceptor only saw the first', () => {
     const r = new Reconciler()
-    r.accept(draft(), 0)
-    r.accept(draft({ source: 'debugger' }), 1)
-    r.accept(draft({ source: 'debugger' }), 2)
+    r.accept(draft({ started_at: 1_000 }), 0)
+    r.accept(draft({ source: 'debugger', started_at: 1_000 }), 1)
+    r.accept(draft({ source: 'debugger', started_at: 2_000 }), 2)
     expect(r.due(RECONCILE_GRACE_MS + 10)).toHaveLength(1)
   })
 

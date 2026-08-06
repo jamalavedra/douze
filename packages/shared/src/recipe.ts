@@ -95,7 +95,7 @@ export const Tool = z.object({
   response: ResponseContract.prefault({}),
   /** AC-REC-004.1 — approved tools reference at least one fixture (enforced below). */
   fixtures: z.array(z.string()).default([]),
-  /** AC-EXE-003.1 — per-tool rate limit; recond queues rather than drops. */
+  /** AC-EXE-003.1 — per-tool rate limit; douzed queues rather than drops. */
   rate_limit_per_minute: z.number().int().positive().optional(),
   /** REQ-CAP-007 — the note that produced this tool, kept as description evidence. */
   annotation: z.string().optional(),

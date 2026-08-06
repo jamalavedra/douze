@@ -1,4 +1,4 @@
-import type { AnnotationSpan, Exchange, UiProvenance } from '@recon/shared'
+import type { AnnotationSpan, Exchange, UiProvenance } from '@douze/shared'
 import { infer } from '../inference/engine.js'
 import type { Candidate } from '../types.js'
 

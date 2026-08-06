@@ -7,25 +7,27 @@ import { join, resolve } from 'node:path'
 export const REPO = resolve(import.meta.dirname, '..')
 export const HELIUM = '/Applications/Helium.app/Contents/MacOS/Helium'
 export const EXTENSION = join(REPO, 'packages/extension/dist')
+/** Resolved once: `npx` re-resolves on every spawn, which is seconds under a loaded suite. */
+export const TSX = join(REPO, 'node_modules/.bin/tsx')
 
 /**
- * Launches Helium with the unpacked Recon extension. Chromium 136+ (and Helium, which carries
+ * Launches Helium with the unpacked Douze extension. Chromium 136+ (and Helium, which carries
  * the same guard) refuses remote debugging against the default profile, so every run gets a
  * scratch --user-data-dir. That also keeps the user's real session untouched.
  */
 /**
  * The live-target suite needs a session that survives between runs, because signing in to a real
- * dashboard is a manual act. `RECON_E2E_PROFILE` points at a profile the user signs into once;
+ * dashboard is a manual act. `DOUZE_E2E_PROFILE` points at a profile the user signs into once;
  * everything else gets a throwaway directory.
  */
-export const LIVE_PROFILE = process.env['RECON_E2E_PROFILE'] ?? join(tmpdir(), 'recon-live-profile')
+export const LIVE_PROFILE = process.env['DOUZE_E2E_PROFILE'] ?? join(tmpdir(), 'douze-live-profile')
 
 export async function launchHelium(
   extensionPath = EXTENSION,
   options: { profileDir?: string } = {},
 ): Promise<{ context: BrowserContext; serviceWorker: Worker; extensionId: string; dispose: () => Promise<void> }> {
   const persistent = options.profileDir !== undefined
-  const userDataDir = options.profileDir ?? mkdtempSync(join(tmpdir(), 'recon-helium-'))
+  const userDataDir = options.profileDir ?? mkdtempSync(join(tmpdir(), 'douze-helium-'))
   mkdirSync(userDataDir, { recursive: true })
   const context = await chromium.launchPersistentContext(userDataDir, {
     executablePath: HELIUM,
@@ -64,12 +66,27 @@ export class FixtureApp {
     return `http://127.0.0.1:${this.port}`
   }
 
+  /**
+   * The port is fixed because the extension's e2e build bakes this exact origin into
+   * `host_permissions`. That makes start/stop ordering load-bearing: if a previous instance
+   * still holds the port, the new one fails to bind and specs silently talk to the old server
+   * with the old control-flag state. So: wait for the port to be free, then for OUR server.
+   */
   async start(): Promise<void> {
-    this.process = spawn('npx', ['tsx', join(REPO, 'fixtures/server.ts')], {
+    await waitFor(async () => !(await this.responding()), `port ${this.port} to be free`)
+    this.process = spawn(TSX, [join(REPO, 'fixtures/server.ts')], {
       env: { ...process.env, FIXTURE_PORT: String(this.port) },
       stdio: 'ignore',
     })
-    await waitFor(async () => (await fetch(`${this.origin}/__test/log`)).ok, 'fixture app')
+    await waitFor(() => this.responding(), 'fixture app')
+  }
+
+  private async responding(): Promise<boolean> {
+    try {
+      return (await fetch(`${this.origin}/__test/log`)).ok
+    } catch {
+      return false
+    }
   }
 
   /** Requests the app saw. The basis for "zero requests were issued" assertions. */
@@ -86,20 +103,25 @@ export class FixtureApp {
     await fetch(`${this.origin}/__test/${key}?value=${encodeURIComponent(JSON.stringify(value))}`)
   }
 
-  stop(): void {
-    this.process?.kill()
+  /** Awaited, so the next spec's start() cannot race a process still holding the port. */
+  async stop(): Promise<void> {
+    if (!this.process) return
+    const exited = new Promise<void>((resolve) => this.process!.once('exit', () => resolve()))
+    this.process.kill()
+    await exited
+    this.process = undefined as never
   }
 }
 
-/** A recond instance rooted at a scratch RECON_HOME, so specs never touch a real install. */
-export class Recond {
+/** A douzed instance rooted at a scratch DOUZE_HOME, so specs never touch a real install. */
+export class Douzed {
   readonly home: string
   private process?: ChildProcess
   port = 0
   token = ''
 
   constructor() {
-    this.home = mkdtempSync(join(tmpdir(), 'recon-home-'))
+    this.home = mkdtempSync(join(tmpdir(), 'douze-home-'))
     // Specs stage recipes and fixtures before the daemon boots, so the dirs must exist first.
     for (const dir of ['recipes', 'fixtures']) mkdirSync(join(this.home, dir), { recursive: true })
   }
@@ -113,8 +135,8 @@ export class Recond {
   }
 
   async start(): Promise<void> {
-    this.process = spawn('npx', ['tsx', join(REPO, 'packages/recond/src/bin.ts')], {
-      env: { ...process.env, RECON_HOME: this.home },
+    this.process = spawn(TSX, [join(REPO, 'packages/douzed/src/bin.ts')], {
+      env: { ...process.env, DOUZE_HOME: this.home },
       stdio: 'inherit',
     })
     await waitFor(async () => {
@@ -122,14 +144,14 @@ export class Recond {
       if (!runtime) return false
       this.port = runtime.port
       return (await fetch(`http://127.0.0.1:${this.port}/health`)).ok
-    }, 'recond')
+    }, 'douzed')
     this.token = (await import('node:fs')).readFileSync(join(this.home, 'token'), 'utf8').trim()
   }
 
   private async runtime(): Promise<{ port: number; pid: number } | null> {
     try {
       const fs = await import('node:fs')
-      return JSON.parse(fs.readFileSync(join(this.home, 'recond.json'), 'utf8'))
+      return JSON.parse(fs.readFileSync(join(this.home, 'douzed.json'), 'utf8'))
     } catch {
       return null
     }
@@ -138,7 +160,7 @@ export class Recond {
   api(path: string, init: RequestInit = {}): Promise<Response> {
     return fetch(`http://127.0.0.1:${this.port}${path}`, {
       ...init,
-      headers: { 'x-recon-token': this.token, 'content-type': 'application/json', ...(init.headers ?? {}) },
+      headers: { 'x-douze-token': this.token, 'content-type': 'application/json', ...init.headers },
     })
   }
 
@@ -148,7 +170,7 @@ export class Recond {
   }
 }
 
-export async function waitFor(check: () => Promise<boolean>, what: string, timeoutMs = 15_000): Promise<void> {
+export async function waitFor(check: () => Promise<boolean>, what: string, timeoutMs = 45_000): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     try {

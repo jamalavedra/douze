@@ -5,7 +5,7 @@ import { REFERENCE_TASKS } from './tasks.js'
 /**
  * T-006.4 — the COV_INF_006.3 number, end to end and offline: infer the reference session, write
  * its descriptions with no model, then score tool selection against the labeled task set.
- * `pnpm --filter @recon/studio eval` runs it and prints the accuracy.
+ * `pnpm --filter @douze/studio eval` runs it and prints the accuracy.
  */
 export function evaluateReference(): { tools: ToolDoc[]; result: EvalResult } {
   const tools = referenceCandidates().map((c) => ({ name: c.tool.name, description: c.tool.description }))

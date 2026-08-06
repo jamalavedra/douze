@@ -1,4 +1,4 @@
-import type { Exchange } from '@recon/shared'
+import type { Exchange } from '@douze/shared'
 
 /**
  * REQ-INF-004 — a single `/graphql` endpoint would otherwise collapse into one useless tool,

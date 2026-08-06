@@ -1,7 +1,7 @@
 import { test, expect } from '@playwright/test'
 import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { FixtureApp, Recond } from '../harness.js'
+import { FixtureApp, Douzed } from '../harness.js'
 
 /**
  * COV_EXE_003 — the guards #RelayBridge owns. Each assertion is "and the target saw nothing",
@@ -43,7 +43,7 @@ tools:
 `
 
 test.describe('COV_EXE_003: Call guards', () => {
-  let recond: Recond
+  let douzed: Douzed
   let app: FixtureApp
 
   test.beforeEach(async () => {
@@ -51,20 +51,20 @@ test.describe('COV_EXE_003: Call guards', () => {
     await app.start()
     await app.reset()
 
-    recond = new Recond()
-    writeFileSync(join(recond.recipesDir, 'orders.yaml'), RECIPE)
-    writeFileSync(join(recond.fixturesDir, 'list_orders.json'), '{"data":{"orders":[]}}')
-    writeFileSync(join(recond.fixturesDir, 'delete_order.json'), '{"data":{"deleted":1}}')
-    await recond.start()
+    douzed = new Douzed()
+    writeFileSync(join(douzed.recipesDir, 'orders.yaml'), RECIPE)
+    writeFileSync(join(douzed.fixturesDir, 'list_orders.json'), '{"data":{"orders":[]}}')
+    writeFileSync(join(douzed.fixturesDir, 'delete_order.json'), '{"data":{"deleted":1}}')
+    await douzed.start()
   })
 
-  test.afterEach(() => {
-    recond.stop()
-    app.stop()
+  test.afterEach(async () => {
+    douzed.stop()
+    await app.stop()
   })
 
   const call = async (recipe: string, tool: string, args: Record<string, unknown>) => {
-    const res = await recond.api(`/relay/${recipe}/${tool}`, { method: 'POST', body: JSON.stringify({ args }) })
+    const res = await douzed.api(`/relay/${recipe}/${tool}`, { method: 'POST', body: JSON.stringify({ args }) })
     return { status: res.status, body: await res.json() }
   }
 
@@ -82,7 +82,7 @@ test.describe('COV_EXE_003: Call guards', () => {
   test('@COV_EXE_003.2 should reject a degraded tool before any network request', async () => {
     // Mark the tool degraded in its recipe, exactly as a Doctor Run would.
     writeFileSync(
-      join(recond.recipesDir, 'orders.yaml'),
+      join(douzed.recipesDir, 'orders.yaml'),
       RECIPE.replace(
         `    fixtures: [list_orders.json]`,
         `    fixtures: [list_orders.json]
@@ -92,16 +92,20 @@ test.describe('COV_EXE_003: Call guards', () => {
       ),
     )
     await expect
-      .poll(async () => (await (await recond.api('/registry')).json()).tools[0]?.degraded, { timeout: 5_000 })
+      .poll(async () => (await (await douzed.api('/registry')).json()).tools[0]?.degraded, { timeout: 5_000 })
       .toBe(true)
 
     const { body } = await call('orders', 'list_orders', {})
 
     expect(body.error).toBe('tool_degraded')
-    // The error must name the tool and the detected change (AC-EXE-003.4).
+    // AC-EXE-003.4 — the tool and the detected change both reach the caller, but they are split:
+    // the prose names the tool, the site and what to do about it, because Claude reads it out to
+    // whoever asked; the change and the developer's route back travel in the structured detail.
     expect(body.message).toContain('orders_list_orders')
-    expect(body.message).toContain('$.data.orders')
+    expect(body.message).toContain('127.0.0.1:4180')
     expect(body.change).toBe('response no longer contains $.data.orders')
+    expect(body.tool).toBe('orders_list_orders')
+    expect(body.fix).toBe('douze doctor orders')
 
     expect(await app.log()).toHaveLength(0)
   })

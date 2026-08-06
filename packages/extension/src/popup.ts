@@ -1,37 +1,62 @@
-import { DEFAULT_PORT } from '@recon/shared'
+import { reviewUrl, siteTools, type SiteTool } from './daemon.js'
 import type { PopupCommand, PopupStatus } from './messages.js'
 
 /**
- * T-001.8 — start/stop, session naming, live count, annotation, and the daemon connection
- * settings. `chrome.permissions.request` must be the first statement in a click handler, so
- * the active tab and its origin are cached at popup load rather than read on click.
+ * T-001.8 — one screen, one primary button, no port and no token. Pairing happens in the
+ * service worker; this only ever reads the result.
+ *
+ * `chrome.permissions.request` must be the first statement in a click handler, so the active
+ * tab and its origin are cached at popup load rather than read on click.
  */
 
 const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T
 
 const el = {
-  connection: $<HTMLSpanElement>('connection'),
-  idle: $<HTMLElement>('idle'),
-  active: $<HTMLElement>('active'),
+  disconnected: $<HTMLElement>('disconnected'),
+  unsupported: $<HTMLElement>('unsupported'),
+  ready: $<HTMLElement>('ready'),
+  watching: $<HTMLElement>('watching'),
+  finished: $<HTMLElement>('finished'),
+  hostname: $<HTMLParagraphElement>('hostname'),
   name: $<HTMLInputElement>('name'),
-  origin: $<HTMLDivElement>('origin'),
-  useDebugger: $<HTMLInputElement>('use-debugger'),
-  start: $<HTMLButtonElement>('start'),
-  sessionName: $<HTMLDivElement>('session-name'),
-  count: $<HTMLSpanElement>('count'),
+  watch: $<HTMLButtonElement>('watch'),
+  toolsSummary: $<HTMLParagraphElement>('tools-summary'),
+  tools: $<HTMLUListElement>('tools'),
+  watchingName: $<HTMLHeadingElement>('watching-name'),
+  count: $<HTMLParagraphElement>('count'),
   note: $<HTMLTextAreaElement>('note'),
-  annotate: $<HTMLButtonElement>('annotate'),
-  stop: $<HTMLButtonElement>('stop'),
+  addNote: $<HTMLButtonElement>('add-note'),
+  noted: $<HTMLParagraphElement>('noted'),
+  done: $<HTMLButtonElement>('done'),
+  finishedText: $<HTMLParagraphElement>('finished-text'),
+  finishedAction: $<HTMLButtonElement>('finished-action'),
   error: $<HTMLParagraphElement>('error'),
-  port: $<HTMLInputElement>('port'),
-  token: $<HTMLInputElement>('token'),
-  save: $<HTMLButtonElement>('save'),
+  useDebugger: $<HTMLInputElement>('use-debugger'),
   noise: $<HTMLTextAreaElement>('noise'),
   saveNoise: $<HTMLButtonElement>('save-noise'),
 }
 
+/** Subdomains that name the deployment, not the product: `app.linear.app` is Linear. */
+const GENERIC_LABELS = new Set(['www', 'app', 'my', 'go', 'dashboard', 'console', 'admin'])
+
+/** The name we suggest: the site's own word, capitalised. Never blocking — always editable. */
+function defaultName(hostname: string): string {
+  const labels = hostname.split('.')
+  const first = labels.find((label) => !GENERIC_LABELS.has(label)) ?? labels[0] ?? hostname
+  return first.charAt(0).toUpperCase() + first.slice(1)
+}
+
+/** AC-CAP-001.3 — the live count, in words rather than a bare number. */
+function countPhrase(count: number): string {
+  if (count === 0) return 'Nothing yet — use the site as you normally would'
+  return count === 1 ? '1 thing so far' : `${count} things so far`
+}
+
 let activeTab: chrome.tabs.Tab | undefined
 let activeOrigin = ''
+let activeHostname = ''
+/** The session that just stopped, so the review page can be opened after it is gone from status. */
+let finished: { id: string; name: string; count: number } | null = null
 
 const send = async (command: PopupCommand): Promise<PopupStatus & { error?: string }> =>
   (await chrome.runtime.sendMessage(command)) as PopupStatus & { error?: string }
@@ -41,30 +66,91 @@ function showError(message: string | null): void {
   el.error.textContent = message ?? ''
 }
 
-function render(state: PopupStatus & { error?: string }): void {
-  showError(state.error ?? null)
-  el.connection.textContent = state.connected ? 'connected' : 'daemon offline'
-  el.idle.hidden = state.session !== null
-  el.active.hidden = state.session === null
-  el.count.textContent = String(state.count)
-  el.sessionName.textContent = state.session ? `${state.session.name} — ${state.session.origins.join(', ')}` : ''
-  el.port.value = String(state.port || DEFAULT_PORT)
-  el.token.value = state.token
-  if (document.activeElement !== el.noise) el.noise.value = state.noiseHosts.join('\n')
-  el.start.disabled = !activeOrigin
+function show(state: 'disconnected' | 'unsupported' | 'ready' | 'watching' | 'finished'): void {
+  for (const name of ['disconnected', 'unsupported', 'ready', 'watching', 'finished'] as const) {
+    el[name].hidden = name !== state
+  }
 }
 
-el.start.addEventListener('click', async () => {
+function render(status: PopupStatus & { error?: string }): void {
+  if (status.error) showError(status.error)
+  if (document.activeElement !== el.noise) el.noise.value = status.noiseHosts.join('\n')
+
+  if (status.session) {
+    finished = { id: status.session.id, name: status.session.name, count: status.count }
+    el.watchingName.textContent = `Watching ${status.session.name}`
+    el.count.textContent = countPhrase(status.count)
+    return show('watching')
+  }
+  if (finished) {
+    renderFinished(status)
+    return show('finished')
+  }
+  if (!status.connected) return show('disconnected')
+  if (!activeOrigin) return show('unsupported')
+  return show('ready')
+}
+
+function renderFinished(status: PopupStatus): void {
+  const session = finished
+  if (!session) return
+  if (session.count === 0) {
+    el.finishedText.textContent =
+      "Nothing was recorded. That usually means the site didn't load new data while Douze was watching — try again and click around the part you want Claude to handle."
+    el.finishedAction.textContent = 'Try again'
+    el.finishedAction.onclick = (): void => {
+      finished = null
+      showError(null)
+      render(status)
+    }
+    return
+  }
+  el.finishedText.textContent = `Recorded ${session.count} things on ${session.name}.`
+  el.finishedAction.textContent = 'Set up what Claude can do →'
+  el.finishedAction.onclick = (): void => {
+    void chrome.tabs.create({ url: reviewUrl({ port: status.port, token: status.token }, session.id) })
+  }
+}
+
+/** The same words the review page uses, so the category never rides on the border colour alone. */
+const KIND_WORD: Record<SiteTool['side_effect'], string> = {
+  read: 'Reads information',
+  write: 'Makes changes',
+  destructive: 'Deletes things',
+}
+
+/** What Claude can already do here — shown quietly, so a repeat recording has context. */
+function renderTools(tools: SiteTool[]): void {
+  el.toolsSummary.hidden = tools.length === 0
+  el.toolsSummary.textContent = `Claude can already do ${tools.length} things here`
+  el.tools.replaceChildren(
+    ...tools.slice(0, 5).map((tool) => {
+      const item = document.createElement('li')
+      item.dataset['effect'] = tool.side_effect
+      const kind = document.createElement('span')
+      kind.className = 'kind'
+      kind.textContent = KIND_WORD[tool.side_effect]
+      item.append(kind, ` — ${tool.description}`)
+      return item
+    }),
+  )
+}
+
+el.watch.addEventListener('click', async () => {
   // First statement: any await before this consumes the user gesture and the request rejects.
   const granted = await chrome.permissions.request({ origins: [`${activeOrigin}/*`] })
-  if (!granted) return showError('Recon needs permission for this site to record it.')
-  const name = el.name.value.trim()
-  if (!name) return showError('A session name is required.')
-  if (activeTab?.id === undefined) return showError('No active tab to record.')
+  if (!granted) {
+    return showError('Douze needs your permission to watch this site. Nothing is recorded until you allow it.')
+  }
+  if (activeTab?.id === undefined) {
+    return showError("Douze couldn't find the page. Close this popup, click the site's tab, and try again.")
+  }
+  showError(null)
+  finished = null
   render(
     await send({
-      type: 'recon:start',
-      name,
+      type: 'douze:start',
+      name: el.name.value.trim() || activeHostname,
       origins: [activeOrigin],
       tabId: activeTab.id,
       useDebugger: el.useDebugger.checked,
@@ -73,21 +159,15 @@ el.start.addEventListener('click', async () => {
   return undefined
 })
 
-el.stop.addEventListener('click', async () => {
-  const before = Number(el.count.textContent ?? '0')
-  render(await send({ type: 'recon:stop' }))
-  showError(`Retained ${before} exchanges after filtering.`)
+el.done.addEventListener('click', async () => {
+  render(await send({ type: 'douze:stop' }))
 })
 
-el.annotate.addEventListener('click', async () => {
+el.addNote.addEventListener('click', async () => {
   if (!el.note.value.trim()) return
-  render(await send({ type: 'recon:annotate', note: el.note.value }))
+  render(await send({ type: 'douze:annotate', note: el.note.value }))
   el.note.value = ''
-})
-
-el.save.addEventListener('click', async () => {
-  await chrome.storage.local.set({ port: Number(el.port.value) || DEFAULT_PORT, token: el.token.value.trim() })
-  showError('Saved. Reconnecting…')
+  el.noted.hidden = false
 })
 
 /** AC-CAP-004.3 — additions apply to subsequent sessions, not the one already running. */
@@ -96,20 +176,28 @@ el.saveNoise.addEventListener('click', async () => {
     .split('\n')
     .map((line) => line.trim().toLowerCase())
     .filter(Boolean)
-  render(await send({ type: 'recon:noise', hosts }))
-  showError('Saved. Applies to the next session.')
+  render(await send({ type: 'douze:noise', hosts }))
 })
 
 async function boot(): Promise<void> {
   ;[activeTab] = await chrome.tabs.query({ active: true, currentWindow: true })
   try {
-    activeOrigin = activeTab?.url ? new URL(activeTab.url).origin : ''
+    const url = new URL(activeTab?.url ?? '')
+    activeOrigin = url.protocol.startsWith('http') ? url.origin : ''
+    activeHostname = url.hostname
   } catch {
     activeOrigin = ''
+    activeHostname = ''
   }
-  el.origin.textContent = activeOrigin || 'This page cannot be recorded.'
-  render(await send({ type: 'recon:status' }))
-  setInterval(async () => render(await send({ type: 'recon:status' })), 1000)
+  el.hostname.textContent = activeHostname
+  el.name.value = defaultName(activeHostname)
+
+  const status = await send({ type: 'douze:status' })
+  render(status)
+  if (status.connected && activeOrigin) {
+    renderTools(await siteTools({ port: status.port, token: status.token }, activeOrigin))
+  }
+  setInterval(async () => render(await send({ type: 'douze:status' })), 1000)
 }
 
 void boot()

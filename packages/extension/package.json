@@ -1,5 +1,5 @@
 {
-  "name": "@recon/extension",
+  "name": "@douze/extension",
   "version": "0.1.0",
   "type": "module",
   "private": true,
@@ -9,7 +9,7 @@
     "smoke": "node smoke.mjs"
   },
   "dependencies": {
-    "@recon/shared": "workspace:*"
+    "@douze/shared": "workspace:*"
   },
   "devDependencies": {
     "@types/chrome": "0.2.2",

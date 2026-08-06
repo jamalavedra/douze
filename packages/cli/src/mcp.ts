@@ -11,10 +11,10 @@ import type { ToolSurfaceBuilder } from './surface.js'
  * 2-second poll keeps a disk edit inside the 5 seconds AC-RUN-002.1 allows end to end.
  *
  * ponytail: polling, not a subscription. One idle GET every 2s on loopback against a daemon
- * that already holds the state in memory. Swap for an SSE endpoint on recond if the poll ever
+ * that already holds the state in memory. Swap for an SSE endpoint on douzed if the poll ever
  * shows up in a profile.
  */
-const POLL_MS = Number(process.env['RECON_REGISTRY_POLL_MS'] ?? 2000)
+const POLL_MS = Number(process.env['DOUZE_REGISTRY_POLL_MS'] ?? 2000)
 
 export interface McpOptions {
   builder: ToolSurfaceBuilder
@@ -34,7 +34,7 @@ export interface McpHandle {
 }
 
 /**
- * `recon --mcp`.
+ * `douze --mcp`.
  *
  * incur's own `Mcp.serve` materialises the tool list once at connect time and never exposes the
  * `McpServer`, so a recipe approved after launch would be invisible until restart — the exact
@@ -47,16 +47,16 @@ export interface McpHandle {
  * `<recipe>_<tool>` name (AC-RUN-001.2). incur's default is `progressive` — four static tools
  * plus a searchable catalog — which would also survive a surface change without any
  * notification, but it hides the real names from `tools/list` and routes every call through a
- * read/write gate. Recon's surface is narrow enough that the literal list is worth more than the
+ * read/write gate. Douze's surface is narrow enough that the literal list is worth more than the
  * token saving, and `notifications/tools/list_changed` covers the churn (AC-RUN-002.2).
  */
 export async function serveMcp(options: McpOptions): Promise<McpHandle> {
   const { builder, daemon } = options
-  const name = options.name ?? 'recon'
+  const name = options.name ?? 'douze'
   const version = options.version ?? '0.1.0'
 
   const server = new McpServer(
-    { name, title: 'Recon', version },
+    { name, title: 'Douze', version },
     {
       instructions:
         'Tools recorded from your own authenticated dashboards. Each tool is named <recipe>_<tool> and executes inside your signed-in browser. Tool names and descriptions change while this server runs; re-read tools/list after a notifications/tools/list_changed.',
@@ -150,14 +150,17 @@ export async function serveMcp(options: McpOptions): Promise<McpHandle> {
  */
 function startProgress(toolName: string, extra: CallExtra): () => void {
   const token = extra?.mcpReq?._meta?.progressToken ?? extra?._meta?.progressToken
-  const send = extra?.sendNotification
-  if (token === undefined || !send) return () => undefined
+  // The SDK hands a tool callback `ctx.mcpReq.notify(...)`; there is no `sendNotification` on
+  // that context (see buildContext in @modelcontextprotocol/server). Reading the wrong property
+  // silently disabled progress for every call of every duration.
+  const notify = extra?.mcpReq?.notify?.bind(extra.mcpReq) ?? extra?.sendNotification
+  if (token === undefined || !notify) return () => undefined
 
   const started = Date.now()
   let progress = 0
   const timer = setInterval(() => {
     const elapsed = Math.round((Date.now() - started) / 1000)
-    void send({
+    void notify({
       method: 'notifications/progress',
       params: {
         progressToken: token,
@@ -191,9 +194,19 @@ interface RegisteredTool {
   remove: () => void
 }
 
+type ProgressNotification = {
+  method: 'notifications/progress'
+  params: { progressToken: string | number; progress: number; message: string }
+}
+
 interface CallExtra {
   _meta?: { progressToken?: string | number }
-  mcpReq?: { _meta?: { progressToken?: string | number } }
+  mcpReq?: {
+    _meta?: { progressToken?: string | number }
+    /** The SDK's notifier on a tool context. This is the one that actually exists. */
+    notify?: (notification: ProgressNotification) => Promise<void>
+  }
+  /** Older/alternate SDK shape, kept as a fallback so a transport change cannot silently regress. */
   sendNotification?: (notification: {
     method: 'notifications/progress'
     params: { progressToken: string | number; progress: number; message: string }

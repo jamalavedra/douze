@@ -3,7 +3,7 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 /**
- * REQ-CON-002 — one command registers Recon with Claude Code.
+ * REQ-CON-002 — one command registers Douze with Claude Code.
  *
  * incur ships an `mcp add`, but it shells out to `npx add-mcp` and reports agent names scraped
  * from that tool's stdout. AC-CON-002.1 asks for the *scope* that was written and AC-CON-002.3
@@ -40,9 +40,9 @@ export interface McpAddResult {
 export function resolveServerName(requested: string): string {
   const taken = new Set(RESERVED_SERVER_NAMES.map((n) => n.toLowerCase()))
   if (!taken.has(requested.toLowerCase())) return requested
-  let candidate = `${requested}-recon`
+  let candidate = `${requested}-douze`
   let suffix = 2
-  while (taken.has(candidate.toLowerCase())) candidate = `${requested}-recon-${suffix++}`
+  while (taken.has(candidate.toLowerCase())) candidate = `${requested}-douze-${suffix++}`
   return candidate
 }
 
@@ -65,7 +65,7 @@ export function configTarget(scope: Scope, cwd: string): { path: string; contain
 export function addToClaudeCode(
   options: { name?: string; scope?: Scope; command?: string; cwd?: string } = {},
 ): McpAddResult {
-  const requested = options.name ?? 'recon'
+  const requested = options.name ?? 'douze'
   const name = resolveServerName(requested)
   const scope = options.scope ?? 'user'
   const cwd = options.cwd ?? process.cwd()
@@ -76,7 +76,7 @@ export function addToClaudeCode(
 
   node[name] = {
     type: 'stdio',
-    command: options.command ?? 'recon',
+    command: options.command ?? 'douze',
     args: ['--mcp'],
   }
 
@@ -88,7 +88,7 @@ export function addToClaudeCode(
     ...(name === requested ? {} : { requested }),
     scope,
     path: target.path,
-    command: options.command ?? 'recon',
+    command: options.command ?? 'douze',
     args: ['--mcp'],
   }
 }

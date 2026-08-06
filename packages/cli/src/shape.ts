@@ -43,7 +43,7 @@ export function shapeResult(body: unknown, options: ShapeOptions = {}): Shaped {
   const encoded = Buffer.byteLength(json(data), 'utf8')
   if (encoded <= MAX_RESULT_BYTES) return note === undefined ? { data } : { data, note }
 
-  const returned = Buffer.from(json(data), 'utf8').subarray(0, MAX_RESULT_BYTES).toString('utf8')
+  const returned = cutToBytes(json(data), MAX_RESULT_BYTES)
   return {
     data: returned,
     truncated: {
@@ -90,4 +90,21 @@ function segments(path: string): string[] {
     .replace(/\['([^']*)'\]/g, '.$1')
     .split('.')
     .filter((s) => s.length > 0)
+}
+
+/**
+ * Cuts a string to at most `limit` BYTES without splitting a UTF-8 sequence.
+ *
+ * `Buffer.subarray(0, limit).toString('utf8')` looks right and is not: a split multi-byte
+ * sequence decodes to a 3-byte U+FFFD, so an emoji straddling the boundary comes back one or two
+ * bytes OVER the cap AC-RUN-004.2 exists to enforce — and mojibake with it. A continuation byte
+ * is 0b10xxxxxx, so walking back to the last lead byte finds the real boundary.
+ */
+export function cutToBytes(value: string, limit: number): string {
+  const buffer = Buffer.from(value, 'utf8')
+  if (buffer.length <= limit) return value
+
+  let end = limit
+  while (end > 0 && (buffer[end]! & 0xc0) === 0x80) end -= 1
+  return buffer.subarray(0, end).toString('utf8')
 }

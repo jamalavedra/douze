@@ -10,10 +10,10 @@ import { REPO } from './harness.js'
  * build keeps `optional_host_permissions` and grants per target at record time (TR-1).
  */
 export default function globalSetup(): void {
-  const origin = process.env['RECON_FIXTURE_ORIGIN'] ?? 'http://127.0.0.1:4180'
-  execFileSync('pnpm', ['--filter', '@recon/extension', 'build'], {
+  const origin = process.env['DOUZE_FIXTURE_ORIGIN'] ?? 'http://127.0.0.1:4180'
+  execFileSync('pnpm', ['--filter', '@douze/extension', 'build'], {
     cwd: REPO,
-    env: { ...process.env, RECON_TEST_ORIGIN: origin },
+    env: { ...process.env, DOUZE_TEST_ORIGIN: origin },
     stdio: 'inherit',
   })
   const manifest = join(REPO, 'packages/extension/dist/manifest.json')

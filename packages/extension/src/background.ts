@@ -6,7 +6,7 @@ import {
   type CaptureSession,
   type NoiseConfig,
   type ServerMessage,
-} from '@recon/shared'
+} from '@douze/shared'
 import type {
   CaptureBatch,
   GestureEvent,
@@ -15,6 +15,7 @@ import type {
   PopupStatus,
   RequestEvent,
 } from './messages.js'
+import { needsPairing, pairAny } from './daemon.js'
 import { DebuggerCapture } from './debugger-capture.js'
 import { installOracle } from './oracle.js'
 import { RECONCILE_GRACE_MS, Reconciler, admits, decodeBody, finalize, type ExchangeDraft } from './pipeline.js'
@@ -23,15 +24,15 @@ import { DaemonSocket } from './ws-client.js'
 
 /**
  * T-001.4 / T-002.2 — the service worker. It owns session lifecycle, provenance attribution,
- * redaction (in `finalize`), reconciliation across capture paths, and the recond socket.
+ * redaction (in `finalize`), reconciliation across capture paths, and the douzed socket.
  *
  * Every listener below is registered synchronously at the top level: a listener added after an
  * `await` silently stops working once Chrome respawns the worker.
  */
 
 const VERSION = chrome.runtime.getManifest().version
-const RECONCILE_IDS = ['recon-main', 'recon-bridge']
-const RECONNECT_ALARM = 'recon-reconnect'
+const RECONCILE_IDS = ['douze-main', 'douze-bridge']
+const RECONNECT_ALARM = 'douze-reconnect'
 
 interface Recording {
   session: CaptureSession
@@ -43,7 +44,8 @@ interface Recording {
 }
 
 let recording: Recording | null = null
-let settings = { port: DEFAULT_PORT, token: '', noiseHosts: [] as string[] }
+// `DEFAULT_PORT` is a literal type; the stored port is whichever one the daemon actually took.
+let settings = { port: DEFAULT_PORT as number, token: '', noiseHosts: [] as string[] }
 /** AC-CAP-004.1 / .3 — the bundled list plus the user's additions; never a copy of the list. */
 let noise: NoiseConfig = { hosts: NOISE_HOSTS }
 const pendingRequests = new Map<string, { event: RequestEvent; gesture?: GestureEvent }>()
@@ -79,12 +81,54 @@ async function loadSettings(): Promise<void> {
   })
 }
 
+/**
+ * Every write to the stored endpoint runs here, one at a time.
+ *
+ * Pairing is a probe followed by a write, and boot, `onInstalled` and the reconnect alarm can all
+ * start one at once. Interleaved, the slowest probe's answer lands last and wins — so the endpoint
+ * we end up on is whichever daemon happened to reply slowest, not the one we chose. Serialising
+ * makes the last endpoint *asked for* the one we keep.
+ */
+let endpointWrites: Promise<unknown> = Promise.resolve()
+function serializeEndpointWrite<T>(work: () => Promise<T>): Promise<T> {
+  const next = endpointWrites.then(work, work)
+  endpointWrites = next.catch(() => {})
+  return next
+}
+
+/**
+ * The user never sees a port or a token: we ask the daemon for one. The daemon reissues its token
+ * on every restart, so this runs on boot and on every reconnect alarm until the socket is up.
+ */
+const ensurePaired = (): Promise<void> => serializeEndpointWrite(pairNow)
+
+async function pairNow(): Promise<void> {
+  if (!needsPairing({ token: settings.token, connected: socket.connected })) return
+  // Re-pairing while merely disconnected is what repairs a token the daemon has since reissued.
+  // The stored port is tried first, so a run pinned to an ephemeral port keeps talking to its own
+  // daemon; the ladder is only walked once that port answers nothing at all.
+  const before = settings
+  const paired = await pairAny(before.port)
+  // Storage, not `settings`: a write that has already landed is not in `settings` until its
+  // `loadSettings` runs, so comparing the in-memory object lets a probe started beforehand
+  // persist the wrong daemon and re-point the next reconnect at it.
+  if (paired && (paired.token !== before.token || paired.port !== before.port)) {
+    const stored = await chrome.storage.local.get(['port', 'token'])
+    const unchanged = (stored['token'] ?? '') === before.token && (stored['port'] ?? DEFAULT_PORT) === before.port
+    if (unchanged) {
+      await chrome.storage.local.set(paired)
+      await loadSettings()
+    }
+  }
+  socket.connect()
+}
+
 /** Session state lives in `chrome.storage.session`: module globals die with the worker. */
 const hydrated = (async () => {
   await loadSettings()
   const session = await chrome.storage.session.get('recording')
   recording = (session['recording'] as Recording | undefined) ?? null
-  socket.connect()
+  void ensurePaired()
   await paintBadge()
 })()
 
@@ -97,7 +141,8 @@ async function persist(): Promise<void> {
 async function paintBadge(): Promise<void> {
   painted = recording ? String(recording.count) : ''
   await chrome.action.setBadgeText({ text: painted })
-  await chrome.action.setBadgeBackgroundColor({ color: '#1f6feb' })
+  // The review page's accent. A flat value, not `light-dark()`: this API takes one colour.
+  await chrome.action.setBadgeBackgroundColor({ color: '#1a56c4' })
 }
 /** The last text handed to `setBadgeText`, so a test can assert what the badge shows. */
 let painted = ''
@@ -186,7 +231,7 @@ async function registerScripts(origins: string[]): Promise<void> {
   const matches = origins.map((origin) => `${origin}/*`)
   await chrome.scripting.registerContentScripts([
     {
-      id: 'recon-main',
+      id: 'douze-main',
       js: ['interceptor.js'],
       world: 'MAIN',
       runAt: 'document_start',
@@ -196,7 +241,7 @@ async function registerScripts(origins: string[]): Promise<void> {
       persistAcrossSessions: true,
     },
     {
-      id: 'recon-bridge',
+      id: 'douze-bridge',
       js: ['bridge.js'],
       world: 'ISOLATED',
       runAt: 'document_start',
@@ -218,14 +263,14 @@ async function resolveTab(origin: string, tabId?: number): Promise<number> {
 }
 
 /** AC-CAP-001.1 / .2 — a named session scoped to the origins the user granted. */
-async function startSession(command: Extract<PopupCommand, { type: 'recon:start' }>): Promise<PopupStatus> {
-  if (!command.name.trim()) throw new Error('a session name is required')
+async function startSession(command: Extract<PopupCommand, { type: 'douze:start' }>): Promise<PopupStatus> {
   const [primary] = command.origins
   if (!primary) throw new Error('a session needs at least one origin')
   const tabId = await resolveTab(primary, command.tabId)
   const session: CaptureSession = {
     id: crypto.randomUUID(),
-    name: command.name.trim(),
+    // An unnamed session is named after the site rather than refused: the name is a label.
+    name: command.name.trim() || new URL(primary).hostname,
     origins: command.origins,
     started_at: Date.now(),
     debugger_enabled: command.useDebugger,
@@ -288,26 +333,40 @@ const status = (): PopupStatus => ({
 
 async function onServerMessage(message: ServerMessage): Promise<void> {
   if (message.type !== 'relay.request') return
-  const response = await executeRelay(message.request, { notifyExpired })
+  // Never replay through the tab being recorded: the oracle would ingest our own request.
+  const response = await executeRelay(message.request, {
+    notifyExpired,
+    recordingTabId: recording?.tabId,
+  })
   socket.send({ type: 'relay.response', id: message.request.id, response })
+}
+
+const hostnameOf = (origin: string): string => {
+  try {
+    return new URL(origin).hostname
+  } catch {
+    return origin
+  }
 }
 
 /** AC-EXE-002.3 — link the user straight at the target's login page. */
 function notifyExpired(origin: string, loginUrl: string): void {
-  const id = `recon-expired-${origin}`
+  const id = `douze-expired-${origin}`
+  // The user knows the site by its name in the address bar, not by a scheme and a port.
+  const site = hostnameOf(origin)
   expiredNotifications.set(id, loginUrl)
   chrome.notifications.create(id, {
     type: 'basic',
     iconUrl: chrome.runtime.getURL('icon128.png'),
-    title: 'Recon: session expired',
-    message: `Your session for ${origin} has expired. Click to sign in again.`,
+    title: `Signed out of ${site}`,
+    message: `You've been signed out of ${site}, so Claude can't act there. Click to sign in again.`,
   })
 }
 
 // --- listeners (top level, synchronous) -----------------------------------
 
 chrome.runtime.onMessage.addListener((message: CaptureBatch | PopupCommand, sender, sendResponse) => {
-  if (message.type === 'recon:capture') {
+  if (message.type === 'douze:capture') {
     const tabId = sender.tab?.id
     // Everything arriving from a content script is attacker-controlled: a page can forge these,
     // so the frame's own origin — not anything in the message — decides whether we listen.
@@ -320,13 +379,13 @@ chrome.runtime.onMessage.addListener((message: CaptureBatch | PopupCommand, send
   }
   void hydrated
     .then(async () => {
-      if (message.type === 'recon:start') return startSession(message)
-      if (message.type === 'recon:stop') return stopSession()
-      if (message.type === 'recon:annotate') {
+      if (message.type === 'douze:start') return startSession(message)
+      if (message.type === 'douze:stop') return stopSession()
+      if (message.type === 'douze:annotate') {
         annotate(message.note)
         return status()
       }
-      if (message.type === 'recon:noise') {
+      if (message.type === 'douze:noise') {
         await chrome.storage.local.set({ noise_hosts: message.hosts })
         return status()
       }
@@ -346,27 +405,26 @@ installOracle({
 // setTimeout exists to fire. `connect()` is idempotent, so a healthy connection makes it a no-op.
 chrome.alarms.create(RECONNECT_ALARM, { periodInMinutes: 0.5 })
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === RECONNECT_ALARM) void hydrated.then(() => socket.connect())
+  if (alarm.name === RECONNECT_ALARM) void hydrated.then(ensurePaired)
 })
 
-chrome.runtime.onStartup.addListener(() => void hydrated.then(() => socket.connect()))
+chrome.runtime.onStartup.addListener(() => void hydrated.then(ensurePaired))
 
 // Dynamic registrations are wiped on every extension update and reload.
 chrome.runtime.onInstalled.addListener(() => {
   void hydrated.then(async () => {
     await DebuggerCapture.clearZombies()
     if (recording) await registerScripts(recording.session.origins)
-    socket.connect()
+    await ensurePaired()
   })
 })
 
-chrome.storage.onChanged.addListener((changes, area) => {
+// `connect()` is idempotent, so this picks up a token written from anywhere without ever
+// interrupting a healthy socket — a caller that means to re-dial closes it first.
+chrome.storage.onChanged.addListener((_changes, area) => {
   if (area !== 'local') return
-  const reconnect = Boolean(changes['port'] ?? changes['token'])
   void hydrated.then(async () => {
     await loadSettings()
-    if (!reconnect) return
-    socket.close()
     socket.connect()
   })
 })
@@ -391,13 +449,17 @@ chrome.tabs.onRemoved.addListener((tabId) => {
  * calls the same function the popup's message handler calls — there is no test-only path.
  */
 Object.assign(globalThis, {
-  __recon: {
+  __douze: {
     async connect(port: number, token: string): Promise<void> {
       await hydrated
-      await chrome.storage.local.set({ port, token })
-      await loadSettings()
-      socket.close()
-      socket.connect()
+      // Through the same queue as pairing: boot's probe is already in flight by the time a spec
+      // calls this, and whichever writes last owns the endpoint.
+      await serializeEndpointWrite(async () => {
+        await chrome.storage.local.set({ port, token })
+        await loadSettings()
+        socket.close()
+        socket.connect()
+      })
     },
     isConnected: (): boolean => socket.connected,
     async startSession(
@@ -407,7 +469,7 @@ Object.assign(globalThis, {
     ): Promise<string> {
       await hydrated
       await startSession({
-        type: 'recon:start',
+        type: 'douze:start',
         name,
         origins,
         useDebugger: opts.debugger ?? false,
@@ -433,7 +495,7 @@ Object.assign(globalThis, {
     pending: (): ClientMessage[] => socket.outbox.snapshot(),
     /**
      * Whether the origin is granted. It cannot be granted from here: `permissions.request`
-     * needs a user gesture, so the e2e build bakes the origin in via `RECON_TEST_ORIGIN`.
+     * needs a user gesture, so the e2e build bakes the origin in via `DOUZE_TEST_ORIGIN`.
      */
     hasOrigin: (origin: string): Promise<boolean> =>
       chrome.permissions.contains({ origins: [`${origin}/*`] }),

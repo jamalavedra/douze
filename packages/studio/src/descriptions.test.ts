@@ -219,15 +219,15 @@ describe('AC-INF-006.5 local model endpoint', () => {
   it('prefers a configured local endpoint over a remote provider', () => {
     expect(
       modelFromEnv({
-        RECON_LOCAL_MODEL_ENDPOINT: 'http://127.0.0.1:11434/v1/chat/completions',
-        RECON_MODEL_ENDPOINT: 'https://api.example.com/v1/chat/completions',
-        RECON_MODEL_API_KEY: 'sk-remote',
+        DOUZE_LOCAL_MODEL_ENDPOINT: 'http://127.0.0.1:11434/v1/chat/completions',
+        DOUZE_MODEL_ENDPOINT: 'https://api.example.com/v1/chat/completions',
+        DOUZE_MODEL_API_KEY: 'sk-remote',
       }),
     ).toEqual({ endpoint: 'http://127.0.0.1:11434/v1/chat/completions', model: 'local', local: true })
   })
 
   it('uses the remote provider only when no local endpoint is configured', () => {
-    expect(modelFromEnv({ RECON_MODEL_ENDPOINT: 'https://api.example.com/v1', RECON_MODEL_API_KEY: 'k' })).toEqual({
+    expect(modelFromEnv({ DOUZE_MODEL_ENDPOINT: 'https://api.example.com/v1', DOUZE_MODEL_API_KEY: 'k' })).toEqual({
       endpoint: 'https://api.example.com/v1',
       model: 'claude-sonnet-5',
       local: false,

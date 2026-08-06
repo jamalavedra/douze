@@ -1,7 +1,9 @@
 node_modules
 dist
-.recon
+.douze
 *.log
 test-results
 playwright-report
 .DS_Store
+*.mcpb
+douze-extension.zip

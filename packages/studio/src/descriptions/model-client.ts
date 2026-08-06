@@ -1,5 +1,5 @@
 /**
- * T-006.2 — description generation is the only part of Recon that may call a model, and it is
+ * T-006.2 — description generation is the only part of Douze that may call a model, and it is
  * optional: with nothing configured the writer falls back to a deterministic template, so the
  * whole studio pipeline runs offline (ADR-006).
  */
@@ -21,16 +21,16 @@ export interface ModelClient {
  * No configuration at all means no model, which is a supported mode, not an error.
  */
 export function modelFromEnv(env: Record<string, string | undefined> = process.env): ModelConfig | undefined {
-  const local = env['RECON_LOCAL_MODEL_ENDPOINT']
+  const local = env['DOUZE_LOCAL_MODEL_ENDPOINT']
   if (local !== undefined && local.length > 0) {
-    return { endpoint: local, model: env['RECON_LOCAL_MODEL'] ?? 'local', local: true }
+    return { endpoint: local, model: env['DOUZE_LOCAL_MODEL'] ?? 'local', local: true }
   }
-  const remote = env['RECON_MODEL_ENDPOINT']
+  const remote = env['DOUZE_MODEL_ENDPOINT']
   if (remote === undefined || remote.length === 0) return undefined
-  const key = env['RECON_MODEL_API_KEY']
+  const key = env['DOUZE_MODEL_API_KEY']
   return {
     endpoint: remote,
-    model: env['RECON_MODEL'] ?? 'claude-sonnet-5',
+    model: env['DOUZE_MODEL'] ?? 'claude-sonnet-5',
     local: false,
     ...(key !== undefined ? { api_key: key } : {}),
   }

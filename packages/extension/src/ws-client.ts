@@ -1,8 +1,8 @@
-import { HEARTBEAT_MS, type ClientMessage, type ServerMessage } from '@recon/shared'
+import { HEARTBEAT_MS, type ClientMessage, type ServerMessage } from '@douze/shared'
 
 /**
- * ADR-003 — the extension dials recond; recond never dials the browser. Chrome 116+ resets the
- * service-worker idle timer on every WebSocket send and receive, so recond's 20-second
+ * ADR-003 — the extension dials douzed; douzed never dials the browser. Chrome 116+ resets the
+ * service-worker idle timer on every WebSocket send and receive, so douzed's 20-second
  * heartbeat is what keeps the worker alive during a recording.
  */
 
@@ -107,7 +107,7 @@ export class DaemonSocket {
       try {
         this.options.onMessage(JSON.parse(String(event.data)) as ServerMessage)
       } catch {
-        /* recond only ever sends JSON; anything else is not ours to interpret */
+        /* douzed only ever sends JSON; anything else is not ours to interpret */
       }
     })
 

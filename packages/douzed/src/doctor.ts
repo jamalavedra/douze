@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { ReconError, Recipe, serializeRecipe, type DriftStatus, type Tool } from '@recon/shared'
+import { DouzeError, Recipe, serializeRecipe, type DriftStatus, type Tool } from '@douze/shared'
 import type { RecipeRegistry, SurfaceTool } from './registry.js'
 import type { RelayBridge } from './relay.js'
 
@@ -136,7 +136,7 @@ export class DriftWatcher {
       // Classify on the error CODE, never on message text. An extension that disconnected or a
       // call that timed out says nothing about the target's contract — treating those as
       // `breaking` would permanently degrade every tool in every recipe over a transient blip.
-      if (error instanceof ReconError) {
+      if (error instanceof DouzeError) {
         if (error.code === 'session_expired') {
           return { tool: tool.name, status: 'session_expired', detail: error.message }
         }
@@ -182,11 +182,11 @@ export class DriftWatcher {
       return
     }
 
-    const branch = `recon/drift-${file.replace(/\.ya?ml$/, '')}`
+    const branch = `douze/drift-${file.replace(/\.ya?ml$/, '')}`
     try {
       await run('git', ['checkout', '-B', branch], { cwd: this.recipesDir })
       // A pathspec commit touches only this file, leaving anything the user had staged alone.
-      await run('git', ['commit', '-m', `recon: drift patch for ${file}`, '--', file], { cwd: this.recipesDir })
+      await run('git', ['commit', '-m', `douze: drift patch for ${file}`, '--', file], { cwd: this.recipesDir })
     } catch {
       // Nothing to commit, or a hook refused — the recipe is already written either way.
     } finally {

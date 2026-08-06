@@ -1,4 +1,4 @@
-import { CONFIRM_PARAM } from '@recon/shared'
+import { CONFIRM_PARAM } from '@douze/shared'
 import type { Candidate, JsonSchema } from './types.js'
 
 export interface BulkResult {

@@ -1,5 +1,5 @@
 /**
- * A store-only ZIP writer. An `.mcpb` is a zip (ADR-008) and this is the whole of what Recon
+ * A store-only ZIP writer. An `.mcpb` is a zip (ADR-008) and this is the whole of what Douze
  * needs to produce one — Node ships no zip writer, and a compression dependency would be a new
  * piece of supply chain for a format that is a header, a payload, and a footer.
  */

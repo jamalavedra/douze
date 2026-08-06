@@ -1,4 +1,4 @@
-import type { Recipe, Tool } from '@recon/shared'
+import type { Recipe, Tool } from '@douze/shared'
 import type { Fixture } from './fixtures.js'
 import type { JsonSchema } from './types.js'
 
@@ -23,6 +23,12 @@ export interface MergeReport {
   added: string[]
 }
 
+/** What actually identifies a tool: the request it makes, not the name a user gave it. */
+function identity(tool: Tool): string {
+  const { method, path, graphql } = tool.request
+  return graphql ? `graphql|${graphql.operation}` : `${method}|${path}`
+}
+
 export interface MergeOptions {
   /** Stored fixtures by tool name, used for the AC-REC-003.3 conflict check. */
   fixtures?: Record<string, Fixture[]>
@@ -37,11 +43,19 @@ export function mergeRecipe(existing: Recipe, incoming: Tool[], options: MergeOp
   const today = options.today ?? new Date().toISOString().slice(0, 10)
   const fixtures = options.fixtures ?? {}
   const byName = new Map(incoming.map((tool) => [tool.name, tool]))
+  /**
+   * AC-REC-003.1 — `name` is user-editable, so a renamed tool must still be recognised as the
+   * same tool on re-inference. Matching on name alone means a rename produces a duplicate: the
+   * renamed tool is marked `unverified` even though its traffic was observed, and the freshly
+   * inferred one is added alongside under the old name. Request identity is what actually
+   * identifies a tool.
+   */
+  const byIdentity = new Map(incoming.map((tool) => [identity(tool), tool]))
   const report: MergeReport = { recipe: existing, preserved: [], retained: [], conflicts: [], added: [] }
 
   const tools: Tool[] = []
   for (const current of existing.tools) {
-    const fresh = byName.get(current.name)
+    const fresh = byName.get(current.name) ?? byIdentity.get(identity(current))
     if (!fresh) {
       // AC-REC-003.2 — absent from this capture is not the same as gone.
       tools.push({
@@ -51,7 +65,8 @@ export function mergeRecipe(existing: Recipe, incoming: Tool[], options: MergeOp
       report.retained.push(current.name)
       continue
     }
-    byName.delete(current.name)
+    byName.delete(fresh.name)
+    byIdentity.delete(identity(fresh))
 
     const conflict = fixtureConflict(fresh, fixtures[current.name] ?? [])
     if (conflict !== undefined) {

@@ -1,28 +1,30 @@
-import { ReconError, type RelayErrorCode } from '@recon/shared'
+import { DouzeError, type RelayErrorCode } from '@douze/shared'
 
 /**
  * REQ-CON-004 — a chat client gives the user no terminal, so every failure has to explain itself
- * inside the message. recond owns the wording for the states it can see; this module owns the
+ * inside the message. douzed owns the wording for the states it can see; this module owns the
  * states only a client can see (an unreachable daemon) and the rule that binds all of them:
  * AC-CON-004.4 — never retry, never substitute a headless attempt.
  */
 
-/** The shape recond returns on a failed relay: `{ error, message, ...detail }`. */
+/** The shape douzed returns on a failed relay: `{ error, message, ...detail }`. */
 export interface DaemonErrorBody {
   error?: string
   message?: string
   [key: string]: unknown
 }
 
+/**
+ * This one surfaces inside the Claude chat window, to someone who did not install a daemon and
+ * has no terminal open. It names the one action that fixes it and nothing else — a second option
+ * they cannot perform is not a fallback, it is a reason to stop reading.
+ */
 const RELAY_UNREACHABLE_HINT =
-  'The Recon relay (recond) is not running, so no tool can execute. Start it with `recon start` in a terminal, then retry.'
+  "Douze's background service isn't running, so nothing can run right now. Quit Claude Desktop and open it again."
 
-export const relayUnreachable = (cause?: string): ReconError =>
-  new ReconError(
-    'relay_unreachable',
-    cause ? `${RELAY_UNREACHABLE_HINT} (${cause})` : RELAY_UNREACHABLE_HINT,
-    {},
-  )
+/** The cause travels in the detail: "ECONNREFUSED 127.0.0.1:8787" is not a sentence for a reader. */
+export const relayUnreachable = (cause?: string): DouzeError =>
+  new DouzeError('relay_unreachable', RELAY_UNREACHABLE_HINT, cause ? { cause } : {})
 
 const CODES = new Set<string>([
   'relay_unreachable',
@@ -35,17 +37,17 @@ const CODES = new Set<string>([
 ])
 
 /**
- * Turns whatever recond returned into a `ReconError`. An unrecognised body still becomes a
+ * Turns whatever douzed returned into a `DouzeError`. An unrecognised body still becomes a
  * legible error rather than a stack trace, because the user may only ever see the chat window.
  */
-export function fromDaemon(body: DaemonErrorBody, status: number, tool: string): ReconError {
+export function fromDaemon(body: DaemonErrorBody, status: number, tool: string): DouzeError {
   const { error, message, ...detail } = body
   if (typeof error === 'string' && CODES.has(error)) {
-    return new ReconError(error as RelayErrorCode, message ?? error, detail)
+    return new DouzeError(error as RelayErrorCode, message ?? error, detail)
   }
-  return new ReconError(
+  return new DouzeError(
     'relay_unreachable',
-    `The Recon relay rejected the call to "${tool}" (HTTP ${status}): ${message ?? error ?? 'no reason given'}.`,
+    `The Douze relay rejected the call to "${tool}" (HTTP ${status}): ${message ?? error ?? 'no reason given'}.`,
     { tool, ...detail },
   )
 }
@@ -54,7 +56,7 @@ export function fromDaemon(body: DaemonErrorBody, status: number, tool: string):
  * The text a client prints. Every branch ends in an instruction the user can act on without a
  * terminal, and none of them suggests a retry the runtime would perform itself.
  */
-export function explain(error: ReconError): string {
+export function explain(error: DouzeError): string {
   const suffix = FOLLOW_UP[error.code]
   return suffix ? `${error.message} ${suffix}` : error.message
 }
@@ -64,7 +66,7 @@ export function explain(error: ReconError): string {
  * nothing in this package reissues a failed call or falls back to headless execution.
  */
 const FOLLOW_UP: Partial<Record<RelayErrorCode, string>> = {
-  relay_unreachable: 'Recon did not retry and did not execute the request any other way.',
-  extension_disconnected: 'Recon did not retry and did not execute the request without the browser.',
-  session_expired: 'Recon did not retry, so no further request was sent to the target.',
+  relay_unreachable: 'Douze did not retry and did not execute the request any other way.',
+  extension_disconnected: 'Douze did not retry and did not execute the request without the browser.',
+  session_expired: 'Douze did not retry, so no further request was sent to the target.',
 }

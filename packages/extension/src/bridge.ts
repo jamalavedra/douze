@@ -17,8 +17,8 @@ import type { CaptureBatch, GestureEvent, PageEvent } from './messages.js'
       // Load-bearing: same frame only. Rejects iframes, the opener, and every other window.
       if (e.source !== window) return
       if (e.origin !== location.origin && e.origin !== 'null') return
-      const data = e.data as { __recon?: number; dir?: string; payload?: PageEvent } | null
-      if (data?.__recon !== 1 || data.dir !== 'page->cs' || !data.payload) return
+      const data = e.data as { __douze?: number; dir?: string; payload?: PageEvent } | null
+      if (data?.__douze !== 1 || data.dir !== 'page->cs' || !data.payload) return
       BUFFER.push(data.payload)
       schedule()
     },
@@ -36,7 +36,7 @@ import type { CaptureBatch, GestureEvent, PageEvent } from './messages.js'
     flushing = false
     if (!BUFFER.length) return
     const batch = BUFFER.splice(0, 200)
-    const message: CaptureBatch = { type: 'recon:capture', frameUrl: location.href, batch }
+    const message: CaptureBatch = { type: 'douze:capture', frameUrl: location.href, batch }
     try {
       await chrome.runtime.sendMessage(message)
     } catch {
@@ -136,7 +136,7 @@ import type { CaptureBatch, GestureEvent, PageEvent } from './messages.js'
 
   // Announce to the MAIN world. Ordering between the two scripts is not guaranteed, so
   // announce twice: now, and on a microtask in case MAIN loaded first.
-  const announce = (): void => window.postMessage({ __recon: 1, dir: 'cs->page', kind: 'ready' }, '/')
+  const announce = (): void => window.postMessage({ __douze: 1, dir: 'cs->page', kind: 'ready' }, '/')
   announce()
   queueMicrotask(announce)
 })()

@@ -4,38 +4,38 @@ import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { addToClaudeCode, configTarget, parseMcpAdd, resolveServerName } from './commands/mcp-add.js'
 
-const scratch = (): string => mkdtempSync(join(tmpdir(), 'recon-mcpadd-'))
+const scratch = (): string => mkdtempSync(join(tmpdir(), 'douze-mcpadd-'))
 
 describe('reserved server names (AC-CON-002.3)', () => {
   it('suffixes every name Claude Code reserves rather than failing', () => {
     for (const reserved of ['workspace', 'claude-in-chrome', 'computer-use', 'Claude Preview', 'Claude Browser']) {
       const resolved = resolveServerName(reserved)
       expect(resolved).not.toBe(reserved)
-      expect(resolved).toBe(`${reserved}-recon`)
+      expect(resolved).toBe(`${reserved}-douze`)
     }
   })
 
   it('matches reserved names case-insensitively', () => {
-    expect(resolveServerName('Workspace')).toBe('Workspace-recon')
-    expect(resolveServerName('COMPUTER-USE')).toBe('COMPUTER-USE-recon')
+    expect(resolveServerName('Workspace')).toBe('Workspace-douze')
+    expect(resolveServerName('COMPUTER-USE')).toBe('COMPUTER-USE-douze')
   })
 
   it('leaves an unreserved name alone', () => {
-    expect(resolveServerName('recon')).toBe('recon')
+    expect(resolveServerName('douze')).toBe('douze')
     expect(resolveServerName('workspace-tools')).toBe('workspace-tools')
   })
 })
 
 describe('registration (AC-CON-002.1)', () => {
-  it('writes a stdio entry invoking `recon --mcp` and reports the file it changed', () => {
+  it('writes a stdio entry invoking `douze --mcp` and reports the file it changed', () => {
     const cwd = scratch()
     const result = addToClaudeCode({ scope: 'project', cwd })
 
-    expect(result).toMatchObject({ name: 'recon', scope: 'project', command: 'recon', args: ['--mcp'] })
+    expect(result).toMatchObject({ name: 'douze', scope: 'project', command: 'douze', args: ['--mcp'] })
     expect(result.path).toBe(join(cwd, '.mcp.json'))
 
     const written = JSON.parse(readFileSync(result.path, 'utf8'))
-    expect(written.mcpServers.recon).toEqual({ type: 'stdio', command: 'recon', args: ['--mcp'] })
+    expect(written.mcpServers.douze).toEqual({ type: 'stdio', command: 'douze', args: ['--mcp'] })
   })
 
   it('registers a reserved name under its suffix and succeeds (COV_CON_002.2)', () => {
@@ -43,9 +43,9 @@ describe('registration (AC-CON-002.1)', () => {
     const result = addToClaudeCode({ name: 'workspace', scope: 'project', cwd })
 
     expect(result.requested).toBe('workspace')
-    expect(result.name).toBe('workspace-recon')
+    expect(result.name).toBe('workspace-douze')
     const written = JSON.parse(readFileSync(result.path, 'utf8'))
-    expect(written.mcpServers['workspace-recon']).toBeDefined()
+    expect(written.mcpServers['workspace-douze']).toBeDefined()
     expect(written.mcpServers['workspace']).toBeUndefined()
   })
 
@@ -81,7 +81,7 @@ describe('argv parsing', () => {
       scope: 'project',
       name: 'workspace',
     })
-    expect(parseMcpAdd(['-c', 'pnpm recon --mcp'])).toEqual({ command: 'pnpm recon --mcp' })
+    expect(parseMcpAdd(['-c', 'pnpm douze --mcp'])).toEqual({ command: 'pnpm douze --mcp' })
     expect(parseMcpAdd([])).toEqual({})
   })
 })

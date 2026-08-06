@@ -1,4 +1,4 @@
-import type { SideEffect } from '@recon/shared'
+import type { SideEffect } from '@douze/shared'
 
 /** Observations past this point add no further confidence. */
 const SATURATION = 5

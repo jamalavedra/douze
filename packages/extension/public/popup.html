@@ -2,69 +2,137 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <title>Recon</title>
+    <title>Douze</title>
     <style>
-      :root { color-scheme: light dark; }
+      /* Verbatim from the review page's :root — the popup and the review page are one product. */
+      :root {
+        color-scheme: light dark;
+        --bg: light-dark(#ffffff, #16181c);
+        --fg: light-dark(#15171c, #f1f3f6);
+        --muted: light-dark(#565e6c, #a3abba);
+        --line: light-dark(#d9dce3, #363b45);
+        --accent: light-dark(#1a56c4, #86aaf7);
+        --safe: light-dark(#166a44, #6ec99c);
+        --changes: light-dark(#82500a, #e2a862);
+        --danger: light-dark(#a11f1f, #f28c8c);
+      }
+      * { box-sizing: border-box; }
       body {
         width: 320px;
         margin: 0;
-        padding: 12px;
-        font: 13px/1.4 system-ui, sans-serif;
+        padding: 16px;
+        background: var(--bg);
+        color: var(--fg);
+        font: 13px/1.45 system-ui, sans-serif;
       }
-      h1 { font-size: 13px; margin: 0 0 8px; display: flex; justify-content: space-between; }
-      .dot { font-weight: 400; opacity: 0.7; }
-      label { display: block; margin: 8px 0 3px; font-size: 11px; opacity: 0.75; }
-      input, textarea, button { width: 100%; box-sizing: border-box; font: inherit; }
-      input, textarea { padding: 5px; border-radius: 5px; border: 1px solid rgba(128,128,128,0.5); background: transparent; color: inherit; }
-      button { padding: 6px; margin-top: 8px; border-radius: 5px; border: 0; background: #1f6feb; color: #fff; cursor: pointer; }
-      button.secondary { background: rgba(128,128,128,0.25); color: inherit; }
-      button:disabled { opacity: 0.5; cursor: default; }
-      .row { display: flex; gap: 8px; align-items: center; }
-      .row input[type='checkbox'] { width: auto; }
-      .count { font-size: 22px; font-weight: 600; }
-      .muted { opacity: 0.65; font-size: 11px; word-break: break-all; }
-      .error { color: #d1242f; font-size: 11px; margin-top: 6px; }
-      details { margin-top: 10px; }
-      summary { cursor: pointer; font-size: 11px; opacity: 0.75; }
-      hr { border: 0; border-top: 1px solid rgba(128,128,128,0.3); margin: 10px 0; }
+      h1 { font-size: 15px; font-weight: 600; margin: 0 0 8px; }
+      p { margin: 0 0 12px; }
+      .lead { font-size: 13px; color: var(--muted); }
+      .site { font-size: 17px; font-weight: 600; margin: 0 0 12px; word-break: break-all; }
+      .muted { color: var(--muted); font-size: 11px; }
+      label { display: block; margin: 0 0 4px; font-size: 11px; color: var(--muted); }
+      input, textarea, button, summary { font: inherit; }
+      input[type='text'], textarea {
+        width: 100%;
+        padding: 6px 8px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: transparent;
+        color: inherit;
+      }
+      button {
+        width: 100%;
+        padding: 8px;
+        margin-top: 12px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: transparent;
+        color: inherit;
+        cursor: pointer;
+      }
+      /* `--bg`, not white: the dark-mode accent is a light blue that white text disappears into. */
+      button.primary { border-color: transparent; background: var(--accent); color: var(--bg); font-weight: 600; }
+      button.quiet { margin-top: 8px; padding: 4px 8px; width: auto; font-size: 11px; color: var(--muted); }
+      :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .live { font-size: 11px; font-weight: 600; color: var(--danger); text-transform: uppercase; letter-spacing: 0.04em; }
+      .live::before { content: '\25CF'; margin-right: 4px; }
+      .count { font-size: 15px; margin: 0 0 12px; }
+      .tools { margin: 12px 0 0; padding: 0; list-style: none; }
+      .tools li { font-size: 11px; color: var(--muted); padding: 2px 0 2px 10px; border-left: 2px solid var(--line); }
+      /* The word carries the meaning; the colour only reinforces it. */
+      .tools .kind { font-weight: 600; }
+      .tools li[data-effect='read'] { border-color: var(--safe); }
+      .tools li[data-effect='read'] .kind { color: var(--safe); }
+      .tools li[data-effect='write'] { border-color: var(--changes); }
+      .tools li[data-effect='write'] .kind { color: var(--changes); }
+      .tools li[data-effect='destructive'] { border-color: var(--danger); }
+      .tools li[data-effect='destructive'] .kind { color: var(--danger); }
+      .error { color: var(--danger); font-size: 11px; margin: 12px 0 0; }
+      .note { color: var(--muted); font-size: 11px; margin: 8px 0 0; }
+      details { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 8px; }
+      summary { cursor: pointer; font-size: 11px; color: var(--muted); }
+      details label { margin-top: 12px; }
+      .check { display: flex; gap: 8px; align-items: baseline; margin-top: 12px; }
+      .check label { margin: 0; font-size: 13px; color: inherit; }
+      .check input { margin: 0; }
     </style>
   </head>
   <body>
-    <h1>Recon <span class="dot" id="connection">…</span></h1>
+    <main>
+      <section id="disconnected" hidden>
+        <h1>Douze</h1>
+        <p class="lead">
+          Douze can't reach Claude Desktop. Open Claude Desktop — and if you haven't added Douze to
+          it yet, install the Douze connector first (double-click Douze.mcpb).
+        </p>
+      </section>
 
-    <section id="idle" hidden>
-      <label for="name">Session name</label>
-      <input id="name" placeholder="orders" autocomplete="off" />
-      <div class="muted" id="origin"></div>
-      <div class="row"><input type="checkbox" id="use-debugger" /><label for="use-debugger" style="margin:8px 0 0">Debugger capture (shows a browser banner)</label></div>
-      <button id="start">Start recording</button>
-    </section>
+      <section id="unsupported" hidden>
+        <h1>Douze</h1>
+        <p class="lead">Douze can't watch this page. Open the dashboard you want Claude to use, then click Douze again.</p>
+      </section>
 
-    <section id="active" hidden>
-      <div class="muted" id="session-name"></div>
-      <div class="count"><span id="count">0</span> <span class="muted">exchanges</span></div>
-      <label for="note">Note for exchanges since the last note</label>
-      <textarea id="note" rows="2" placeholder="transitions an issue to done"></textarea>
-      <button class="secondary" id="annotate">Attach note</button>
-      <button id="stop">Stop recording</button>
-    </section>
+      <section id="ready" hidden>
+        <p class="site" id="hostname"></p>
+        <label for="name">What should Claude call this site?</label>
+        <input id="name" type="text" autocomplete="off" />
+        <button class="primary" id="watch">Watch this site</button>
+        <!-- Chrome's own permission prompt fires on that click; this is the answer to it. -->
+        <p class="note">Stays on this computer. Douze never sees your password.</p>
+        <p class="note" id="tools-summary" hidden></p>
+        <ul class="tools" id="tools"></ul>
+      </section>
 
-    <p class="error" id="error" hidden></p>
+      <section id="watching" hidden>
+        <h1 id="watching-name"></h1>
+        <p class="live">Recording</p>
+        <p class="count" id="count"></p>
+        <label for="note">What did you just do?</label>
+        <textarea id="note" rows="2" placeholder="moved a task to Done"></textarea>
+        <button class="quiet" id="add-note">Add note</button>
+        <p class="note" id="noted" hidden>Noted.</p>
+        <button class="primary" id="done">Done</button>
+      </section>
+
+      <section id="finished" hidden>
+        <p class="lead" id="finished-text"></p>
+        <button class="primary" id="finished-action"></button>
+      </section>
+
+      <p class="error" id="error" role="alert" hidden></p>
+    </main>
 
     <details>
-      <summary>Daemon connection</summary>
-      <label for="port">Port</label>
-      <input id="port" type="number" inputmode="numeric" />
-      <label for="token">Install token (~/.recon/token)</label>
-      <input id="token" type="password" autocomplete="off" />
-      <button class="secondary" id="save">Save</button>
-    </details>
-
-    <details>
-      <summary>Noise list additions</summary>
-      <label for="noise">Extra hosts to exclude, one per line. Applies to the next session.</label>
+      <summary>Advanced</summary>
+      <div class="check">
+        <input type="checkbox" id="use-debugger" />
+        <label for="use-debugger">Thorough recording (Chrome will show a warning bar while it's on)</label>
+      </div>
+      <p class="muted">Only needed if Douze records nothing without it.</p>
+      <label for="noise">Ignore these sites</label>
       <textarea id="noise" rows="3" placeholder="metrics.internal.example"></textarea>
-      <button class="secondary" id="save-noise">Save noise list</button>
+      <p class="muted">One address per line. Applies next time you record.</p>
+      <button class="quiet" id="save-noise">Save</button>
     </details>
 
     <script type="module" src="popup.js"></script>

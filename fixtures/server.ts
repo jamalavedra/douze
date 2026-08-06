@@ -154,6 +154,9 @@ function handleControl(path: string, req: IncomingMessage, res: ServerResponse) 
   if (key === 'log') return json(res, 200, control.log)
   if (key === 'reset') {
     control.log = []
+    // `pageStateAuth` is deliberately NOT reset: it selects which HTML variant is served and is
+    // configured before the page loads, whereas these flags gate per-assertion behaviour. Specs
+    // reset the log after setting it up (see e2e/relay/execution.spec.ts boot()).
     Object.assign(control, { sessionValid: true, widenResponse: false, breakResponse: false, delayMs: 0 })
     return json(res, 200, { ok: true })
   }

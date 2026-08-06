@@ -2,12 +2,12 @@ import { mkdtempSync, readFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { beforeEach, describe, expect, it } from 'vitest'
-import { Recipe, parseRecipe, serializeRecipe } from '@recon/shared'
-import { StudioSession, baseUrlFrom, createApi, type StudioConfig } from './api.js'
+import { Recipe, parseRecipe, serializeRecipe } from '@douze/shared'
+import { StudioSession, baseUrlFrom, type StudioConfig } from './api.js'
+import { reviewPage } from './app.js'
 import { readFixtures, toFixture, writeFixture } from './fixtures.js'
 import { mergeRecipe } from './merge.js'
 import { infer } from './inference/engine.js'
-import { startStudio } from './server.js'
 import { makeExchanges } from './testing.js'
 import type { JsonSchema } from './types.js'
 
@@ -15,7 +15,7 @@ let home: string
 let config: StudioConfig
 
 beforeEach(() => {
-  home = mkdtempSync(join(tmpdir(), 'recon-studio-'))
+  home = mkdtempSync(join(tmpdir(), 'douze-studio-'))
   config = {
     recipeName: 'orders',
     baseUrl: 'https://app.example.com',
@@ -275,47 +275,71 @@ describe('REQ-REC-003 non-destructive regeneration', () => {
   })
 })
 
-describe('review HTTP API', () => {
-  it('serves state, restricts bulk approval, and saves', async () => {
-    const studio = session()
-    const app = createApi(studio)
+describe('the review page', () => {
+  const html = () => reviewPage({ id: 'abc-123', token: 'tok-xyz' })
 
-    const state = (await (await app.request('/api/state')).json()) as { candidates: { name: string }[] }
-    expect(state.candidates).toHaveLength(4)
-
-    const bulk = (await (await app.request('/api/approve-reads', { method: 'POST' })).json()) as {
-      approved: string[]
-      skipped: string[]
-    }
-    expect(bulk.approved.sort()).toEqual(['get_order', 'list_orders'])
-    expect(bulk.skipped.sort()).toEqual(['create_order', 'delete_order'])
-
-    const edit = await app.request('/api/candidates/list_orders/edit', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ field: 'description', value: 'Edited via the API.' }),
-    })
-    // AC-REC-002.2 — the edit is on disk immediately, before any explicit save.
-    expect((await edit.json()) as { user_edited: string[] }).toMatchObject({ ok: true, user_edited: ['description'] })
-    expect(readRecipe().tools.find((t) => t.name === 'list_orders')?.description).toBe('Edited via the API.')
-
-    const approve = await app.request('/api/candidates/delete_order/approve', { method: 'POST' })
-    expect(JSON.stringify(await approve.json())).toContain('confirm')
-
-    const save = (await (await app.request('/api/save', { method: 'POST' })).json()) as { path: string }
-    expect(existsSync(save.path)).toBe(true)
-    expect(readRecipe().tools.find((t) => t.name === 'list_orders')?.description).toBe('Edited via the API.')
+  it('inlines the session and token so its own fetches authenticate', () => {
+    expect(html()).toContain('const SESSION = "abc-123"')
+    expect(html()).toContain('const TOKEN = "tok-xyz"')
   })
 
-  it('serves the review SPA on loopback', async () => {
-    const server = await startStudio(session())
-    try {
-      expect(server.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/)
-      const html = await (await fetch(server.url)).text()
-      expect(html).toContain('Recon Studio')
-      expect(html).toContain('Approve all reads')
-    } finally {
-      await server.close()
+  it('speaks plain English rather than the vocabulary of the recipe format', () => {
+    const page = html()
+    for (const copy of [
+      'What Claude can do on ',
+      'Douze watched you use this site and worked out what it could do for you.',
+      'Reads information',
+      'Makes changes',
+      'Deletes things',
+      'Only seen once',
+      'Name is a guess',
+      'Not checked yet',
+      'Claude will be able to do this on your real account.',
+      'Turn these on',
+      'Nothing selected',
+      'Open Claude Desktop and ask it. Nothing else to install.',
+      'Technical details',
+    ]) {
+      expect(page).toContain(copy)
     }
+    // The developer vocabulary the old screen used must not be back on the first screen.
+    expect(page).not.toContain('Approve')
+    expect(page).not.toContain('confidence')
+  })
+
+  it('carries a category word and a marker glyph, never colour alone', () => {
+    const page = html()
+    expect(page).toMatch(/mark: '\\u00b7'/)
+    expect(page).toContain('--safe')
+    expect(page).toContain('--changes')
+    expect(page).toContain('--danger')
+  })
+})
+
+describe('renaming a tool (AC-REC-003.1)', () => {
+  it('recognises a renamed tool on re-inference instead of duplicating it', () => {
+    const studio = session()
+    studio.approveReads()
+    const original = studio.candidates[0]!.tool.name
+    studio.edit(original, 'name', 'find_open_orders')
+    const saved = studio.save()
+    expect(saved.recipe.tools.some((t) => t.name === 'find_open_orders')).toBe(true)
+
+    // Re-infer the identical traffic: the rename must be recognised, not treated as a new tool.
+    const again = session()
+    again.approveReads()
+    const report = again.save()
+
+    const names = report.recipe.tools.map((t) => t.name)
+    expect(names).toContain('find_open_orders')
+    // The old name must NOT reappear as a second tool for the same endpoint.
+    expect(names).not.toContain(original)
+    expect(names.filter((n) => n === 'find_open_orders')).toHaveLength(1)
+
+    // And it is not falsely marked unverified — its traffic was observed in this very capture.
+    const renamed = report.recipe.tools.find((t) => t.name === 'find_open_orders')!
+    expect(renamed.flags.unverified).toBe(false)
+    // AC-REC-003.1 — the user's name is kept and the inferred alternative is a suggestion.
+    expect(renamed.flags.user_edited).toContain('name')
   })
 })

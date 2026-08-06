@@ -83,7 +83,8 @@ describe('REQ-INF-004 GraphQL operation splitting', () => {
           position: 3,
           method: 'POST',
           url: '/graphql',
-          request_body: graphqlBody(CREATE_ISSUE, { title: '' }, 'CreateIssue'),
+          // Omits `title` entirely — the very reason the server rejected it.
+          request_body: graphqlBody(CREATE_ISSUE, {}, 'CreateIssue'),
           status: 200,
           response_body: { data: null, errors: [{ message: 'title must not be empty', code: 'VALIDATION' }] },
         },
@@ -99,7 +100,11 @@ describe('REQ-INF-004 GraphQL operation splitting', () => {
     expect(create.tool.observations).toBe(1)
     expect(create.tool.flags.sparse).toBe(true)
 
-    // Its variables still describe the input, because the request itself was well formed.
+    /**
+     * AC-INF-004.4 — "shall exclude it from schema inference", input schema included. The failed
+     * call omitted `title`; had it reached input inference, `title` would be optional here and the
+     * tool would advertise that an agent may reproduce exactly the request the server rejected.
+     */
     expect((create.tool.request.input_schema as JsonSchema)['required']).toEqual(['title'])
   })
 

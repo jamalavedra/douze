@@ -10,13 +10,13 @@ import type { CapturedBody, PageEvent } from './messages.js'
 
 declare global {
   interface Window {
-    __recon_interceptor__?: true
+    __douze_interceptor__?: true
   }
 }
 
 ;(() => {
-  if (window.__recon_interceptor__) return
-  Object.defineProperty(window, '__recon_interceptor__', { value: true })
+  if (window.__douze_interceptor__) return
+  Object.defineProperty(window, '__douze_interceptor__', { value: true })
 
   const MAX_BODY = 2 * 1024 * 1024
   const nativeFetch = window.fetch
@@ -38,7 +38,7 @@ declare global {
     // '/' means "same origin as this document" and is the one form that works in about:blank
     // and sandboxed frames, where `location.origin` is the string "null".
     try {
-      window.postMessage({ __recon: 1, dir: 'page->cs', payload }, '/')
+      window.postMessage({ __douze: 1, dir: 'page->cs', payload }, '/')
     } catch {
       /* uncloneable payload — drop it rather than throwing into page code */
     }
@@ -48,8 +48,8 @@ declare global {
     'message',
     (e: MessageEvent) => {
       if (e.source !== window) return
-      const data = e.data as { __recon?: number; dir?: string; kind?: string } | null
-      if (data?.__recon !== 1 || data.dir !== 'cs->page' || data.kind !== 'ready') return
+      const data = e.data as { __douze?: number; dir?: string; kind?: string } | null
+      if (data?.__douze !== 1 || data.dir !== 'cs->page' || data.kind !== 'ready') return
       bridgeReady = true
       for (const payload of queue.splice(0)) post(payload)
     },
@@ -150,7 +150,7 @@ declare global {
     return out
   }
 
-  window.fetch = function reconFetch(this: unknown, input: RequestInfo | URL, init?: RequestInit) {
+  window.fetch = function douzeFetch(this: unknown, input: RequestInfo | URL, init?: RequestInit) {
     let req: Request
     try {
       req = new NativeRequest(input, init)
@@ -228,14 +228,14 @@ declare global {
     headers: Record<string, string>
     t: number
   }
-  const STATE = Symbol('recon')
+  const STATE = Symbol('douze')
   type TrackedXhr = XMLHttpRequest & { [STATE]?: XhrState | null }
 
   const xOpen = NativeXHR.prototype.open
   const xSend = NativeXHR.prototype.send
   const xHeader = NativeXHR.prototype.setRequestHeader
 
-  NativeXHR.prototype.open = function reconOpen(
+  NativeXHR.prototype.open = function douzeOpen(
     this: TrackedXhr,
     method: string,
     url: string | URL,
@@ -255,13 +255,13 @@ declare global {
     return (xOpen as (...a: unknown[]) => void).call(this, method, url, ...rest)
   }
 
-  NativeXHR.prototype.setRequestHeader = function reconSetHeader(this: TrackedXhr, name: string, value: string) {
+  NativeXHR.prototype.setRequestHeader = function douzeSetHeader(this: TrackedXhr, name: string, value: string) {
     const state = this[STATE]
     if (state) state.headers[name] = value
     return xHeader.call(this, name, value)
   }
 
-  NativeXHR.prototype.send = function reconSend(this: TrackedXhr, body?: Document | XMLHttpRequestBodyInit | null) {
+  NativeXHR.prototype.send = function douzeSend(this: TrackedXhr, body?: Document | XMLHttpRequestBodyInit | null) {
     const state = this[STATE]
     if (state) {
       post({

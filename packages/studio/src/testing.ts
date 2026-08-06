@@ -1,4 +1,4 @@
-import type { Exchange } from '@recon/shared'
+import type { Exchange } from '@douze/shared'
 
 /** Test support: a valid `Exchange` from the handful of fields a given case actually cares about. */
 export interface ExchangeDraft {

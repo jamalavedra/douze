@@ -8,11 +8,11 @@ import {
   redactBody,
   redactHeaders,
   redactUrl,
-} from '@recon/shared'
+} from '@douze/shared'
 
 /**
  * #CaptureStore — persists sessions, exchanges, and annotation spans, and is the last gate
- * before anything touches disk (AC-CAP-005, TR-6). Uses node:sqlite so recond ships with no
+ * before anything touches disk (AC-CAP-005, TR-6). Uses node:sqlite so douzed ships with no
  * native dependency to compile.
  */
 export class CaptureStore {
@@ -69,7 +69,7 @@ export class CaptureStore {
   }
 
   /**
-   * Redaction is re-applied here even though the extension already ran it, because recond also
+   * Redaction is re-applied here even though the extension already ran it, because douzed also
    * ingests HAR files and must not depend on an upstream having been careful (AC-CAP-006.1).
    */
   appendExchange(input: Exchange): Exchange {

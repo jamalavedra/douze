@@ -60,3 +60,33 @@ describe('truncation (AC-RUN-004.2)', () => {
     expect(shapeResult(body, { primary_payload_path: '$.data', raw: true }).truncated).toBeDefined()
   })
 })
+
+describe('AC-RUN-004.2 truncation at the UTF-8 boundary', () => {
+  /**
+   * The cap is a BYTE cap. `Buffer.subarray(0, cap).toString('utf8')` splits a multi-byte
+   * sequence into a 3-byte U+FFFD, so a naive cut returns MORE bytes than the cap it was
+   * enforcing — and reports the violation as if compliant. Every offset that can straddle the
+   * boundary is exercised, because only some of them split a sequence.
+   */
+  it('never returns more than the cap, whatever straddles it', () => {
+    for (let pad = 0; pad < 8; pad++) {
+      // '😀' is 4 bytes; padding shifts where it lands relative to the cap.
+      const payload = 'a'.repeat(MAX_RESULT_BYTES - pad) + '😀'.repeat(64)
+      const result = shapeResult({ data: payload }, { primary_payload_path: '$.data' })
+
+      const bytes = Buffer.byteLength(result.data as string, 'utf8')
+      expect(bytes, `pad=${pad}`).toBeLessThanOrEqual(MAX_RESULT_BYTES)
+      // The reported size must be the truth, not a number that contradicts the returned payload.
+      expect(result.truncated?.returned_bytes, `pad=${pad}`).toBe(bytes)
+      // And the cut must not manufacture a replacement character out of a split sequence.
+      expect(result.data as string, `pad=${pad}`).not.toContain('�')
+    }
+  })
+
+  it('leaves a multi-byte payload under the cap untouched', () => {
+    const payload = '😀'.repeat(10)
+    const result = shapeResult({ data: payload }, { primary_payload_path: '$.data' })
+    expect(result.data).toBe(payload)
+    expect(result.truncated).toBeUndefined()
+  })
+})

@@ -1,24 +1,24 @@
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { ReconError, type Recipe } from '@recon/shared'
+import { DouzeError, type Recipe } from '@douze/shared'
 import { buildRequest } from './relay.js'
 import type { SurfaceTool } from './registry.js'
 
 const run = promisify(execFile)
 
-const SERVICE = 'recon-headless'
+const SERVICE = 'douze-headless'
 
 /**
  * AC-EXE-004.3 — every headless invocation says so. This is the degraded path and must never
  * be reachable by implicit fallback from the relay (WO-013 out-of-scope note, AC-CON-004.4).
  */
 export const DEGRADED_NOTICE =
-  'Executed via Headless Mode — the degraded path. Requests were issued directly from recond ' +
+  'Executed via Headless Mode — the degraded path. Requests were issued directly from douzed ' +
   'using a stored session rather than through your signed-in browser.'
 
 /**
  * AC-EXE-004.1 — the session lives in the OS keychain; configuration holds only a reference.
- * macOS `security` is used directly so recond ships without a native keychain dependency.
+ * macOS `security` is used directly so douzed ships without a native keychain dependency.
  */
 export class Keychain {
   constructor(private readonly service = SERVICE) {}
@@ -65,16 +65,16 @@ export async function executeHeadless(
 ): Promise<HeadlessResult> {
   const account = recipe.auth.keychain_ref
   if (recipe.auth.mode !== 'headless' || !account) {
-    throw new ReconError(
+    throw new DouzeError(
       'relay_unreachable',
-      `Headless Mode is not enabled for "${recipe.name}". Enable it explicitly with \`recon headless enable ${recipe.name}\`, or start Chrome so the browser relay can run.`,
+      `Headless Mode is not enabled for "${recipe.name}". Enable it explicitly with \`douze headless enable ${recipe.name}\`, or start Chrome so the browser relay can run.`,
       { recipe: recipe.name },
     )
   }
 
   const session = await keychain.get(account)
   if (!session) {
-    throw new ReconError(
+    throw new DouzeError(
       'session_expired',
       `No stored session for "${recipe.name}". Browser relay is required to re-establish it: open Chrome, sign in, and re-enable Headless Mode.`,
       { recipe: recipe.name },
@@ -92,7 +92,7 @@ export async function executeHeadless(
     }
     if (!refreshed || response.status === 401) {
       await keychain.clear(account)
-      throw new ReconError(
+      throw new DouzeError(
         'session_expired',
         `The stored session for "${recipe.name}" could not be refreshed and has been cleared. Browser relay is required to re-establish it.`,
         { recipe: recipe.name },

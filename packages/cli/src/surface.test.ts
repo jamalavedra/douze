@@ -3,8 +3,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { Cli, Mcp } from 'incur'
-import type { RegistryState, SurfaceTool } from '@recon/recond'
-import type { Tool } from '@recon/shared'
+import type { RegistryState, SurfaceTool } from '@douze/douzed'
+import type { Tool } from '@douze/shared'
 import type { RelayClient } from './relay-client.js'
 import { RESERVED_GROUPS, ToolSurfaceBuilder } from './surface.js'
 import { toZodObject } from './schema-to-zod.js'
@@ -52,7 +52,7 @@ const surface = (recipe: string, t: Tool, overrides: Partial<SurfaceTool> = {}):
 const state = (tools: SurfaceTool[], revision: number): RegistryState => ({ tools, errors: [], revision })
 
 function build(): { builder: ToolSurfaceBuilder; relay: RelayClient; root: ReturnType<typeof Cli.create> } {
-  const root = Cli.create('recon', { description: 'Recon', version: '0.1.0' })
+  const root = Cli.create('douze', { description: 'Douze', version: '0.1.0' })
   const relay = { call: vi.fn().mockResolvedValue({ status: 200, duration_ms: 1, data: {} }) } as unknown as RelayClient
   return { builder: new ToolSurfaceBuilder(root, relay, '/nonexistent-fixtures'), relay, root }
 }
@@ -71,7 +71,7 @@ describe('namespacing (AC-RUN-001.2 / AC-RUN-001.3)', () => {
     expect([...groups.keys()].sort()).toEqual(['jira', 'linear'])
     for (const recipe of ['jira', 'linear']) {
       const group = groups.get(recipe) as { commands: Map<string, unknown> }
-      // `recon <recipe> list` — the tool keeps its own name inside its own group.
+      // `douze <recipe> list` — the tool keeps its own name inside its own group.
       expect([...group.commands.keys()]).toEqual(['list'])
     }
   })
@@ -183,10 +183,10 @@ describe('reserved group names', () => {
 
 describe('worked examples from fixtures (AC-CON-002.4)', () => {
   it('fills required parameters from the tool\'s own recorded fixture', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'recon-fixtures-'))
+    const dir = mkdtempSync(join(tmpdir(), 'douze-fixtures-'))
     writeFileSync(join(dir, 'list.json'), JSON.stringify({ data: [{ id: 'o-1', status: 'open' }] }))
 
-    const root = Cli.create('recon', { description: 'Recon', version: '0.1.0' })
+    const root = Cli.create('douze', { description: 'Douze', version: '0.1.0' })
     const relay = { call: vi.fn() } as unknown as RelayClient
     const builder = new ToolSurfaceBuilder(root, relay, dir)
     builder.apply(state([surface('jira', tool('list', { fixtures: ['list.json'] }))], 1))
@@ -198,10 +198,10 @@ describe('worked examples from fixtures (AC-CON-002.4)', () => {
   })
 
   it('falls back to a placeholder when the fixture holds no matching value', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'recon-fixtures-'))
+    const dir = mkdtempSync(join(tmpdir(), 'douze-fixtures-'))
     writeFileSync(join(dir, 'list.json'), JSON.stringify({ data: [{ id: 'o-1' }] }))
 
-    const root = Cli.create('recon', { description: 'Recon', version: '0.1.0' })
+    const root = Cli.create('douze', { description: 'Douze', version: '0.1.0' })
     const builder = new ToolSurfaceBuilder(root, { call: vi.fn() } as unknown as RelayClient, dir)
     builder.apply(state([surface('jira', tool('list', { fixtures: ['list.json'] }))], 1))
 

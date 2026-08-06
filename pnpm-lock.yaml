@@ -26,15 +26,18 @@ importers:
 
   packages/cli:
     dependencies:
+      '@douze/douzed':
+        specifier: workspace:*
+        version: link:../douzed
+      '@douze/shared':
+        specifier: workspace:*
+        version: link:../shared
+      '@douze/studio':
+        specifier: workspace:*
+        version: link:../studio
       '@modelcontextprotocol/server':
         specifier: 2.0.0-alpha.4
         version: 2.0.0-alpha.4
-      '@recon/recond':
-        specifier: workspace:*
-        version: link:../recond
-      '@recon/shared':
-        specifier: workspace:*
-        version: link:../shared
       incur:
         specifier: 0.4.26
         version: 0.4.26
@@ -46,24 +49,14 @@ importers:
         specifier: 8.1.5
         version: 8.1.5(@types/node@26.1.2)(esbuild@0.28.1)(tsx@4.23.1)(yaml@2.9.0)
 
-  packages/extension:
+  packages/douzed:
     dependencies:
-      '@recon/shared':
+      '@douze/shared':
         specifier: workspace:*
         version: link:../shared
-    devDependencies:
-      '@types/chrome':
-        specifier: 0.2.2
-        version: 0.2.2
-      vite:
-        specifier: 8.1.5
-        version: 8.1.5(@types/node@26.1.2)(esbuild@0.28.1)(tsx@4.23.1)(yaml@2.9.0)
-
-  packages/recond:
-    dependencies:
-      '@recon/shared':
+      '@douze/studio':
         specifier: workspace:*
-        version: link:../shared
+        version: link:../studio
       chokidar:
         specifier: 5.0.0
         version: 5.0.0
@@ -84,6 +77,19 @@ importers:
         specifier: 8.18.1
         version: 8.18.1
 
+  packages/extension:
+    dependencies:
+      '@douze/shared':
+        specifier: workspace:*
+        version: link:../shared
+    devDependencies:
+      '@types/chrome':
+        specifier: 0.2.2
+        version: 0.2.2
+      vite:
+        specifier: 8.1.5
+        version: 8.1.5(@types/node@26.1.2)(esbuild@0.28.1)(tsx@4.23.1)(yaml@2.9.0)
+
   packages/shared:
     dependencies:
       yaml:
@@ -95,12 +101,9 @@ importers:
 
   packages/studio:
     dependencies:
-      '@recon/shared':
+      '@douze/shared':
         specifier: workspace:*
         version: link:../shared
-      hono:
-        specifier: 4.12.32
-        version: 4.12.32
       yaml:
         specifier: 2.9.0
         version: 2.9.0

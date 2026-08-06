@@ -1,15 +1,15 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { Cli, z } from 'incur'
-import { paths, type RegistryState, type SurfaceTool } from '@recon/recond'
+import { paths, type RegistryState, type SurfaceTool } from '@douze/douzed'
 import { explain } from './errors.js'
-import { ReconError } from '@recon/shared'
+import { DouzeError } from '@douze/shared'
 import type { RelayClient } from './relay-client.js'
 import { RAW_OPTION, toZodObject } from './schema-to-zod.js'
 
 /**
  * Command names the runtime owns. A recipe called `start` would otherwise silently replace
- * `recon start`, which is a worse outcome than refusing to mount it.
+ * `douze start`, which is a worse outcome than refusing to mount it.
  */
 export const RESERVED_GROUPS = new Set([
   'bundle',
@@ -23,7 +23,6 @@ export const RESERVED_GROUPS = new Set([
   'start',
   'status',
   'stop',
-  'studio',
 ])
 
 type ErrorFn = (options: { code: string; message: string; retryable?: boolean }) => never
@@ -38,7 +37,7 @@ export interface SurfaceResult {
 /**
  * #ToolSurfaceBuilder — turns a `RegistryState` into a live incur command tree.
  *
- * One tree serves both surfaces (ADR-007): incur exposes a leaf as `recon <recipe> <tool>` on
+ * One tree serves both surfaces (ADR-007): incur exposes a leaf as `douze <recipe> <tool>` on
  * the CLI and joins the same path with `_` for MCP, so `<recipe>_<tool>` needs no separate
  * naming pass and two recipes defining `list` stay distinct with neither renamed (AC-RUN-001.3).
  *
@@ -94,6 +93,7 @@ export class ToolSurfaceBuilder {
       const group = this.group(recipe)
       const commands = liveCommands(group)
       const wanted = new Set(tools.map((t) => t.tool.name))
+      // oxlint-disable-next-line unicorn/no-useless-spread -- snapshot before mutating the collection being iterated
       for (const name of [...commands.keys()]) if (!wanted.has(name)) commands.delete(name)
       for (const tool of tools) group.command(tool.tool.name, this.define(tool) as never)
     }
@@ -134,7 +134,7 @@ export class ToolSurfaceBuilder {
         } catch (error) {
           // AC-CON-004.* — the user may only ever see this string, so it carries the fix, and
           // `retryable: false` says in the protocol what the text says in prose.
-          if (error instanceof ReconError) {
+          if (error instanceof DouzeError) {
             return c.error({ code: error.code, message: explain(error), retryable: false })
           }
           throw error
@@ -161,7 +161,7 @@ function describe(surface: SurfaceTool): string {
 }
 
 /**
- * AC-CON-002.4 — `recon skills add` is incur's built-in generator; it renders whatever
+ * AC-CON-002.4 — `douze skills add` is incur's built-in generator; it renders whatever
  * `examples` a command carries. Drawing the values from the tool's own recorded fixture is what
  * makes the generated skill a worked example rather than a schema restatement.
  */

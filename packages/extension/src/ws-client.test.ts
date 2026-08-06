@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { ClientMessage, HEARTBEAT_MS, type Exchange } from '@recon/shared'
+import { ClientMessage, HEARTBEAT_MS, type Exchange } from '@douze/shared'
 import { Outbox, backoffDelay, socketUrl } from './ws-client.js'
 
 const exchange = (id: string): Exchange => ({
@@ -71,7 +71,7 @@ describe('Outbox', () => {
 })
 
 describe('message framing', () => {
-  it('speaks exactly the shapes recond validates', () => {
+  it('speaks exactly the shapes douzed validates', () => {
     const messages: ClientMessage[] = [
       { type: 'hello', token: 't', extension_version: '0.1.0' },
       { type: 'pong' },

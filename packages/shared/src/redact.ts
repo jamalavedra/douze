@@ -91,6 +91,7 @@ const FORM_BODY = /^(?:[\w.[\]%+-]+=[^&]*)(?:&[\w.[\]%+-]+=[^&]*)*$/
 export function redactFormBody(body: string, config: RedactionConfig = defaultRedaction()): string {
   const params = new URLSearchParams(body)
   let changed = false
+  // oxlint-disable-next-line unicorn/no-useless-spread -- snapshot before params.set() mutates during iteration
   for (const [key, value] of [...params.entries()]) {
     if (matches(key, config.fields) && !isPlaceholder(value)) {
       params.set(key, placeholder(value))
@@ -130,6 +131,7 @@ export function redactUrl(url: string, config: RedactionConfig = defaultRedactio
     return url
   }
   let changed = false
+  // oxlint-disable-next-line unicorn/no-useless-spread -- snapshot before params.set() mutates during iteration
   for (const [key, value] of [...parsed.searchParams.entries()]) {
     if (matches(key, config.fields) || looksLikeCredential(value)) {
       parsed.searchParams.set(key, placeholder(value))

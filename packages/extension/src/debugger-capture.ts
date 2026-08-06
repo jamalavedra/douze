@@ -59,6 +59,7 @@ export class DebuggerCapture {
   }
 
   async detachAll(): Promise<void> {
+    // oxlint-disable-next-line unicorn/no-useless-spread -- snapshot before mutating the collection being iterated
     for (const tabId of [...this.attached]) await this.detach(tabId)
     this.pending.clear()
   }

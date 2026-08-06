@@ -6,6 +6,7 @@ import { ToolSurfaceBuilder } from './surface.js'
 import { register as registerDaemon } from './commands/daemon.js'
 import { register as registerBundle } from './commands/bundle.js'
 import { addToClaudeCode, parseMcpAdd } from './commands/mcp-add.js'
+import { register as registerMaintenance } from './commands/maintenance.js'
 
 const VERSION = '0.1.0'
 
@@ -13,17 +14,19 @@ const VERSION = '0.1.0'
  * Commands that answer without the recipe surface. `status` in particular must be able to
  * report a stopped daemon rather than starting one to ask it how it is.
  */
-const SURFACE_FREE = new Set(['start', 'stop', 'status', 'sessions', 'import', 'bundle'])
+const SURFACE_FREE = new Set(['start', 'stop', 'status', 'sessions', 'import', 'bundle', 'doctor', 'eject'])
 
 export function createCli(): ReturnType<typeof Cli.create> {
-  const cli = Cli.create('recon', {
+  const cli = Cli.create('douze', {
     description: 'Call your own authenticated dashboards as tools, executed in your signed-in browser.',
     version: VERSION,
     // ADR-007 — one surface, so the MCP name is the CLI path joined with `_`.
-    mcp: { name: 'recon', title: 'Recon' },
+    mcp: { name: 'douze', title: 'Douze' },
   })
   registerDaemon(cli as never)
   registerBundle(cli as never)
+  // doctor and eject share the daemon client the surface uses.
+  registerMaintenance(cli as never, new DaemonClient())
   return cli
 }
 
@@ -76,10 +79,10 @@ async function attachSurface(cli: ReturnType<typeof Cli.create>, argv: string[])
   try {
     const result = builder.apply(await daemon.registry())
     for (const skipped of result.skipped) {
-      process.stderr.write(`recon: recipe "${skipped}" shadows a built-in command and was not mounted.\n`)
+      process.stderr.write(`douze: recipe "${skipped}" shadows a built-in command and was not mounted.\n`)
     }
     for (const failure of result.errors) {
-      process.stderr.write(`recon: recipe "${failure.recipe}" failed to load — ${failure.error}\n`)
+      process.stderr.write(`douze: recipe "${failure.recipe}" failed to load — ${failure.error}\n`)
     }
   } catch (error) {
     // Help and version must render with the daemon down; a real call will fail loudly instead.
@@ -93,7 +96,7 @@ const isPassive = (argv: string[]): boolean =>
 const needsSurface = (argv: string[]): boolean => !SURFACE_FREE.has(argv[0] ?? '')
 
 function isClaudeCodeMcpAdd(argv: string[]): ReturnType<typeof parseMcpAdd> | null {
-  const start = argv[0] === 'recon' ? 1 : 0
+  const start = argv[0] === 'douze' ? 1 : 0
   if (argv[start] !== 'mcp' || argv[start + 1] !== 'add') return null
   const parsed = parseMcpAdd(argv.slice(start + 2))
   if (parsed.agent !== undefined && parsed.agent !== 'claude-code') return null
