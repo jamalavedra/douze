@@ -78,7 +78,8 @@ export class Refusal extends Error {
       | 'unknown_tool'
       | 'invalid_arguments'
       | 'permission_required'
-      | 'executor_unavailable',
+      | 'executor_unavailable'
+      | 'cross_origin_refused',
     message: string,
   ) {
     super(message)
@@ -253,10 +254,15 @@ function check(value: unknown, schema: Record<string, unknown>, path: string, ex
   if (Array.isArray(value) && isRecord(items)) {
     return value.flatMap((item, index) => check(item, items, `${path}[${index}]`, EMPTY))
   }
-  const properties = schema['properties']
-  // No declared properties is no constraint: inference emits `{}` for a shape it could not pin
-  // down, and inventing a constraint there would refuse calls the recording proves are fine.
-  if (!isRecord(value) || !isRecord(properties)) return []
+  if (!isRecord(value)) return []
+  /**
+   * A schema with no `properties` declares no parameters, so it allows none. It used to allow
+   * every one: `check` returned no faults at all, and validation for that tool was a no-op — which
+   * is exactly the wrong default for a recipe that arrived as an imported file rather than from a
+   * recording. Inference emits a bare `{}` for a tool that takes nothing (engine.ts), and "takes
+   * nothing" and "takes anything" are not the same contract.
+   */
+  const properties = isRecord(schema['properties']) ? schema['properties'] : {}
   const faults: string[] = []
   for (const [key, child] of Object.entries(value)) {
     if (path === '' && RUNTIME_ARGS.has(key)) continue
@@ -674,11 +680,18 @@ export async function runToolCall(
  */
 export const PERMISSION_MISSING = /has no permission for/
 export const EXECUTOR_MISSING = /executor tab/
+/**
+ * A request whose URL leaves the origin its recipe declares, or that is redirected off it. Neither
+ * changes on a retry — the recipe says what it says — and retrying would re-issue the very request
+ * that was refused, so this is a Refusal rather than a retryable transport failure.
+ */
+export const CROSS_ORIGIN_REFUSED = /refused to call/
 
 const executionFailure = (tool: string, error: string): Error => {
   // The relay's own sentence already names the fix — allow the permission, or open the site —
   // so it is carried through verbatim rather than replaced with a shorter one that does not.
   if (PERMISSION_MISSING.test(error)) return new Refusal('permission_required', `"${tool}" did not run. ${error}`)
+  if (CROSS_ORIGIN_REFUSED.test(error)) return new Refusal('cross_origin_refused', `"${tool}" did not run. ${error}`)
   if (EXECUTOR_MISSING.test(error)) {
     return new Refusal(
       'executor_unavailable',

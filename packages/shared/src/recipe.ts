@@ -48,8 +48,28 @@ export const AuthDescriptor = z.object({
    * which is right for a site that serves its own API. A dashboard calling an API host needs its
    * own page: that is where the token lives and the origin the target's CORS expects.
    */
-  page_origin: z.string().optional(),
+  page_origin: z
+    .string()
+    .refine(isHttpOrigin, 'page_origin must be an http(s) origin, with no path — e.g. https://app.example')
+    .optional(),
 })
+
+/**
+ * An origin and nothing else. `page_origin` becomes a `chrome.tabs.create` URL and the target of a
+ * MAIN-world `executeScript`, and it is compared against `new URL(tab.url).origin`, so a value
+ * carrying a path never matches any tab and a `javascript:` value has no business being opened at
+ * all. It is also passed to `chrome.permissions.contains` as `${origin}/*`, which throws on a
+ * malformed match pattern — outside the relay's try block, so the user got a raw internal error
+ * instead of the sentence that names the fix.
+ */
+function isHttpOrigin(value: string): boolean {
+  try {
+    const url = new URL(value)
+    return (url.protocol === 'https:' || url.protocol === 'http:') && url.origin === value
+  } catch {
+    return false
+  }
+}
 
 /** REQ-INF-005 — how a paginated collection is driven. */
 export const Pagination = z.object({
@@ -62,8 +82,29 @@ export const Pagination = z.object({
 
 export const RequestContract = z.object({
   method: z.enum(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE']),
-  /** Endpoint Template with `{param}` segments — REQ-INF-001. */
-  path: z.string(),
+  /**
+   * Endpoint Template with `{param}` segments — REQ-INF-001.
+   *
+   * Site-relative, and only site-relative. `buildRequest` resolves this against the recipe's
+   * `base_url`, and `new URL()` discards that base for anything that is not: an absolute
+   * `https://evil.example/steal`, a protocol-relative `//evil.example/steal`, a leading
+   * `/\evil.example` (a backslash is a slash to the URL parser), or a `/\n//evil.example` (tabs
+   * and newlines are stripped before parsing). Any of those turns a recipe someone sent the user
+   * into a request that runs on their real dashboard with its cookies and page-state token
+   * attached, aimed at the sender's server — or at 169.254.169.254.
+   *
+   * Nothing legitimate is lost: inference only ever emits `new URL(exchange.url).pathname`
+   * (packages/studio/src/inference/graphql.ts) or `/` joined over non-empty path segments
+   * (packages/studio/src/inference/templating.ts), and a pathname percent-encodes whitespace and
+   * backslashes. `executeRelay` checks the same thing again against the URL it is about to fetch,
+   * because a recipe stored before this rule existed does not re-validate itself.
+   */
+  path: z
+    .string()
+    .regex(
+      /^\/(?!\/)[^\s\\]*$/,
+      'request paths must be site-relative: one leading "/", no scheme, host, backslash or whitespace',
+    ),
   /**
    * AC-INF-002.4 — JSON Schema, kept as JSON Schema: it is pushed to a host verbatim as the
    * tool's `input_schema`, and `checkPolicy` (packages/extension/src/guards.ts) validates every
@@ -135,7 +176,13 @@ export const Recipe = z
     version: z.number().int().positive(),
     name: z.string().regex(/^[a-z][a-z0-9-]*$/, 'recipe names are kebab-case'),
     enabled: z.boolean().default(true),
-    target: z.object({ base_url: z.url() }),
+    /**
+     * `z.url()` alone accepts `javascript:`, `data:` and `file:` — verified against zod 4.4.3.
+     * Nothing downstream is known to be exploitable through one (the first two throw inside
+     * `new URL(path, base_url)`, and `file:` produces the origin `null` that the host-permission
+     * check refuses), but the allow-list belongs at the boundary rather than in three accidents.
+     */
+    target: z.object({ base_url: z.url({ protocol: /^https?$/ }) }),
     auth: AuthDescriptor.prefault({}),
     tools: z.array(Tool).default([]),
   })
