@@ -536,6 +536,100 @@ running at all.
 - **Bundle size.** ~230 KB for MCP alone if the SDK ends up in the extension; with relay-owned sessions it should not need to be there at all.
 - **This rewrites the local half before C-1 has ever proven the product once.** Phase 0 exists precisely because of that, and is why it is not optional.
 
+## WO-016 — What seven security reviews found (IN PROGRESS)
+
+2026-08-11. After WO-015 landed, seven reviewers went at the merged tree: supply chain and the
+shipped bundle, an adversarial re-attack on the repaired trust model, privacy and data flow,
+whole-diff correctness, and three against published standards — OWASP Top 10:2025 with the API
+Security Top 10:2023, the OWASP Top 10 for LLM Applications 2025, and ASVS 5.0 at L2.
+
+Two things they agreed on, and both are worth keeping in mind before reading the list. The
+foundations hold: trust is derived from what the extension dialled and no field on any inbound
+frame reaches the decision; the bridge handshake's transcript binds version, role, port and both
+nonces, and the port binding was empirically confirmed to defeat a rogue relaying to a real bridge;
+cross-tenant isolation on the relay held under live probe. ASVS called the authorization model and
+the transcript "the two things hardest to get right and most expensive to fix later" correct.
+
+And the layer above them does not hold. Nearly every finding below is in classification, reachability
+or disclosure — the parts that decide *which* rule applies, not the parts that enforce it.
+
+### The classification problem, which is the one to remember
+
+`destructive` — the only class a hosted assistant can never reach, no flag, no exception — is
+decided by `/delete|remove|purge|cancel|refund|revoke/i` in `packages/studio/src/inference/side-effects.ts`.
+Everything else with a non-GET method is `write`. So `POST /users/{id}/suspend`, `POST /payouts`,
+`deactivateAccount`, `transferFunds` and `wipeWorkspace` are offered to ChatGPT whenever writes are
+on, with no `confirm` and no rate limit. The review page groups tools by consequence but only lets a
+user edit a name and a description, so someone who *sees* the mistake cannot correct it. The regex
+will always be incomplete; the human reading the list has to be the backstop, and currently is not.
+
+### Findings, by where they live
+
+**Reachable without any user action**
+- Redirects are followed with no origin re-check (`packages/extension/src/relay.ts`). An open
+  redirect on the user's own dashboard sends a page-state credential to an attacker host and returns
+  a fully attacker-controlled body to the model as a tool result. The only finding triggerable today
+  with no import step.
+- Any local process can bind a bridge port, accept, and close 1008; the extension wipes its pinned
+  bridge secret and blocks all five ports permanently. Fires in ordinary use too: with two bridges
+  running, the one the user did not pair destroys the pairing that just succeeded. A passing test
+  codified the broken behaviour.
+
+**Reachable because the import UI shipped**
+- A recipe's `request.path` is unconstrained, so an absolute URL discards `base_url` while the
+  permission check still validates the declared origin. Credential exfiltration from a tab on the
+  real dashboard. The single finding that fails ASVS L2.
+- `credential_source.expression` falls through to `eval` in the page's MAIN world — arbitrary JS in
+  the user's authenticated dashboard once the above is reachable.
+
+**Crypto**
+- `PBKDF2_SALT` is a compile-time constant, so one precomputed table over the ~39-bit code space is
+  valid against every install that will ever exist. Both the trust re-attack and ASVS found it
+  independently; ASVS cites 6.5.2, which requires a random salt below 112 bits of entropy.
+- 200k iterations is below the 600k current guidance; the pairing code has no lifetime, which is the
+  window the offline attack needs; the extension re-derives per socket where the bridge caches.
+- Counting abandoned handshakes toward the attempt cap does **not** close the oracle — one transcript
+  is enough — and a per-process counter makes self-DoS cheaper.
+
+**Agency and injection**
+- Nothing marks a tool result as data rather than instruction. Between the target's response and the
+  model there is a JSON path selection, a credential scan and a truncation; none is a semantic
+  boundary and none was meant to be.
+- No per-call signal for a remote write: approve once at review time, callable forever, silently.
+- The per-tool rate limiter never engages — `rate_limit_per_minute` has no producer anywhere, so
+  `RateLimiter.run` short-circuits for every tool.
+- Argument validation is strong on structure (undeclared parameters refused, GraphQL document fixed
+  in the recipe) and absent on values: no numeric ceiling, so `limit=20` observed permits
+  `limit=1000000`.
+
+**Disclosure**
+- Three README claims were false: that nothing is left behind after uninstall, that Douze does not
+  copy your data, and that everything stays on your computer unless a hosted assistant is connected
+  — the local bridge's clients are themselves AI apps that forward results to their own providers.
+- Redaction targets credentials, not people. Customer names, emails and addresses survive into
+  fixtures and into every tool result by design, and the approval screen said nothing about it.
+- The two irreversible grants (enabling writes, exempting a tool from the result gate) had no
+  confirmation while the two reversible ones did.
+
+**Operability**
+- The relay logs no authentication failure of any kind, so a URL-secret brute force is invisible
+  live and afterwards.
+- No global endpoint cap; an endpoint holding a live socket is never reaped; `TRUST_PROXY` is pinned
+  nowhere in the repo, so the deployed rate limit is folklore.
+- The audit log cannot distinguish a stolen MCP URL from the legitimate connector.
+
+### Judged correct, so they are not re-litigated later
+
+Payload-free relay logs and argument-free audit entries are the right call (ASVS 16.2.5 asks that
+logging be governed by the data's protection level); the gap was refusals being silent, not the
+minimalism. Unauthenticated relay registration is fine as designed — an enrolment secret shipped
+inside a public extension buys nothing, and the real gap is a resource cap. Keeping `unknown_tool`
+and `trust_refused` distinct leaks sibling names to a host that already has the surface, and the
+recovery text it buys the user is worth more. No declared CSP is correct: MV3's default is already
+stricter than the enforceable minimum.
+
+---
+
 ## Open Questions (PRD 5.3 — resolve during implementation)
 
 - [x] Q1 — **RESOLVED (verified)**: incur's `Mcp.serve()` does NOT support mid-session re-registration — `collectTools` snapshots once at connect. The escape hatch works and was executed end-to-end: `Cli.toCommands` (live Map) + `Mcp.collectTools` + `Mcp.callTool` + own `McpServer`, whose `registerTool()` handle fires `notifications/tools/list_changed` automatically. Original question: Does incur support re-registering tools mid-session and emitting `listChanged`? Spike in M0 (T-008.1). Fallback: a thin wrapper that re-emits `tools/list` on reload.
