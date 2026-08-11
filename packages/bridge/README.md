@@ -74,21 +74,25 @@ cannot drift into disagreeing about what proves what.
 
 ```
 extension → hello             { extension_version, nonce: Ne }
-bridge    → bridge.challenge  { nonce: Nb, proof: P(bridge) }
+bridge    → bridge.challenge  { nonce: Nb, salt?, proof: P(bridge) }
 extension → bridge.proof      { proof: P(extension) }       only if P(bridge) verified
 bridge    → welcome           { heartbeat_ms, secret? }     only if P(extension) verified
 ```
 
-`P(role) = HMAC-SHA256(K, "douze-bridge-v1|<role>|<port>|<Ne>|<Nb>")`, hex, compared in constant
-time on both ends. `hello` and `bridge.proof` and `bridge.challenge` are the transport's own frames
-and are deliberately not in the `HostFrame`/`ExtensionFrame` union, exactly as the relay's endpoint
-token is not.
+`P(role) = HMAC-SHA256(K, "douze-bridge-v1|<role>|<port>|<Ne>|<Nb>|<salt>")`, hex, compared in
+constant time on both ends. `hello` and `bridge.proof` and `bridge.challenge` are the transport's
+own frames and are deliberately not in the `HostFrame`/`ExtensionFrame` union, exactly as the
+relay's endpoint token is not.
 
 `K` is never on the wire, in either direction:
 
-- **first pairing**: `K = PBKDF2-SHA256(code, "douze-bridge-v1|pairing", 200 000 rounds)`. The
-  bridge mints an 8-character code and prints it **to stderr**, which reaches the human through
-  their client's log and reaches no socket. The user types it into the extension. Nothing sends it.
+- **first pairing**: `K = PBKDF2-SHA256(code, "douze-bridge-v1|pairing|<salt>", 600 000 rounds)` —
+  the iteration count OWASP's Password Storage Cheat Sheet gives for PBKDF2-HMAC-SHA256. The bridge
+  mints an 8-character code and prints it **to stderr**, which reaches the human through their
+  client's log and reaches no socket. The user types it into the extension. Nothing sends it. The
+  **salt is 32 random bytes minted per bridge process** and travels on the challenge, unsalted-empty
+  once paired; it is not a secret and it is not authenticated, which is safe — a rogue that sends
+  its own only makes the extension derive a key the rogue still cannot prove anything with.
 - **every attach after that**: `K = sha256(secret)`, which is exactly the 32 bytes in
   `~/.douze/bridge.json`. The 32-byte secret itself crosses the wire once — on the `welcome` that
   ends the pairing handshake, after the extension has proved it holds the code — and is written
@@ -105,11 +109,30 @@ What each element of the transcript is for:
   listener per port on loopback is the only binding two unauthenticated TCP connections have, and
   this uses it.
 
-The bridge answers a challenge to anything that says hello, so that challenge is an offline oracle
-for the code — which is why the code's key is stretched. Searching 39 bits at 200 000 PBKDF2 rounds
-each is not an afternoon's work, and the code is single-use and lives only until the first pairing.
-On top of that, **ten failed proofs and the process refuses every connection until it is
-restarted**, and only your own MCP client restarts a bridge.
+### What pays for a 39-bit code
+
+The bridge answers a challenge to anything that says hello, so **one captured challenge is an
+offline oracle**: `{port, Ne, Nb, salt, proof}` is everything needed to test a guess, at whatever
+rate the attacker's hardware allows and with nothing on this side able to see it happening. No
+attempt cap touches that, and any claim that it does is wrong. Three things do:
+
+- **600 000 PBKDF2 rounds** per candidate, which is what a guess costs.
+- **A salt minted per bridge process**, so that cost is paid per target. With a constant salt, one
+  table over the whole 30^8 code space could be computed once — a few hundred GPU-days — and then
+  turned any captured challenge into a recovered code in minutes, against every Douze install ever.
+- **A ten-minute lifetime.** The code is minted at startup and dies unused; after that the bridge
+  refuses to pair at all and says to restart it for a fresh one. That is the window the search has
+  to finish inside, and it is also why the code being long-lived was the part that mattered: a
+  bridge your editor spawned in the morning is otherwise still handing out oracles at six.
+
+The code is also single-use — it is spent at the first pairing, and every later attach runs on the
+32-byte credential instead, which is not guessable at all.
+
+**Ten wrong proofs and the process refuses every connection until it is restarted.** That is the
+bound on guessing done *at* the bridge, and only that. It is deliberately not spent on peers that
+take a challenge and leave: those are refused per socket and reported, but not counted, because ten
+abandoned sockets would otherwise be a way for any local process to lock you out of your own
+pairing — a better attack than the one counting them would prevent.
 
 Upgrades are rejected unless `Origin` is a `chrome-extension://` URL, before anything is counted as
 an attempt. WebSocket connections are not subject to CORS, so without that check any page you
@@ -130,8 +153,12 @@ Cannot, without holding the code or the credential:
   not proved itself is ignored;
 - replay a recorded handshake, because both nonces are fresh per socket;
 - sit between a real extension and a real bridge, because the proof is bound to the port;
-- learn any of it by guessing, because of the ten-attempt cap, or by timing, because both ends
-  compare digests in constant time.
+- guess it at the bridge, because ten wrong proofs end pairing for that process, or learn it by
+  timing, because both ends compare digests in constant time;
+- **unpair you.** A 1008 close from a bridge port is the word of a peer that has proved nothing, so
+  the extension stops dialling that one port and writes nothing down. It used to overwrite the
+  stored pairing, which made "bind a free port, close 1008" enough to unpair a working install for
+  good.
 
 Can:
 
@@ -139,6 +166,7 @@ Can:
 - take the port, so the bridge walks to the next one in its range — and, by answering the
   extension's dial with a wrong proof, keep that port useless until the socket times out. It is
   told nothing and the extension's pairing is not turned off by it;
+- collect challenges to search the code offline, which is what the section above is about;
 - occupy the ten attempts and so deny pairing until the client restarts the bridge.
 
 **The residual, stated plainly: local malware running as you reads the file.** `~/.douze/bridge.json`
@@ -158,10 +186,8 @@ restart the bridge; it prints a fresh code. The refusal message says so.
 `BRIDGE_PORT_RANGE` in `@douze/shared` — `8912–8916`, walked in order, taking the first that is
 free. It lives there rather than in either end because both ends must agree on it: the bridge binds
 the range and the extension sweeps it, and a constant declared twice is a constant that eventually
-differs. Deliberately **not** douzed's 8787–8791: that range speaks a different protocol (capture,
-not attachment), so a single range would have the extension meeting the wrong server until the
-daemon goes away in phase 4. The walk itself is kept because a bridge is per MCP client rather than
-per machine: Claude Code and Cursor open one each, so several are live at once and the extension
+differs. The walk itself is kept because a bridge is per MCP client rather than per machine: Claude
+Code and Cursor open one each, so several are live at once and the extension
 sweeps the range rather than assuming one. The port is also part of the handshake transcript, which
 is what stops one member of the range from relaying for another.
 
@@ -177,6 +203,11 @@ is what stops one member of the range from relaying for another.
   carry that, so a bridge started before the browser lists nothing at first and corrects itself the
   moment the extension attaches.
 - `ping`/`pong` every 20 seconds; two missed windows and the socket is terminated.
+- a handshake that is started and not finished — `hello` in, challenge out, then silence or a drop
+  — is closed 1008 and **reported to stderr as a refused connection**, because from the user's side
+  that is what a mistyped code looks like: the extension cannot verify this bridge's proof, so it
+  stays quiet and there is nothing else to tell them with. Each phase of the handshake gets 5
+  seconds of its own.
 - a `tools/call` arriving with nothing attached is held for **40 seconds** before being answered as
   offline. Same number and same reason as the relay: an evicted MV3 service worker cannot be woken
   from outside and revives itself on a `chrome.alarms` floor of 30 seconds, so a shorter grace
@@ -190,14 +221,19 @@ is what stops one member of the range from relaying for another.
   one attachment client per bridge, since each is a separate MCP client's session. Chrome puts
   `Origin: chrome-extension://<id>` on the upgrade, which is what gets it past the check above.
 - First frame `hello{extension_version, nonce}` within 5 seconds, carrying **no credential** — then
-  the handshake above, which the whole 5 seconds covers.
+  the proof within 5 seconds of the challenge.
 - Verify `bridge.challenge` before sending anything else, and stay silent on a mismatch rather than
-  closing: a real bridge given the wrong code answers 1008 a moment later, and that is what tells
-  the user to type it again. A rogue that answers badly must not be able to switch bridge pairing
-  off from the outside.
+  closing: a real bridge given the wrong code answers 1008 a moment later and says so on its stderr,
+  and that is what tells the user to type it again. A rogue that answers badly must not be able to
+  switch bridge pairing off from the outside.
+- Derive the code's key against the challenge's `salt`, and cache that derivation per code: five
+  ports are dialled on every alarm and 600 000 PBKDF2 rounds each time would be a browser tax.
+- Treat a 1008 as **the word of a peer that proved nothing**. It may stop that port; it must not
+  touch the stored pairing. Any process can bind a free port in the range and close 1008 on demand,
+  and two clients running at once produce it in ordinary use — the bridge the user did not type a
+  code for refuses on its own deadline seconds after the other paired.
 - Read `secret` off the **raw** `welcome` frame on a first pairing and pin it in extension storage;
   the `HostFrame` schema does not carry it, and parsing strictly would drop it.
-- Treat a 1008 close as "not paired": prompt for a code rather than retrying the same credential.
 - Derive `trust` from what it dialled **and from what the far side proved** — a `ws://127.0.0.1`
   bridge whose proof verified is `local` — and never from anything a frame claims. Holding a secret
   is not the test; the peer proving it holds the same one is.

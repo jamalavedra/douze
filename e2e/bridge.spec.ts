@@ -60,8 +60,16 @@ test('a stdio client lists and calls through a paired bridge, and an unpaired on
   expect(offline.error?.data?.error).toBe('extension_disconnected')
 
   // --- an unpaired attachment is refused outright ------------------------
+  // A wrong code does not produce a wrong proof: the extension checks the BRIDGE first, cannot
+  // verify it, and goes quiet by design — so what the bridge sees is a handshake taken and
+  // abandoned, and it has to report that to the user as the failed pairing it is. Nothing is
+  // counted against the ten attempts for it, which is why the real code below still works.
   await redial(browser, 'AAAA-BBBB')
-  await waitFor(async () => bridge.log().includes('refused an unpaired connection'), 'the bridge to refuse')
+  await waitFor(
+    async () => bridge.log().includes('refused an unpaired connection (abandoned the handshake)'),
+    'the bridge to report the abandoned handshake',
+  )
+  expect(bridge.log()).not.toContain('too many failed attempts')
   expect(await mcp.tools()).toEqual([])
 
   // --- paired, with the code the user read off the bridge ----------------

@@ -681,9 +681,14 @@ async function connectState(extra: Partial<ConnectState> = {}): Promise<ConnectS
   }
 }
 
+/**
+ * A refusal is not stored — it is the word of a peer that proved nothing, and it stops one port
+ * rather than the pairing (packages/extension/src/attach.ts, `refused`) — so it is asked for here
+ * rather than read out of storage, and it outranks `paired` only while no bridge is actually up.
+ */
 const bridgeState = (bridge: BridgePairing): ConnectState['bridge'] => {
+  if (attachments.bridgeRefused()) return 'refused'
   if (bridge.secret) return 'paired'
-  if (bridge.blocked) return 'refused'
   return bridge.code ? 'trying' : 'unpaired'
 }
 

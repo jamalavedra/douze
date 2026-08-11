@@ -2,12 +2,12 @@ import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { WebSocket } from 'ws'
 import { codeKey, mintNonce, proof, secretHashKey, sha256Hex } from '@douze/shared'
 import type { AttachedTool, HostFrame } from '@douze/mcp-host'
 import { startBridge, type Bridge, type BridgeOptions } from './bridge.js'
-import { credentialFile } from './pairing.js'
+import { ATTEMPTS, credentialFile } from './pairing.js'
 
 /**
  * Both ends of the bridge are faked here, because both ends are the whole package: a fake MCP
@@ -18,15 +18,23 @@ import { credentialFile } from './pairing.js'
 let home: string
 const bridges: Bridge[] = []
 const sockets: WebSocket[] = []
+/** Everything the bridge said to the human, which is where every refusal is reported. */
+let stderr: string
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), 'douze-bridge-'))
   process.env['DOUZE_HOME'] = home
+  stderr = ''
+  vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+    stderr += String(chunk)
+    return true
+  })
 })
 
 afterEach(async () => {
   for (const socket of sockets.splice(0)) socket.close()
   for (const bridge of bridges.splice(0)) await bridge.close()
+  vi.restoreAllMocks()
   delete process.env['DOUZE_HOME']
   rmSync(home, { recursive: true, force: true })
 })
@@ -118,14 +126,23 @@ interface Impostor {
   replay?: { extensionNonce: string; proof: string }
   /** `null` sends no Origin header at all, which is what any non-extension client does. */
   origin?: string | null
+  /** Derive against this salt instead of the one the bridge sent — another install's, say. */
+  salt?: string
+  /**
+   * Take the challenge and never answer it. `'close'` drops the socket at once, which is the
+   * cheapest thing a harvester can do; `'silent'` holds it open and is what the real extension does
+   * when it cannot verify the bridge's proof — it stays quiet on purpose, so a rogue that answered
+   * badly cannot switch bridge pairing off from the outside.
+   */
+  abandon?: 'close' | 'silent'
 }
 
 /** What Chrome puts on an upgrade from an MV3 service worker; the bridge accepts nothing else. */
 const EXTENSION_ORIGIN = 'chrome-extension://ophjlpahpchlmihnnnihgmmeilfjmjjc'
 
-const keyFor = async (credential: Credential): Promise<CryptoKey | null> => {
+const keyFor = async (credential: Credential, salt: string): Promise<CryptoKey | null> => {
   if (credential.secret !== undefined) return secretHashKey(await sha256Hex(credential.secret))
-  return credential.code === undefined ? null : codeKey(credential.code)
+  return credential.code === undefined ? null : codeKey(credential.code, salt)
 }
 
 const tool = (name: string, sideEffect: AttachedTool['side_effect'] = 'read'): AttachedTool => ({
@@ -154,15 +171,20 @@ const attach = async (bridge: Bridge, credential: Credential, tricks: Impostor =
   const extensionNonce = tricks.replay?.extensionNonce ?? mintNonce()
   const transcript = { extensionNonce, bridgeNonce: '', proof: '' }
 
-  const answerChallenge = async (challenge: { nonce: string; proof: string }): Promise<void> => {
+  const answerChallenge = async (challenge: { nonce: string; proof: string; salt: string }): Promise<void> => {
+    if (tricks.abandon === 'close') return socket.close()
+    if (tricks.abandon === 'silent') return
     transcript.bridgeNonce = challenge.nonce
-    const key = await keyFor(credential)
-    const mine =
-      tricks.replay?.proof ??
-      tricks.proof ??
-      (key === null
-        ? 'f'.repeat(64)
-        : await proof(key, { role: 'extension', port: bridge.port, extensionNonce, bridgeNonce: challenge.nonce }))
+    const salt = tricks.salt ?? challenge.salt
+    const key = await keyFor(credential, salt)
+    const shared = {
+      role: 'extension' as const,
+      port: bridge.port,
+      extensionNonce,
+      bridgeNonce: challenge.nonce,
+      salt,
+    }
+    const mine = tricks.replay?.proof ?? tricks.proof ?? (key === null ? 'f'.repeat(64) : await proof(key, shared))
     transcript.proof = mine
     socket.send(JSON.stringify({ type: 'bridge.proof', proof: mine }))
   }
@@ -173,7 +195,8 @@ const attach = async (bridge: Bridge, credential: Credential, tricks: Impostor =
       // is read off the raw payload here exactly as the extension reads it.
       const raw = JSON.parse(String(data)) as Record<string, string>
       if (raw['type'] === 'bridge.challenge') {
-        void answerChallenge({ nonce: raw['nonce'] ?? '', proof: raw['proof'] ?? '' })
+        // No salt once paired: the key is `sha256(secret)`, which stretches nothing.
+        void answerChallenge({ nonce: raw['nonce'] ?? '', proof: raw['proof'] ?? '', salt: raw['salt'] ?? '' })
         return
       }
       const frame = raw as unknown as HostFrame & { secret?: string }
@@ -205,6 +228,18 @@ const attach = async (bridge: Bridge, credential: Credential, tricks: Impostor =
     },
     answer: (id, result) => socket.send(JSON.stringify({ type: 'tool.result', id, result })),
   }
+}
+
+/** The salt a bridge puts on its challenge, read the way anything that can dial reads it. */
+const saltOf = async (bridge: Bridge): Promise<string> => {
+  const socket = new WebSocket(`ws://127.0.0.1:${bridge.port}/ws`, { origin: EXTENSION_ORIGIN })
+  sockets.push(socket)
+  return await new Promise<string>((resolve) => {
+    socket.on('message', (data) => resolve((JSON.parse(String(data)) as { salt?: string }).salt ?? ''))
+    socket.on('open', () =>
+      socket.send(JSON.stringify({ type: 'hello', extension_version: '0.1.0', nonce: mintNonce() })),
+    )
+  })
 }
 
 /** Pairs a fresh bridge the way a human does: read the code off the bridge, type it in. */
@@ -313,13 +348,18 @@ describe('pairing', () => {
     const socket = new WebSocket(`ws://127.0.0.1:${mcp.bridge.port}/ws`, { origin: EXTENSION_ORIGIN })
     sockets.push(socket)
 
-    const challenge = await new Promise<{ type: string; nonce: string; proof: string }>((resolve) => {
+    const challenge = await new Promise<{ type: string; nonce: string; proof: string; salt: string }>((resolve) => {
       socket.on('message', (data) => resolve(JSON.parse(String(data)) as never))
       socket.on('open', () => socket.send(JSON.stringify({ type: 'hello', extension_version: '0.1.0', nonce: extensionNonce })))
     })
 
-    const key = await codeKey(code)
-    const transcript = { port: mcp.bridge.port, extensionNonce, bridgeNonce: challenge.nonce }
+    const key = await codeKey(code, challenge.salt)
+    const transcript = {
+      port: mcp.bridge.port,
+      extensionNonce,
+      bridgeNonce: challenge.nonce,
+      salt: challenge.salt,
+    }
     expect(challenge.type).toBe('bridge.challenge')
     expect(challenge.proof).toBe(await proof(key, { role: 'bridge', ...transcript }))
     // Bound to the role and to the port: a rogue cannot reflect this back as the extension's own
@@ -327,7 +367,44 @@ describe('pairing', () => {
     expect(challenge.proof).not.toBe(await proof(key, { role: 'extension', ...transcript }))
     expect(challenge.proof).not.toBe(await proof(key, { role: 'bridge', ...transcript, port: transcript.port + 1 }))
     // And a wrong code produces a proof the extension would reject.
-    expect(challenge.proof).not.toBe(await proof(await codeKey('AAAA-AAAA'), { role: 'bridge', ...transcript }))
+    expect(challenge.proof).not.toBe(await proof(await codeKey('AAAA-AAAA', challenge.salt), { role: 'bridge', ...transcript }))
+  })
+
+  /**
+   * ASVS 6.5.2 — the code is 39 bits and a challenge is an offline oracle for it, so the only thing
+   * that stops one precomputed table from being built once and spent against every Douze install is
+   * that the key depends on a value this process minted and nobody else has.
+   */
+  it('salts the code with a value fresh to this process, so no table is worth building', async () => {
+    const first = await client()
+    const second = await client()
+
+    const salts = await Promise.all([saltOf(first.bridge), saltOf(second.bridge)])
+
+    expect(salts[0]).toMatch(/^[\w-]{43}$/)
+    expect(salts[0]).not.toBe(salts[1])
+    // The salt reaches the KDF, not just the transcript: one table of stretched codes is useless
+    // against the next install even if the transcript were identical.
+    const same = { role: 'bridge' as const, port: 1, extensionNonce: mintNonce(), bridgeNonce: mintNonce(), salt: '' }
+    expect(await proof(await codeKey('AAAA-AAAA', salts[0] as string), same)).not.toBe(
+      await proof(await codeKey('AAAA-AAAA', salts[1] as string), same),
+    )
+    // And it really is the key's salt, not decoration: the same code under the other salt derives a
+    // key that proves nothing here.
+    expect(await attach(first.bridge, { code: first.bridge.code ?? '' }, { salt: salts[1] })).toBeNull()
+    expect(await attach(first.bridge, { code: first.bridge.code ?? '' })).not.toBeNull()
+  })
+
+  /**
+   * ASVS 6.5.5 — an unused code does not live as long as the process does. A bridge spawned by an
+   * editor at 9am is otherwise still handing out oracles for a live code at 6pm.
+   */
+  it('stops pairing once the code has expired, and says to restart for a fresh one', async () => {
+    const mcp = await client({ codeTtlMs: 0 })
+
+    expect(await attach(mcp.bridge, { code: mcp.bridge.code ?? '' })).toBeNull()
+    expect(stderr).toContain('the pairing code has expired')
+    expect(stderr).toContain('Restart this bridge')
   })
 
   it('refuses a replayed transcript, because the nonce it was signed against is spent', async () => {
@@ -412,6 +489,50 @@ describe('pairing', () => {
     // The real code no longer works either: the process is done pairing until it is restarted,
     // and only the user's own MCP client restarts it.
     expect(await attach(mcp.bridge, { code: mcp.bridge.code ?? '' })).toBeNull()
+  })
+
+  /**
+   * The refusal nobody was told about. A wrong code does not produce a wrong proof: the extension
+   * verifies the BRIDGE first, cannot, and deliberately goes quiet — so the user who mistyped sat
+   * looking at a terminal that said nothing at all, and the only sign of a failed pairing was a
+   * socket quietly timing out.
+   */
+  it('reports an abandoned handshake as the failed pairing it is', async () => {
+    const mcp = await client()
+
+    expect(await attach(mcp.bridge, { code: mcp.bridge.code ?? '' }, { abandon: 'close' })).toBeNull()
+
+    // The dropping peer learns of its own close before this end does, so the refusal lands a tick
+    // later than the socket did.
+    await until(() => stderr.includes('refused an unpaired connection (abandoned the handshake)'))
+    expect(stderr).toContain('check what you typed and enter it again')
+  })
+
+  it('reports one that holds the socket open too, which is what the extension actually does', async () => {
+    // Long enough for the derivation behind the first challenge, short enough to wait out here.
+    const mcp = await client({ helloTimeoutMs: 700 })
+
+    expect(await attach(mcp.bridge, { code: mcp.bridge.code ?? '' }, { abandon: 'silent' })).toBeNull()
+
+    expect(stderr).toContain('refused an unpaired connection (abandoned the handshake)')
+  })
+
+  /**
+   * A challenge is worth harvesting — it is the offline oracle for the code — so anything that can
+   * dial can have as many as it likes. What it must not have is the user's ten attempts: spending
+   * the cap on peers that guessed nothing would turn "abandon ten sockets" into a way to lock the
+   * user out of their own pairing, which is a strictly better attack than any it prevents.
+   */
+  it('does not let abandoned handshakes spend the attempt cap the real guesses are for', async () => {
+    const mcp = await client()
+
+    for (let attempt = 0; attempt < ATTEMPTS + 5; attempt += 1) {
+      expect(await attach(mcp.bridge, { code: mcp.bridge.code ?? '' }, { abandon: 'close' })).toBeNull()
+    }
+    await until(() => stderr.split('abandoned the handshake').length === ATTEMPTS + 6)
+
+    expect(stderr).not.toContain('too many failed attempts')
+    expect(await attach(mcp.bridge, { code: mcp.bridge.code ?? '' })).not.toBeNull()
   })
 })
 

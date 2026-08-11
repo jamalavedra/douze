@@ -8,6 +8,7 @@ import {
   codeKey,
   isNonce,
   mintNonce,
+  mintSalt,
   proof,
   proofMatches,
   secretHashKey,
@@ -43,7 +44,28 @@ import { ATTEMPTS, credentialFile, mintCode, mintSecret, readCredential, writeCr
 
 /** Frames are small; ws defaults to 100 MB, which nothing here needs. */
 const MAX_PAYLOAD = 1_048_576
+
+/**
+ * Per handshake phase: `hello` within this, then the proof within another one of these. Split
+ * rather than shared, so a browser that was slow to say hello does not spend the budget its own
+ * PBKDF2 derivation needs — 600 000 rounds in an MV3 worker is a few hundred milliseconds, and 5 s
+ * is a wide margin around it either way. Both phases together cap an unproved socket at ten
+ * seconds, which is the whole time a challenge is worth anything to whoever asked for it.
+ */
 const HELLO_TIMEOUT_MS = 5_000
+
+/**
+ * ASVS 6.5.5 — how long an unused pairing code stays alive. It is minted at startup and, until
+ * this, any process that dials can have a challenge to search it against offline; ten minutes is
+ * the window the search must finish inside, which at 600 000 PBKDF2 rounds per candidate is not a
+ * fraction of 39 bits worth having.
+ *
+ * Ten rather than one: the human has to find the code in their MCP client's log, switch to the
+ * browser, open the extension and type it, and the extension's own dial is on a 30-second alarm
+ * floor. Expiring under a user who is doing exactly the right thing is its own kind of failure —
+ * and the recovery, restarting the bridge for a fresh code, is only cheap if it is rare.
+ */
+const CODE_TTL_MS = 600_000
 
 /**
  * How long a `tools/call` waits for a detached extension before it is answered as offline — the
@@ -71,6 +93,7 @@ export interface BridgeOptions {
   heartbeatMs?: number
   wakeGraceMs?: number
   helloTimeoutMs?: number
+  codeTtlMs?: number
 }
 
 export interface Bridge {
@@ -88,6 +111,10 @@ export async function startBridge(options: BridgeOptions): Promise<Bridge> {
 
   let credential = readCredential()
   const code = credential ? null : mintCode()
+  /** Fresh per process, sent on every challenge, and what stops one precomputed table from working
+   * against every install. Nothing stores it: the code it salts does not outlive this process. */
+  const salt = mintSalt()
+  const codeExpiresAt = Date.now() + (options.codeTtlMs ?? CODE_TTL_MS)
   let key: Promise<CryptoKey> | null = null
   let failures = 0
   let socket: WebSocket | null = null
@@ -157,19 +184,23 @@ export async function startBridge(options: BridgeOptions): Promise<Bridge> {
     })
   }
 
+  /** An unpaired bridge past its code's lifetime has nothing left to pair with (ASVS 6.5.5). */
+  const expired = (): boolean => !credential && Date.now() >= codeExpiresAt
+
   /**
    * The key every handshake on this bridge runs on: the stored credential once paired, the printed
-   * code before that. Null when there is nothing to prove knowledge of, which is a bridge whose
-   * code has been used and whose credential file vanished under it.
+   * code before that. Null when there is nothing to prove knowledge of — a bridge whose code has
+   * been used and whose credential file vanished under it, or one whose code has expired.
    *
-   * Derived **once per credential**, not once per socket. `codeKey` is deliberately slow (200k
-   * PBKDF2 rounds), the key depends on the credential and nothing else, and a per-socket derivation
-   * would let any local process spend this process's CPU by connecting in a loop.
+   * Derived **once per credential**, not once per socket. `codeKey` is deliberately slow (600k
+   * PBKDF2 rounds), the key depends on the credential and the salt and on nothing else, and a
+   * per-socket derivation would let any local process spend this process's CPU by connecting in a
+   * loop. The extension caches the mirror of this for the same reason.
    */
   const handshakeKey = (): Promise<CryptoKey> | null => {
-    if (key) return key
-    if (credential) key = secretHashKey(credential.secret_hash)
-    else if (code) key = codeKey(code)
+    if (expired()) key = null
+    else if (!key && credential) key = secretHashKey(credential.secret_hash)
+    else if (!key && code) key = codeKey(code, salt)
     return key
   }
 
@@ -223,16 +254,33 @@ export async function startBridge(options: BridgeOptions): Promise<Bridge> {
     diag(`extension detached (${reason})`)
   }
 
+  /** What to do about it, which is the half of a refusal the person at the terminal needs. */
+  const advice = (): string =>
+    credential
+      ? `If this is your extension after a reinstall, delete ${credentialFile()} and restart this bridge to pair again.`
+      : 'It did not prove it holds the pairing code above — check what you typed and enter it again.'
+
+  /**
+   * Turns one socket away and says so. Deliberately **not** counted against `ATTEMPTS`: this is the
+   * refusal for a peer that guessed nothing — it abandoned the handshake, or arrived after the code
+   * expired — and counting it would let any local process burn the ten attempts with ten silent
+   * connections and lock the user out of their own pairing. The socket-scoped close is the whole
+   * consequence, and the extension reads the 1008 as "that code did not work".
+   */
+  const turnAway = (candidate: WebSocket, reason: string, why = advice()): void => {
+    candidate.close(1008, reason)
+    diag(`refused an unpaired connection (${reason}). ${why}`)
+  }
+
+  /**
+   * A peer that answered the challenge **wrongly**, which is the only thing `ATTEMPTS` defends
+   * against: an online guess costs one of these, so ten is all a guesser gets. It buys nothing
+   * against the offline search a single challenge already allows — the salt, the iteration count
+   * and the code's lifetime are what pay for that.
+   */
   const refuse = (candidate: WebSocket, reason: string): void => {
     failures += 1
-    candidate.close(1008, reason)
-    diag(
-      `refused an unpaired connection (${reason}). ${
-        credential
-          ? `If this is your extension after a reinstall, delete ${credentialFile()} and restart this bridge to pair again.`
-          : 'It did not prove it holds the pairing code above.'
-      }`,
-    )
+    turnAway(candidate, reason)
     if (failures >= ATTEMPTS) diag(`too many failed attempts; refusing every connection until restart.`)
   }
 
@@ -244,13 +292,28 @@ export async function startBridge(options: BridgeOptions): Promise<Bridge> {
     /** One hello per socket: the derivation behind a challenge is not free, and one is all it takes. */
     let greeted = false
     /** Minted for this socket's hello, spent by its one `bridge.proof`, and never reused. */
-    let challenge: { key: CryptoKey; extensionNonce: string; bridgeNonce: string } | null = null
-    const deadline = setTimeout(() => candidate.close(1008, 'expected hello'), helloMs)
+    let challenge: { key: CryptoKey; extensionNonce: string; bridgeNonce: string; salt: string } | null = null
+    /**
+     * A challenge went out and no valid proof came back. That is a failed pairing however the
+     * socket ends, and the extension **abandoning** is the ordinary way it happens: given a wrong
+     * code it cannot verify this bridge's proof, and it deliberately goes quiet rather than closing
+     * — which from here used to look like nothing at all, leaving the user staring at a terminal
+     * that never mentioned the code they had just mistyped.
+     */
+    let owed = false
+    const deadline = setTimeout(
+      () => candidate.close(1008, owed ? 'abandoned the handshake' : 'expected hello'),
+      helloMs,
+    )
     // ws raises 'error' on an abruptly dropped peer; an unhandled one is an uncaughtException that
     // would take the whole bridge — and the client's MCP session — down with it.
     candidate.on('error', () => candidate.terminate())
     candidate.on('close', () => {
       clearTimeout(deadline)
+      if (owed) {
+        owed = false
+        turnAway(candidate, 'abandoned the handshake')
+      }
       if (socket !== candidate) return
       socket = null
       detach('closed')
@@ -264,14 +327,28 @@ export async function startBridge(options: BridgeOptions): Promise<Bridge> {
      */
     const offerChallenge = async (payload: Record<string, unknown>): Promise<void> => {
       const extensionNonce = payload['nonce']
+      if (expired())
+        return turnAway(
+          candidate,
+          'the pairing code has expired',
+          'Restart this bridge and it will print a fresh one.',
+        )
       const pending = handshakeKey()
       if (!isNonce(extensionNonce) || !pending) return refuse(candidate, 'not paired')
+      // Empty once paired: `secretHashKey` stretches nothing, so there is no salt to agree on, and
+      // a bridge that sent one anyway would be telling every dial whether it has paired yet.
+      const mySalt = credential ? '' : salt
       const resolved = await pending
       const bridgeNonce = mintNonce()
-      const mine = await proof(resolved, { role: 'bridge', port, extensionNonce, bridgeNonce })
+      const mine = await proof(resolved, { role: 'bridge', port, extensionNonce, bridgeNonce, salt: mySalt })
       if (candidate.readyState !== 1) return
-      challenge = { key: resolved, extensionNonce, bridgeNonce }
-      candidate.send(JSON.stringify({ type: 'bridge.challenge', nonce: bridgeNonce, proof: mine }))
+      challenge = { key: resolved, extensionNonce, bridgeNonce, salt: mySalt }
+      // Owed from the moment the challenge is on the wire: what the peer does with it — answer
+      // wrongly, walk away, or nothing at all — decides which refusal it gets, never whether.
+      owed = true
+      deadline.refresh()
+      const frame = { type: 'bridge.challenge', nonce: bridgeNonce, proof: mine, ...(mySalt ? { salt: mySalt } : {}) }
+      candidate.send(JSON.stringify(frame))
     }
 
     /**
@@ -280,6 +357,9 @@ export async function startBridge(options: BridgeOptions): Promise<Bridge> {
      * `bridge.proof` carries a credential — only a proof of one.
      */
     const handshake = async (payload: unknown): Promise<void> => {
+      // A frame arriving is the opposite of abandoning: whatever this one turns out to be, its own
+      // refusal is the one that gets logged, and the close below must not log a second.
+      owed = false
       if (failures >= ATTEMPTS || !isRecord(payload)) return refuse(candidate, 'not paired')
       if (payload['type'] === 'hello' && !greeted) {
         greeted = true
@@ -289,12 +369,15 @@ export async function startBridge(options: BridgeOptions): Promise<Bridge> {
       // One proof per challenge: a replayed transcript must not find its nonces still live.
       challenge = null
       if (payload['type'] !== 'bridge.proof' || !answered) return refuse(candidate, 'expected hello')
-      const { key: proven, extensionNonce, bridgeNonce } = answered
-      const expected = await proof(proven, { role: 'extension', port, extensionNonce, bridgeNonce })
+      const { key: proven, extensionNonce, bridgeNonce, salt: agreed } = answered
+      const expected = await proof(proven, { role: 'extension', port, extensionNonce, bridgeNonce, salt: agreed })
       if (!proofMatches(expected, payload['proof'])) return refuse(candidate, 'not paired')
       if (candidate.readyState !== 1) return
       clearTimeout(deadline)
       adopted = true
+      // Proved: nothing is owed on this socket, and its eventual close is a detach rather than a
+      // refusal.
+      owed = false
       adopt(candidate, settle().secret)
     }
 
