@@ -167,6 +167,13 @@ function group(kind: keyof typeof GROUPS, candidates: CandidateView[]): HTMLElem
         el('span', { className: 'group-count', textContent: `(${candidates.length})` }),
       ]),
       el('p', { textContent: copy.detail }),
+      // The picker that moves a skill between these groups lives behind each skill's Details, with
+      // the other edits, because a dropdown on every row makes the list unreadable. That hides the
+      // one control that corrects a misclassification, and the classifier is a guess over names —
+      // so the groups that can be wrong say where the correction is, once, instead of per row.
+      ...(kind === 'read'
+        ? []
+        : [el('p', { className: 'group-hint', textContent: 'In the wrong group? Open a skill to move it.' })]),
     ]),
     el('ul', {}, candidates.map(item)),
   ])

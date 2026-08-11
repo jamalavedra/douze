@@ -305,6 +305,26 @@ describe('a reviewer correcting what inference guessed (WO-016)', () => {
   })
 
   /**
+   * A description the user wrote is the one place on that screen where they explained the tool in
+   * their own words. Regenerating it on promotion would silently discard that, so the wording is
+   * kept and only the consequence is added — the class still has to reach the text, or the tool
+   * reads as an ordinary change while the policy treats it as irreversible.
+   */
+  it('keeps a hand-written description when the tool is promoted, and says what changed', async () => {
+    const recipes = await RecipeStore.open()
+    const review = await ReviewSession.open('cap', { captures: capturesOf(detailOf(RECORDED)), recipes })
+
+    review.edit('create_order', 'description', 'Files a resupply order with the warehouse')
+    review.edit('create_order', 'side_effect', 'destructive')
+    review.approve(['create_order'])
+    await review.save()
+
+    const tool = recipes.recipe('shop-orders')?.tools.find((t) => t.name === 'create_order')
+    expect(tool?.description).toContain('Files a resupply order with the warehouse')
+    expect(tool?.description).toContain('cannot be undone')
+  })
+
+  /**
    * The correction has to outlive the next recording. Inference classifies `POST /api/orders` as a
    * write every single time, and `mergeRecipe` rebuilds `request.input_schema` from it — so this
    * covers both halves: the label is preserved because it is `user_edited`, and the confirm is

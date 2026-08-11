@@ -130,9 +130,26 @@ function reclassify(candidate: Candidate, value: unknown): Candidate {
   tool.side_effect = value
   tool.request.input_schema =
     value === 'destructive' ? injectConfirm(tool.request.input_schema) : withoutConfirm(tool.request.input_schema)
-  tool.description = describeSync(descriptionInput(tool, candidate.evidence.provenance?.accessible_name))
-  markEdited(candidate, 'side_effect', 'description')
+  // A description that still says "makes changes" on a tool the policy now treats as irreversible
+  // is worse than either alone, so the class has to reach the text. But a description the user
+  // wrote themselves is theirs: overwriting it with the template silently discards the one part of
+  // this screen where they explained the tool in their own words. So a generated description is
+  // regenerated, and a hand-written one keeps its wording and gains the sentence the policy needs.
+  const wrote = candidate.tool.flags.user_edited.includes('description')
+  const generated = describeSync(descriptionInput(tool, candidate.evidence.provenance?.accessible_name))
+  tool.description = wrote ? withConsequence(tool.description, value) : generated
+  markEdited(candidate, 'side_effect', ...(wrote ? [] : (['description'] as EditableField[])))
   return candidate
+}
+
+/**
+ * Keeps the user's own words and makes the class explicit in them. The phrasing matches what
+ * `describeSync` generates for a destructive tool, so a hand-written and a generated description
+ * say the same thing about consequence even though they differ everywhere else.
+ */
+function withConsequence(description: string, side_effect: 'write' | 'destructive'): string {
+  const stripped = description.replace(/;? ?this cannot be undone\.?$/i, '').replace(/\.$/, '')
+  return side_effect === 'destructive' ? `${stripped}; this cannot be undone` : stripped
 }
 
 /** The other half of AC-REC-002.4: a demoted tool stops demanding a word it no longer means. */
