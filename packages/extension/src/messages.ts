@@ -147,15 +147,24 @@ export interface ReviewSaved {
 }
 
 /**
- * Connect page → service worker. `status` and `pair` are live (T-015.8/12); T-015.10 wires the
- * three that mint or retire a relay endpoint, and until then each answers with `error` set and
- * nothing changed.
+ * Connect page → service worker. Every one of these answers with the whole `ConnectState`, so the
+ * page never has to infer what changed; a command that could not be carried out answers with
+ * `error` set and nothing changed at all.
  */
 export type ConnectCommand =
   | { type: 'douze:connect:status' }
-  | { type: 'douze:connect:start' }
+  /**
+   * T-015.10 — register with a relay and store the pairing. `url` is the relay to use; omitted
+   * means the default one, which is what the page offers unless the user typed their own.
+   */
+  | { type: 'douze:connect:start'; url?: string }
   | { type: 'douze:connect:rotate' }
   | { type: 'douze:connect:stop' }
+  /**
+   * T-015.9/10 — the write opt-in, which is a property of the relay pairing. Destructive tools are
+   * not reachable either way and no value here changes that.
+   */
+  | { type: 'douze:connect:writes'; allow: boolean }
   /**
    * T-015.12 — the code a local bridge printed to its stderr, typed in by the user. Loopback alone
    * is not consent: this is what earns a bridge `local` trust and its destructive tools with it.
@@ -168,16 +177,36 @@ export type ConnectCommand =
    */
   | { type: 'douze:connect:expose'; trust: 'local' | 'remote'; tool: string; allow: boolean }
 
+/** What the connect page knows about the local bridge, which is a pairing and not a link. */
+export type BridgeState = 'unpaired' | 'trying' | 'paired' | 'refused'
+
 export interface ConnectState {
   /** Whether a link exists at all — the page shows setup or the link, never both. */
   configured: boolean
-  /** The relay the link points at, named on the setup screen before anything is shared. */
+  /**
+   * The relay the link points at. Before anything is shared this is the default the page offers,
+   * which is the relay a user who types nothing will get.
+   */
   url: string
   /** The link itself. Empty until configured. */
   mcp_url: string
   allow_writes: boolean
-  /** Whether the attachment is up right now. The link survives it being down. */
+  /**
+   * Whether Douze has a live attachment right now — to the relay, to a local bridge, or both. It
+   * is deliberately not per-pipe: the attachment client reports one answer for all of them, and a
+   * page that split it here would be inventing a distinction it cannot see.
+   */
   connected: boolean
+  /** Every approved tool's qualified name, so the expose control lists real tools and not a box. */
+  tools: string[]
+  /**
+   * Tools exempt from the result secret gate, per trust level and never merged: exempting a tool
+   * for an app on this computer must not start sending that value to a relay operator.
+   */
+  exposed: { local: string[]; remote: string[] }
+  bridge: BridgeState
   /** Set when an action could not be carried out; the page shows it and changes nothing. */
   error?: string
+  /** Set when the action WAS carried out but something about it did not work — see `stop`. */
+  warning?: string
 }

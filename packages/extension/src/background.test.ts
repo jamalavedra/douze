@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Recipe } from '@douze/shared'
-import type { PageEvent } from './messages.js'
+import type { RelayPairing } from './attach.js'
+import type { ConnectState, PageEvent } from './messages.js'
 import { RecipeStore } from './recipes.js'
 import { ReviewSession } from './review-session.js'
 import { CaptureStore } from './store.js'
@@ -227,9 +228,13 @@ interface FakeChrome {
   notifications: { id: string; title: string; message: string }[]
   /** Swapped by a test that needs a specific response, or a slow one. */
   inject: (url: string) => Promise<Injected>
+  /** T-015.10 — the host permission the connect page asks for. Cleared to refuse it. */
+  hostPermission: boolean
 }
 
 const globals = globalThis as Record<string, unknown>
+/** Put back after each test: `fetch` here is Node's own, and the worker's is faked over it. */
+const realFetch = globalThis.fetch
 
 function installChrome(): FakeChrome {
   const onMessage = fakeEvent()
@@ -254,6 +259,7 @@ function installChrome(): FakeChrome {
       url,
       redirected: false,
     }),
+    hostPermission: true,
   }
 
   globals['chrome'] = {
@@ -276,7 +282,7 @@ function installChrome(): FakeChrome {
       },
       clear: async () => undefined,
     },
-    permissions: { contains: async () => true },
+    permissions: { contains: async () => state.hostPermission },
     storage: {
       local: storageArea(local, 'local', onChanged),
       session: storageArea(session, 'session', onChanged),
@@ -468,11 +474,49 @@ interface DouzeSurface {
 
 const douze = (): DouzeSurface => globals['__douze'] as DouzeSurface
 
+// --- the relay's HTTP API (T-015.10) ---------------------------------------
+
+interface RelayCall {
+  url: string
+  method: string
+  token?: string
+  body?: unknown
+}
+
+/** Every call the worker made to a relay's own API, in order. */
+const relayCalls: RelayCall[] = []
+/** What the relay answers next. Swapped by a test that needs a refusal or an outage. */
+let relayAnswer: (call: RelayCall) => { status: number; body?: unknown } = () => ({
+  status: 201,
+  body: { token: 'minted-token', mcp_path: '/m/minted' },
+})
+
+const fakeFetch = async (url: string, init: { method: string; headers: Record<string, string>; body?: string }) => {
+  const call: RelayCall = {
+    url,
+    method: init.method,
+    ...(init.headers['x-douze-relay-token'] === undefined
+      ? {}
+      : { token: init.headers['x-douze-relay-token'] }),
+    ...(init.body === undefined ? {} : { body: JSON.parse(init.body) as unknown }),
+  }
+  relayCalls.push(call)
+  const answer = relayAnswer(call)
+  return {
+    ok: answer.status >= 200 && answer.status < 300,
+    status: answer.status,
+    json: async () => answer.body,
+  }
+}
+
 /** `seed` lands in `chrome.storage.local` BEFORE the worker starts, as a stored pairing does. */
 async function bootWorker(seed: Record<string, unknown> = {}): Promise<void> {
   databases.clear()
   fake = installChrome()
   FakeSocket.opened.length = 0
+  relayCalls.length = 0
+  relayAnswer = () => ({ status: 201, body: { token: 'minted-token', mcp_path: '/m/minted' } })
+  globals['fetch'] = fakeFetch
   for (const [key, value] of Object.entries(seed)) fake.local.set(key, value)
   globals['indexedDB'] = fakeIndexedDB
   globals['IDBKeyRange'] = FakeKeyRange
@@ -495,6 +539,7 @@ afterEach(() => {
   delete globals['indexedDB']
   delete globals['IDBKeyRange']
   delete globals['WebSocket']
+  globals['fetch'] = realFetch
   delete globals['__douze']
 })
 
@@ -1046,6 +1091,203 @@ describe('an expired session (AC-EXE-002.3)', () => {
     fake.onNotificationClicked.emit(notification?.id)
     await settle()
     expect(fake.created).toContain('https://app.test/login')
+  })
+})
+
+/**
+ * WO-015 T-015.10 — the connect page's commands, which are the whole no-terminal path: someone
+ * with no terminal ends up with a URL to paste into ChatGPT, and can take it back again.
+ *
+ * The relay's HTTP API is faked at `fetch` and nothing below it is, so the pairing that lands in
+ * `chrome.storage.local` is the one the attachment client reads on its next alarm.
+ */
+describe('sharing Douze with a hosted assistant (T-015.10)', () => {
+  const connect = (command: Record<string, unknown>): Promise<ConnectState> =>
+    sendFrom(extensionPage(), command) as Promise<ConnectState>
+
+  const storedRelay = (): RelayPairing | undefined => fake.local.get('attach:relay') as RelayPairing | undefined
+
+  it('registers with the default relay and hands back the link to paste', async () => {
+    const state = await connect({ type: 'douze:connect:start' })
+
+    expect(relayCalls).toEqual([
+      { url: 'https://douze.jamalavedra.com/register', method: 'POST', body: { daemon_version: '0.1.0' } },
+    ])
+    // Exactly what `attach.ts` reads, including the write opt-in starting off.
+    expect(storedRelay()).toEqual({
+      url: 'https://douze.jamalavedra.com',
+      token: 'minted-token',
+      mcp_path: '/m/minted',
+      allow_writes: false,
+    })
+    expect(state.error).toBeUndefined()
+    expect(state.configured).toBe(true)
+    expect(state.mcp_url).toBe('https://douze.jamalavedra.com/m/minted')
+    expect(state.allow_writes).toBe(false)
+  })
+
+  it('registers with a relay the user runs themselves, trailing slash and all', async () => {
+    const state = await connect({ type: 'douze:connect:start', url: 'https://relay.example.com/' })
+    expect(relayCalls[0]?.url).toBe('https://relay.example.com/register')
+    expect(state.mcp_url).toBe('https://relay.example.com/m/minted')
+  })
+
+  it('refuses a relay address that would send the link in the clear, and shares nothing', async () => {
+    const state = await connect({ type: 'douze:connect:start', url: 'http://relay.example.com' })
+    expect(state.error).toContain('https://')
+    expect(relayCalls).toEqual([])
+    expect(storedRelay()).toBeUndefined()
+    expect(state.configured).toBe(false)
+  })
+
+  it('says which permission is missing rather than failing as a network error', async () => {
+    fake.hostPermission = false
+    const state = await connect({ type: 'douze:connect:start' })
+    expect(state.error).toContain('permission')
+    expect(state.error).toContain('https://douze.jamalavedra.com')
+    expect(relayCalls).toEqual([])
+    expect(storedRelay()).toBeUndefined()
+  })
+
+  it('reports a relay that is out of registrations in words, not a status code', async () => {
+    relayAnswer = () => ({ status: 429 })
+    const state = await connect({ type: 'douze:connect:start' })
+    expect(state.error).toContain('Try again in an hour.')
+    expect(state.error).not.toContain('429')
+    expect(storedRelay()).toBeUndefined()
+  })
+
+  it('rotates by REPLACING the pairing, so the dead link is not left in storage', async () => {
+    await connect({ type: 'douze:connect:start' })
+    relayAnswer = () => ({ status: 200, body: { token: 'second-token', mcp_path: '/m/second' } })
+
+    const state = await connect({ type: 'douze:connect:rotate' })
+    expect(relayCalls.at(-1)).toEqual({
+      url: 'https://douze.jamalavedra.com/rotate',
+      method: 'POST',
+      token: 'minted-token',
+    })
+    expect(storedRelay()).toEqual({
+      url: 'https://douze.jamalavedra.com',
+      token: 'second-token',
+      mcp_path: '/m/second',
+      allow_writes: false,
+    })
+    expect(state.mcp_url).toBe('https://douze.jamalavedra.com/m/second')
+    // The relay killed the old pair as it answered; nothing here may still be holding it.
+    expect(JSON.stringify(fake.local.get('attach:relay'))).not.toContain('minted')
+  })
+
+  it('keeps the link when a rotate fails, and says so', async () => {
+    await connect({ type: 'douze:connect:start' })
+    relayAnswer = () => ({ status: 401 })
+
+    const state = await connect({ type: 'douze:connect:rotate' })
+    expect(state.error).toContain('does not recognise this link')
+    expect(storedRelay()?.token).toBe('minted-token')
+    expect(state.mcp_url).toBe('https://douze.jamalavedra.com/m/minted')
+  })
+
+  it('tells the relay to drop the endpoint and clears the pairing', async () => {
+    await connect({ type: 'douze:connect:start' })
+    relayAnswer = () => ({ status: 204 })
+
+    const state = await connect({ type: 'douze:connect:stop' })
+    expect(relayCalls.at(-1)).toEqual({
+      url: 'https://douze.jamalavedra.com/register',
+      method: 'DELETE',
+      token: 'minted-token',
+    })
+    expect(storedRelay()).toBeUndefined()
+    expect(state).toMatchObject({ configured: false, mcp_url: '', allow_writes: false })
+    expect(state.error).toBeUndefined()
+    expect(state.warning).toBeUndefined()
+  })
+
+  it('stops sharing even when the relay cannot be reached, and warns instead of refusing', async () => {
+    await connect({ type: 'douze:connect:start' })
+    globals['fetch'] = () => Promise.reject(new TypeError('Failed to fetch'))
+
+    const state = await connect({ type: 'douze:connect:stop' })
+    // Someone who wants to stop sharing must always be able to: the pairing is gone either way.
+    expect(storedRelay()).toBeUndefined()
+    expect(state.configured).toBe(false)
+    expect(state.error).toBeUndefined()
+    expect(state.warning).toContain('could not tell')
+    expect(state.warning).toContain('https://douze.jamalavedra.com')
+  })
+
+  it('refuses to rotate, stop or change writes when nothing is shared, calling nobody', async () => {
+    for (const type of ['douze:connect:rotate', 'douze:connect:stop', 'douze:connect:writes']) {
+      const state = await connect({ type, allow: true })
+      expect(state.error).toContain('nothing to change')
+    }
+    expect(relayCalls).toEqual([])
+  })
+
+  it('turns the write opt-in on and off on the stored pairing, and tells nobody else', async () => {
+    await connect({ type: 'douze:connect:start' })
+
+    const on = await connect({ type: 'douze:connect:writes', allow: true })
+    expect(storedRelay()?.allow_writes).toBe(true)
+    expect(on.allow_writes).toBe(true)
+    // The attachment key carries the opt-in, so the client re-dials on its own; the relay's API
+    // has no say in it and must not be called.
+    expect(relayCalls).toHaveLength(1)
+
+    const off = await connect({ type: 'douze:connect:writes', allow: false })
+    expect(storedRelay()?.allow_writes).toBe(false)
+    expect(off.allow_writes).toBe(false)
+  })
+
+  it('adds and removes an exemption per trust level, and never across them', async () => {
+    await approveShop()
+    const exempt = (trust: string, allow: boolean): Promise<ConnectState> =>
+      connect({ type: 'douze:connect:expose', trust, tool: 'shop_list_orders', allow })
+
+    const local = await exempt('local', true)
+    expect(local.exposed).toEqual({ local: ['shop_list_orders'], remote: [] })
+
+    const both = await exempt('remote', true)
+    expect(both.exposed).toEqual({ local: ['shop_list_orders'], remote: ['shop_list_orders'] })
+
+    const removed = await exempt('remote', false)
+    expect(removed.exposed).toEqual({ local: ['shop_list_orders'], remote: [] })
+    expect(fake.local.get('attach:expose')).toEqual({ local: ['shop_list_orders'], remote: [] })
+  })
+
+  it('tells the page what there is to be told, and nothing it cannot know', async () => {
+    await approveShop()
+    expect(await connect({ type: 'douze:connect:status' })).toEqual({
+      configured: false,
+      // Named before anything is shared, so the setup screen says where the link would come from.
+      url: 'https://douze.jamalavedra.com',
+      mcp_url: '',
+      allow_writes: false,
+      connected: false,
+      tools: ['shop_list_orders', 'shop_create_order', 'shop_delete_order'],
+      exposed: { local: [], remote: [] },
+      bridge: 'unpaired',
+    })
+  })
+
+  it('reports the bridge as it actually is at each step of pairing', async () => {
+    expect((await connect({ type: 'douze:connect:status' })).bridge).toBe('unpaired')
+
+    // The code is in storage and no host has accepted it yet — which is neither paired nor not.
+    await connect({ type: 'douze:connect:pair', code: 'four-word-code' })
+    expect((await connect({ type: 'douze:connect:status' })).bridge).toBe('trying')
+
+    const socket = dialled('127.0.0.1') as FakeSocket
+    socket.accept()
+    await settle()
+    socket.deliver({ type: 'welcome', heartbeat_ms: 20_000 }, { secret: 'minted-secret' })
+    await settle()
+    expect((await connect({ type: 'douze:connect:status' })).bridge).toBe('paired')
+
+    socket.drop(1008)
+    await settle()
+    expect((await connect({ type: 'douze:connect:status' })).bridge).toBe('refused')
   })
 })
 

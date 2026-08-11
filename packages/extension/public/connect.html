@@ -32,7 +32,12 @@
           answered here, by the Douze already running in this browser, and nothing new starts
           listening on this computer.
         </p>
-        <p class="sub" id="relay"></p>
+        <label class="field-label" for="relay-url">The relay Douze will use</label>
+        <input class="field" id="relay-url" type="text" spellcheck="false" autocomplete="off" />
+        <p class="sub" id="relay">
+          Leave this as it is unless you run your own relay. Whoever runs it can read everything
+          that crosses it &mdash; see below.
+        </p>
         <div class="actions">
           <p>You can stop sharing at any time.</p>
           <button type="button" class="primary" id="connect">Connect</button>
@@ -51,6 +56,12 @@
           <li><strong>claude.ai</strong> &mdash; Settings &rarr; Connectors &rarr; Add custom connector</li>
           <li><strong>Dust</strong> &mdash; Admin &rarr; Tools &rarr; Add MCP server</li>
         </ul>
+        <h2 class="section-heading">What a hosted assistant may do</h2>
+        <p class="sub" id="writes-state"></p>
+        <div class="actions">
+          <p>Deleting is never possible from a hosted assistant, whichever of these is on.</p>
+          <button type="button" class="quiet" id="writes"></button>
+        </div>
         <div class="actions">
           <button type="button" class="quiet" id="rotate">Get a new link</button>
           <button type="button" class="quiet danger" id="stop">Stop sharing</button>
@@ -60,6 +71,43 @@
           <button type="button" class="primary" id="confirm-yes"></button>
           <button type="button" class="quiet" id="confirm-no">Cancel</button>
         </section>
+      </section>
+      <section id="exposed">
+        <h2 class="section-heading">Results that look like passwords</h2>
+        <p class="sub">
+          When a tool's answer contains something shaped like a password, key or token, Douze holds
+          the whole answer back and says so. If a tool's answers always look like that and you meant
+          to send them, allow it here.
+        </p>
+        <p class="sub">
+          The two lists are kept apart on purpose: allowing a tool for an app on this computer does
+          not start sending that value to whoever runs the relay.
+        </p>
+        <h3>Apps on this computer</h3>
+        <ul class="steps" id="exposed-local"></ul>
+        <h3>Hosted assistants</h3>
+        <ul class="steps" id="exposed-remote"></ul>
+        <label class="field-label" for="expose-tool">Allow another tool's answers</label>
+        <select class="field" id="expose-tool"></select>
+        <p class="sub" id="expose-empty" hidden>Douze has no tools set up yet, so there is nothing to allow.</p>
+        <div class="actions">
+          <button type="button" class="quiet" id="expose-local">Allow for apps on this computer</button>
+          <button type="button" class="quiet" id="expose-remote">Allow for hosted assistants</button>
+        </div>
+      </section>
+      <section id="local">
+        <h2 class="section-heading">An app on this computer</h2>
+        <p class="sub" id="bridge-state"></p>
+        <p>
+          An app on this computer gets everything, including tools that delete things, so Douze will
+          not take one on trust just because it is running here: the app prints a short code, and
+          typing it in is you saying yes.
+        </p>
+        <div class="copy-row">
+          <input class="field" id="pair-code" type="text" spellcheck="false" autocomplete="off"
+            aria-label="The code the app printed" />
+          <button type="button" class="primary" id="pair">Pair</button>
+        </div>
       </section>
       <section class="trust">
         <h2 class="section-heading">What you are trusting</h2>
