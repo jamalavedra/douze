@@ -263,8 +263,14 @@ browser at all.
    stores no credential.
 3. **Installation happens once.** Connect a client one time. Every recipe recorded afterwards
    appears automatically, with no rebuild and no reconnect.
-4. **It stays true.** Sites change. Douze replays stored fixtures, catches drift, and makes broken
-   tools fail loudly instead of quietly returning the wrong shape.
+4. **A broken tool fails loudly.** A tool whose stored fixture is missing is marked degraded: it
+   says so in the description your assistant reads, and refuses before it issues a request, rather
+   than quietly returning the wrong shape.
+
+   What Douze does **not** do is notice a site changed on its own. Scheduled fixture replay and
+   drift classification — the `douze doctor` run — were built for the daemon and deleted with it in
+   WO-015; nothing has replaced them. When a site changes under a recipe, the tool keeps calling the
+   old endpoint until you notice and record the site again.
 
 ## Packages
 

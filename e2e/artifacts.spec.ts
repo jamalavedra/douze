@@ -1,7 +1,11 @@
 import { test, expect } from '@playwright/test'
 import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
-import { EXTENSION, FixtureApp, launchHelium, waitFor, type Browser } from './harness.js'
+import { EXTENSION, FixtureApp, launchHelium, stopEverything, waitFor, type Browser } from './harness.js'
+
+// Not a `finally`: a Playwright TIMEOUT abandons the test body, and the fixture app then outlives
+// the run and breaks the next one's "port is free" wait.
+test.afterEach(stopEverything)
 
 /**
  * V-015.4 — what has to be true of the artefacts themselves.
@@ -51,6 +55,32 @@ const CODE_GENERATION = /\bFunction\(/g
  */
 const KNOWN_PROBE = 'Cloudflare'
 
+/**
+ * Every row in every object store of every database the extension holds — not just the session
+ * under test. The claim being made is "no credential is readable back out of extension storage",
+ * and a row the sweep never opened is a row that could hold one: `sessions` and `annotations` are
+ * as much of the store as `exchanges`, and a second database would be missed entirely.
+ */
+const wholeIndexedDb = (browser: Browser): Promise<Record<string, unknown>> =>
+  browser.serviceWorker.evaluate(async () => {
+    const read = <T>(request: IDBRequest<T>): Promise<T> =>
+      new Promise((resolve, reject) => {
+        request.onsuccess = (): void => resolve(request.result)
+        request.onerror = (): void => reject(request.error ?? new Error('IndexedDB request failed'))
+      })
+    const dump: Record<string, unknown> = {}
+    for (const { name, version } of await indexedDB.databases()) {
+      if (name === undefined) continue
+      const db = await read(indexedDB.open(name, version))
+      for (let i = 0; i < db.objectStoreNames.length; i += 1) {
+        const store = db.objectStoreNames.item(i)!
+        dump[`${name}/${store}`] = await read(db.transaction(store, 'readonly').objectStore(store).getAll())
+      }
+      db.close()
+    }
+    return dump
+  })
+
 test('the built bundle generates no code', () => {
   const files = bundleFiles()
   // A guard on the build, not on the source: a Web Store reviewer reads the bundle, not the vite
@@ -69,66 +99,64 @@ test('nothing credential-shaped can be read back out of extension storage after 
   test.setTimeout(180_000)
 
   const app = new FixtureApp()
-  let browser: Browser | undefined
 
-  try {
-    await app.start()
-    await app.reset()
-    browser = await launchHelium()
-    const { serviceWorker, context } = browser
+  await app.start()
+  await app.reset()
+  const browser = await launchHelium()
+  const { serviceWorker, context } = browser
 
-    const page = await context.newPage()
-    await page.goto(app.origin)
-    const sessionId = await serviceWorker.evaluate((origin) => __douze.startSession('secrets', [origin]), app.origin)
-    await page.waitForSelector('#create')
-    await page.waitForFunction(() => (window as { __douze_interceptor__?: boolean }).__douze_interceptor__ === true)
+  const page = await context.newPage()
+  await page.goto(app.origin)
+  const sessionId = await serviceWorker.evaluate((origin) => __douze.startSession('secrets', [origin]), app.origin)
+  await page.waitForSelector('#create')
+  await page.waitForFunction(() => (window as { __douze_interceptor__?: boolean }).__douze_interceptor__ === true)
 
-    // One session carrying every shape the sweep looks for: a password in a request body, a
-    // session cookie on every same-origin request, a page-state bearer and CSRF header, and two
-    // credential-shaped values under innocuous keys that come back in the response as well.
-    await page.evaluate(
-      async (secrets) => {
-        const auth = {
-          'content-type': 'application/json',
-          authorization: 'Bearer page-state-bearer-token-value',
-          'x-csrf-token': 'csrf-fixture-value',
-        }
-        await fetch('/login', {
+  // One session carrying every shape the sweep looks for: a password in a request body, a
+  // session cookie on every same-origin request, a page-state bearer and CSRF header, and two
+  // credential-shaped values under innocuous keys that come back in the response as well.
+  await page.evaluate(
+    async (secrets) => {
+      const auth = {
+        'content-type': 'application/json',
+        authorization: 'Bearer page-state-bearer-token-value',
+        'x-csrf-token': 'csrf-fixture-value',
+      }
+      await fetch('/login', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ user: 'sam', password: 'hunter2' }),
+      })
+      for (const note of [secrets.jwt, secrets.key]) {
+        await fetch('/api/orders', {
           method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ user: 'sam', password: 'hunter2' }),
+          headers: auth,
+          body: JSON.stringify({ item: 'widget', qty: 1, note }),
         })
-        for (const note of [secrets.jwt, secrets.key]) {
-          await fetch('/api/orders', {
-            method: 'POST',
-            headers: auth,
-            body: JSON.stringify({ item: 'widget', qty: 1, note }),
-          })
-        }
-        await fetch('/api/orders', { headers: auth })
-      },
-      { jwt: JWT, key: API_KEY },
-    )
-    await waitFor(async () => (await serviceWorker.evaluate(() => __douze.badgeCount())) >= 4, 'four exchanges')
-    await serviceWorker.evaluate(() => __douze.stopSession())
+      }
+      await fetch('/api/orders', { headers: auth })
+    },
+    { jwt: JWT, key: API_KEY },
+  )
+  await waitFor(async () => (await serviceWorker.evaluate(() => __douze.badgeCount())) >= 4, 'four exchanges')
+  await serviceWorker.evaluate(() => __douze.stopSession())
 
-    const recorded = await serviceWorker.evaluate((id) => __douze.recorded(id), sessionId)
-    // A vacuous sweep is worse than none: the exchanges that carried the credentials must be in
-    // the store, redacted — not silently refused by the write gate and therefore absent.
-    const posts = (recorded.exchanges as { method: string; url: string }[]).filter(
-      (exchange) => exchange.method === 'POST' && exchange.url.endsWith('/api/orders'),
-    )
-    expect(posts.length).toBe(2)
+  const recorded = await serviceWorker.evaluate((id) => __douze.recorded(id), sessionId)
+  // A vacuous sweep is worse than none: the exchanges that carried the credentials must be in
+  // the store, redacted — not silently refused by the write gate and therefore absent.
+  const posts = (recorded.exchanges as { method: string; url: string }[]).filter(
+    (exchange) => exchange.method === 'POST' && exchange.url.endsWith('/api/orders'),
+  )
+  expect(posts.length).toBe(2)
 
-    const stored = await serviceWorker.evaluate(() => chrome.storage.local.get(null))
-    const swept = JSON.stringify({ indexeddb: recorded, local: stored })
-    for (const [pattern, what] of PATTERNS) {
-      expect(`${what}: ${pattern.test(swept)}`).toBe(`${what}: false`)
-    }
-    // The redactor left a placeholder where each of those was, rather than dropping the field.
-    expect(swept).toContain('«redacted:string:')
-  } finally {
-    await browser?.dispose()
-    await app.stop()
+  const stored = await serviceWorker.evaluate(() => chrome.storage.local.get(null))
+  const indexeddb = await wholeIndexedDb(browser)
+  // A sweep over nothing is worse than none: the databases have to have been opened and the
+  // exchanges above have to be inside what was read.
+  expect(Object.keys(indexeddb)).toContain('douze-capture/exchanges')
+  const swept = JSON.stringify({ indexeddb, local: stored })
+  for (const [pattern, what] of PATTERNS) {
+    expect(`${what}: ${pattern.test(swept)}`).toBe(`${what}: false`)
   }
+  // The redactor left a placeholder where each of those was, rather than dropping the field.
+  expect(swept).toContain('«redacted:string:')
 })

@@ -73,10 +73,12 @@ function matches(name: string, list: string[]): boolean {
 }
 
 /**
- * Redaction runs twice by design — once in the extension's service worker, once again in the
- * daemon, which also ingests HAR files. It must therefore be idempotent: re-redacting a
- * placeholder would replace it with a placeholder of the placeholder, destroying the original
- * length that AC-CAP-005.3 requires schema inference to keep.
+ * Redaction runs more than once over the same bytes by design: at capture time on the exchange,
+ * and again on anything imported (`har.ts` re-redacts a HAR the extension never recorded). The
+ * second pass used to be the daemon's, which is gone; the property it needed has not changed. It
+ * must therefore be idempotent: re-redacting a placeholder would replace it with a placeholder of
+ * the placeholder, destroying the original length that AC-CAP-005.3 requires schema inference to
+ * keep.
  */
 export function redactHeaders(
   headers: Record<string, string>,

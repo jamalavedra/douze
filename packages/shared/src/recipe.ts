@@ -6,9 +6,6 @@ export const RECIPE_VERSION = 1
 /** AC-INF-003.1/.2 — read is safe to replay, destructive needs `confirm`. */
 export const SideEffect = z.enum(['read', 'write', 'destructive'])
 
-/** AC-DRF-001.2 — the five outcomes a Doctor Run can report per tool. */
-export const DriftStatus = z.enum(['ok', 'schema_widened', 'breaking', 'session_expired', 'gone'])
-
 /**
  * AC-REC-001.2 — a recipe records only where a credential comes from, never a value.
  * `cookie` needs nothing: the browser attaches it. `page_state` names the expression the
@@ -96,7 +93,15 @@ export const ToolFlags = z.object({
   /** AC-REC-003.2 — retained across a recapture that no longer observed it. */
   unverified: z.boolean().default(false),
   last_observed: z.string().optional(),
-  /** AC-DRF-002.1 — set by a Doctor Run; the runtime rejects calls to this tool. */
+  /**
+   * AC-RUN-001.5 — the runtime rejects calls to this tool before it issues a request.
+   *
+   * The Doctor Run that used to set it from a live replay went with the daemon (WO-015 T-015.13),
+   * and nothing replaced it: the only producer left is `RecipeStore`'s load-time check that an
+   * approved tool's fixture is present (packages/extension/src/recipes.ts). The flag stays in the
+   * schema because it is still written by that check, still honoured by `checkPolicy`, and still
+   * survives an export/import round trip.
+   */
   degraded: z.boolean().default(false),
   degraded_reason: z.string().optional(),
   /** AC-REC-002.2 — fields the user hand-edited, protected from re-inference. */
@@ -118,7 +123,7 @@ export const Tool = z.object({
   response: ResponseContract.prefault({}),
   /** AC-REC-004.1 — approved tools reference at least one fixture (enforced below). */
   fixtures: z.array(z.string()).default([]),
-  /** AC-EXE-003.1 — per-tool rate limit; douzed queues rather than drops. */
+  /** AC-EXE-003.1 — per-tool rate limit; the extension's limiter queues rather than drops. */
   rate_limit_per_minute: z.number().int().positive().optional(),
   /** REQ-CAP-007 — the note that produced this tool, kept as description evidence. */
   annotation: z.string().optional(),
@@ -171,7 +176,6 @@ function hasConfirm(tool: z.infer<typeof Tool>): boolean {
 export type Recipe = z.infer<typeof Recipe>
 export type Tool = z.infer<typeof Tool>
 export type SideEffect = z.infer<typeof SideEffect>
-export type DriftStatus = z.infer<typeof DriftStatus>
 export type CredentialSource = z.infer<typeof CredentialSource>
 export type RequestContract = z.infer<typeof RequestContract>
 export type ResponseContract = z.infer<typeof ResponseContract>

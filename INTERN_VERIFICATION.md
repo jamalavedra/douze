@@ -2,8 +2,9 @@
 
 Use this guide to verify Douze without touching a real account first. It covers the extension —
 which is the product — and the two stateless pipes that attach to it: the cloud relay and the local
-bridge. There is no daemon, no `douze` CLI, no `.mcpb`, and no headless mode; if you find a document
-or a comment that mentions one, it is stale and the code wins.
+bridge. There is no daemon, no `douze` CLI, no `.mcpb`, no headless mode, and no drift detection —
+`douze doctor`, scheduled fixture replay and drift classification went with the daemon and were not
+rebuilt. If you find a document or a comment that mentions one, it is stale and the code wins.
 
 Everything here is a check you can run and a piece of evidence you can record. Where something has
 never been verified, it is in [Known verification gaps](#known-verification-gaps), not softened into
@@ -372,7 +373,8 @@ override.
 
 **The artifact sweep runs against extension storage.** It used to be `e2e/metrics.mjs` walking
 `DOUZE_HOME`, which no longer exists. `e2e/artifacts.spec.ts` replaces it: it records a session
-carrying every secret shape in the pattern list, then sweeps `chrome.storage.local` and IndexedDB
+carrying every secret shape in the pattern list, then sweeps all of `chrome.storage.local` and every
+object store of every IndexedDB database the extension holds — not only the session under test —
 through the service worker, and asserts the exchanges are present so the sweep cannot pass by
 finding nothing. It also carries the build guard — the worker bundle must contain no
 code-generating call site beyond zod's one probe, which `zod-config.ts` now disables.
@@ -450,8 +452,14 @@ lacks a test.
 - **The e2e suite is only as good as `e2e/README.md` claims.** Fifty-one specs were deleted with the
   daemon and the replacement was written against that file's requirements list. Read it before
   treating a green run as coverage of anything it does not name.
-- **The artifact secret sweep does not exist on the new architecture.** See the note under
-  [Secret handling](#secret-handling). C-4 is unverified until it does.
+- **Drift detection has no producer.** Nothing checks a recipe against its live target any more, so
+  nothing marks a tool degraded from a real change and nothing un-degrades one that recovered. The
+  only producer of `flags.degraded` left is `RecipeStore`'s missing-fixture check at load. A target
+  that changes upstream is discovered by a user getting a wrong answer, and the recovery is to
+  record the site again.
+- **Relay overhead has never been measured on this architecture.** The half of `e2e/metrics.mjs`
+  that measured it called douzed's `/relay/...` route and was deleted with it; the 1.2 ms figure in
+  `TASKS.md` Q4 is the daemon's. C-4 has no evidence here.
 - **HAR import and YAML export/import have no user interface.** `importHar`, `exportRecipe`,
   `exportAll` and `importFiles` are implemented and unit-tested but have no caller outside their own
   tests — no file picker, no download, no message type. They can be verified as APIs and not as
