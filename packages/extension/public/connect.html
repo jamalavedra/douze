@@ -68,11 +68,6 @@
           <button type="button" class="quiet" id="rotate">Get a new link</button>
           <button type="button" class="quiet danger" id="stop">Stop sharing</button>
         </div>
-        <section class="confirm" id="confirm" hidden>
-          <p id="confirm-copy"></p>
-          <button type="button" class="primary" id="confirm-yes"></button>
-          <button type="button" class="quiet" id="confirm-no">Cancel</button>
-        </section>
       </section>
       <section id="exposed">
         <h2 class="section-heading">Results that look like passwords</h2>
@@ -134,6 +129,16 @@
           <li>Those result bodies are live data from your dashboards, fetched from your account just now.</li>
         </ul>
       </section>
+      <!--
+        One dialog for the whole page, and outside every section that hides itself: it guards the
+        write opt-in and the link controls, which live under "ready", and the secret-gate grant,
+        which is on screen whether or not anything is connected.
+      -->
+      <dialog class="confirm" id="confirm">
+        <p id="confirm-copy"></p>
+        <button type="button" class="primary" id="confirm-yes"></button>
+        <button type="button" class="quiet" id="confirm-no">Cancel</button>
+      </dialog>
       <p id="error" role="alert"></p>
     </main>
     <script type="module" src="connect.js"></script>
