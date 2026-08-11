@@ -5,6 +5,7 @@ import { RelayClient } from './relay-client.js'
 import { ToolSurfaceBuilder } from './surface.js'
 import { register as registerDaemon } from './commands/daemon.js'
 import { register as registerBundle } from './commands/bundle.js'
+import { register as registerConnect } from './commands/connect.js'
 import { AGENTS, addToAgent, isAgent, parseMcpAdd, snippet, type Scope } from './commands/mcp-add.js'
 import { register as registerMaintenance } from './commands/maintenance.js'
 
@@ -14,7 +15,18 @@ const VERSION = '0.1.0'
  * Commands that answer without the recipe surface. `status` in particular must be able to
  * report a stopped daemon rather than starting one to ask it how it is.
  */
-const SURFACE_FREE = new Set(['start', 'stop', 'status', 'sessions', 'import', 'bundle', 'doctor', 'eject'])
+const SURFACE_FREE = new Set([
+  'start',
+  'stop',
+  'status',
+  'sessions',
+  'import',
+  'bundle',
+  'doctor',
+  'eject',
+  'connect',
+  'disconnect',
+])
 
 export function createCli(): ReturnType<typeof Cli.create> {
   const cli = Cli.create('douze', {
@@ -25,6 +37,7 @@ export function createCli(): ReturnType<typeof Cli.create> {
   })
   registerDaemon(cli as never)
   registerBundle(cli as never)
+  registerConnect(cli as never)
   // doctor and eject share the daemon client the surface uses.
   registerMaintenance(cli as never, new DaemonClient())
   return cli

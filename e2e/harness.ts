@@ -194,7 +194,12 @@ export class Douzed {
   port = 0
   token = ''
 
-  constructor() {
+  /**
+   * `remote: true` boots the daemon through `douze start` instead of douzed's own bin, because
+   * the outbound relay bridge is started by the CLI's foreground path and nowhere else. It reads
+   * `relay.json` from this home at startup, so a spec writes that file before calling start().
+   */
+  constructor(readonly options: { remote?: boolean } = {}) {
     this.home = mkdtempSync(join(tmpdir(), 'douze-home-'))
     // Specs stage recipes and fixtures before the daemon boots, so the dirs must exist first.
     for (const dir of ['recipes', 'fixtures']) mkdirSync(join(this.home, dir), { recursive: true })
@@ -209,12 +214,22 @@ export class Douzed {
   }
 
   async start(): Promise<void> {
-    this.process = spawn(TSX, [join(REPO, 'packages/douzed/src/bin.ts')], {
+    const entry = this.options.remote
+      ? [join(REPO, 'packages/cli/src/bin.ts'), 'start']
+      : [join(REPO, 'packages/douzed/src/bin.ts')]
+    this.process = spawn(TSX, entry, {
       // DOUZE_PORT=0 keeps specs off the 8787-8791 range the shipped daemon walks. Without it
       // every scratch daemon — including the detached ones a client auto-starts, which inherit
       // this env — competes for 8787 with each other and with whatever is really running on the
       // developer's machine. The harness reads the port back from the runtime file regardless.
-      env: { ...process.env, DOUZE_HOME: this.home, DOUZE_PORT: '0' },
+      // DOUZE_FOREGROUND keeps `douze start` in this process rather than detaching a child the
+      // harness could not then reap.
+      env: {
+        ...process.env,
+        DOUZE_HOME: this.home,
+        DOUZE_PORT: '0',
+        ...(this.options.remote ? { DOUZE_FOREGROUND: '1' } : {}),
+      },
       stdio: 'inherit',
     })
     await waitFor(async () => {

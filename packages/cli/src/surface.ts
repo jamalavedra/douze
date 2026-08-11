@@ -14,6 +14,8 @@ import { RAW_OPTION, toZodObject } from './schema-to-zod.js'
 export const RESERVED_GROUPS = new Set([
   'bundle',
   'completions',
+  'connect',
+  'disconnect',
   'doctor',
   'eject',
   'import',

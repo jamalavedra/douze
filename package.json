@@ -16,7 +16,7 @@
     "lint": "oxlint packages e2e fixtures",
     "test": "pnpm -r test",
     "e2e": "playwright test",
-    "verify:e2e": "playwright test e2e/verification/full-app.spec.ts e2e/relay/execution.spec.ts e2e/relay/guards.spec.ts"
+    "verify:e2e": "playwright test e2e/verification/full-app.spec.ts e2e/relay/execution.spec.ts e2e/relay/guards.spec.ts e2e/remote/connector.spec.ts"
   },
   "devDependencies": {
     "@playwright/test": "1.62.0",

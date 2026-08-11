@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { findSurvivingSecrets, redactBody, redactHeaders, redactUrl } from './redact.js'
 import { isNoiseHost, shouldCapture } from './capture.js'
 import { parseRecipe, serializeRecipe } from './recipe-file.js'
+import { HEARTBEAT_MS, RemoteDaemonMessage, RemoteRegistration, RemoteRelayMessage } from './protocol.js'
 
 describe('redaction (REQ-CAP-005)', () => {
   it('replaces credential headers but keeps type and length (AC-CAP-005.1/.3)', () => {
@@ -331,5 +332,67 @@ describe('review findings — redaction gaps', () => {
 
   it('leaves a non-form string body alone', () => {
     expect(redactBody('just some prose')).toBe('just some prose')
+  })
+})
+
+describe('remote relay frames (WO-014)', () => {
+  const daemon: RemoteDaemonMessage[] = [
+    { type: 'hello', token: 't', daemon_version: '0.1.0' },
+    { type: 'pong' },
+    { type: 'mcp.message', sid: 's1', message: { jsonrpc: '2.0', id: 1, method: 'tools/list' } },
+    { type: 'session.closed', sid: 's1' },
+  ]
+
+  const relay: RemoteRelayMessage[] = [
+    { type: 'welcome', heartbeat_ms: HEARTBEAT_MS },
+    { type: 'ping' },
+    { type: 'session.open', sid: 's1' },
+    { type: 'mcp.message', sid: 's1', message: { jsonrpc: '2.0', id: 1, result: {} } },
+    { type: 'session.close', sid: 's1' },
+  ]
+
+  for (const frame of daemon) {
+    it(`parses a daemon ${frame.type} frame`, () => {
+      expect(RemoteDaemonMessage.parse(frame)).toEqual(frame)
+    })
+  }
+
+  for (const frame of relay) {
+    it(`parses a relay ${frame.type} frame`, () => {
+      expect(RemoteRelayMessage.parse(frame)).toEqual(frame)
+    })
+  }
+
+  it('accepts a build-metadata version and still refuses one carrying a newline', () => {
+    expect(RemoteRegistration.safeParse({ daemon_version: '0.1.0+abc' }).success).toBe(true)
+    // The log line the relay writes is one line per event, and this is what keeps it that way.
+    expect(RemoteRegistration.safeParse({ daemon_version: '0.1.0\nendpoint.registered ep=x' }).success).toBe(false)
+    expect(RemoteRegistration.safeParse({ daemon_version: '0.1.0\n' }).success).toBe(false)
+    expect(RemoteRegistration.safeParse({ daemon_version: '+'.repeat(33) }).success).toBe(false)
+  })
+
+  it('rejects a frame from the wrong direction', () => {
+    expect(RemoteDaemonMessage.safeParse({ type: 'session.open', sid: 's1' }).success).toBe(false)
+    expect(RemoteRelayMessage.safeParse({ type: 'hello', token: 't', daemon_version: '0.1.0' }).success).toBe(false)
+  })
+
+  it('rejects a routable frame with no sid', () => {
+    expect(RemoteDaemonMessage.safeParse({ type: 'mcp.message', message: {} }).success).toBe(false)
+    expect(RemoteRelayMessage.safeParse({ type: 'session.close' }).success).toBe(false)
+  })
+
+  /** The relay routes on `sid` alone, so whatever the MCP session put in `message` must survive. */
+  it('passes any JSON payload through unchanged', () => {
+    const payloads: unknown[] = [
+      null,
+      42,
+      'a string',
+      [1, { nested: true }],
+      { jsonrpc: '2.0', id: 'x', error: { code: -32_601, data: { deep: [{ a: null }] } } },
+    ]
+    for (const message of payloads) {
+      const parsed = RemoteRelayMessage.parse({ type: 'mcp.message', sid: 's1', message })
+      expect(parsed).toEqual({ type: 'mcp.message', sid: 's1', message })
+    }
   })
 })
