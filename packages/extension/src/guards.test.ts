@@ -47,9 +47,36 @@ const tool = (
   ...extra,
 })
 
-const READ = tool('list', 'read')
-const WRITE = tool('create', 'write')
-const DESTRUCTIVE = tool('delete', 'destructive')
+const READ = tool(
+  'list',
+  'read',
+  {},
+  {
+    input_schema: {
+      type: 'object',
+      properties: { customer_email: { type: 'string' }, limit: { type: 'integer' } },
+    },
+  },
+)
+const WRITE = tool(
+  'create',
+  'write',
+  {},
+  { method: 'POST', input_schema: { type: 'object', properties: { title: { type: 'string' } } } },
+)
+const DESTRUCTIVE = tool(
+  'delete',
+  'destructive',
+  {},
+  {
+    method: 'DELETE',
+    input_schema: {
+      type: 'object',
+      properties: { id: { type: 'string' }, confirm: { type: 'boolean' } },
+      required: ['id', 'confirm'],
+    },
+  },
+)
 const SURFACE = [READ, WRITE, DESTRUCTIVE]
 
 const names = (tools: { name: string }[]): string[] => tools.map((entry) => entry.name)
@@ -102,13 +129,72 @@ describe('call-time enforcement regardless of what was pushed (T-015.9)', () => 
   })
 
   it('requires confirm for a destructive tool locally, and runs it with one', () => {
-    expect(refusal(() => checkPolicy(DESTRUCTIVE, {}, 'local', true)).code).toBe('confirm_required')
-    expect(() => checkPolicy(DESTRUCTIVE, { confirm: true }, 'local', true)).not.toThrow()
+    expect(refusal(() => checkPolicy(DESTRUCTIVE, { id: '7' }, 'local', true)).code).toBe('confirm_required')
+    expect(() => checkPolicy(DESTRUCTIVE, { id: '7', confirm: true }, 'local', true)).not.toThrow()
   })
 
   it('lets a read through at either trust level', () => {
     expect(() => checkPolicy(READ, {}, 'remote', false)).not.toThrow()
     expect(() => checkPolicy(READ, {}, 'local', false)).not.toThrow()
+  })
+
+  it('refuses a parameter the recipe never recorded, rather than passing it on', () => {
+    // Nothing here breaks the trust table; what it does is widen a recorded read into an
+    // arbitrary parameterised call against the target, which `buildRequest` would happily issue.
+    const error = refusal(() => checkPolicy(READ, { limit: 20, role: 'admin' }, 'remote', false))
+    expect(error.code).toBe('invalid_arguments')
+    expect(error.message).toContain('"role" is not a parameter of this tool')
+    expect(error.message).toContain('jira.test')
+  })
+
+  it('refuses an argument of the wrong type, and a required one that is missing', () => {
+    expect(refusal(() => checkPolicy(READ, { limit: '20' }, 'local', true)).message).toContain('limit must be integer')
+    expect(refusal(() => checkPolicy(DESTRUCTIVE, { confirm: true }, 'local', true)).message).toContain(
+      '"id" is required',
+    )
+  })
+
+  it('checks nested objects, which is where a GraphQL tool takes its variables', () => {
+    const graphql = tool(
+      'search',
+      'read',
+      {},
+      {
+        input_schema: {
+          type: 'object',
+          properties: { filter: { type: 'object', properties: { state: { type: 'string' } } } },
+        },
+      },
+    )
+    expect(() => checkPolicy(graphql, { filter: { state: 'open' } }, 'remote', false)).not.toThrow()
+    expect(refusal(() => checkPolicy(graphql, { filter: { admin: true } }, 'remote', false)).message).toContain(
+      '"filter.admin" is not a parameter',
+    )
+  })
+
+  it('lets the runtime arguments through whatever the schema says, and leaves a loose schema loose', () => {
+    expect(() => checkPolicy(READ, { raw: true, confirm: true }, 'local', true)).not.toThrow()
+    // Inference emits `{}` for a shape it could not pin down; a constraint invented here would
+    // refuse calls the recording proves are fine.
+    const loose = tool('search', 'read', {}, { input_schema: {} })
+    expect(() => checkPolicy(loose, { anything: 1 }, 'remote', false)).not.toThrow()
+  })
+
+  it('exempts a page-filled parameter from the required check, because the caller cannot send it', () => {
+    const entry = tool(
+      'get',
+      'read',
+      {
+        credential_source: [
+          { kind: 'page_state', expression: 'localStorage.getItem("k")', param: 'project', prefix: '' },
+        ],
+      },
+      {
+        path: '/p/{project}/issues',
+        input_schema: { type: 'object', properties: { project: { type: 'string' } }, required: ['project'] },
+      },
+    )
+    expect(() => checkPolicy(entry, {}, 'remote', false)).not.toThrow()
   })
 
   it('refuses a degraded tool by name before any policy question (AC-RUN-001.5)', () => {
@@ -343,7 +429,9 @@ describe('one inbound tool.call, end to end (T-015.9)', () => {
   it('refuses a result carrying a JWT, then passes once the tool is exempted', async () => {
     const leaking = deps(async () => ok({ data: { session: JWT } }))
     const refused = await runToolCall({ name: 'jira_list', args: {}, trust: 'remote' }, leaking)
-    expect(refused.error?.message).toContain('$.content[0].text')
+    // The path names the field inside the payload, because the gate now reads the payload rather
+    // than the serialised envelope it used to be handed.
+    expect(refused.error?.message).toContain('$.session')
     expect(JSON.stringify(refused)).not.toContain(JWT)
 
     const exempted = await runToolCall(
@@ -352,6 +440,45 @@ describe('one inbound tool.call, end to end (T-015.9)', () => {
     )
     expect(exempted.error).toBeUndefined()
     expect(JSON.stringify(exempted)).toContain(JWT)
+  })
+
+  it('returns a big clean result truncated, rather than withholding it', async () => {
+    // 4000 rows of nothing secret. Gated after the cap, this came back `result_withheld` naming
+    // `$.content[0].text`: the cut JSON no longer parsed, so the detector fell through to its
+    // entropy rule and 32 KB of space-free JSON scores far above the threshold. The only escape
+    // the message offered — exempting the tool — would have disabled the gate for it entirely.
+    const rows = Array.from({ length: 4000 }, (_, index) => ({ id: index, name: `order-${index}` }))
+    const outcome = await runToolCall({ name: 'jira_list', args: {}, trust: 'remote' }, deps(async () => ok({ data: rows })))
+
+    expect(outcome.error).toBeUndefined()
+    const payload = textOf(outcome)
+    expect((payload['truncated'] as { returned_bytes: number }).returned_bytes).toBeLessThanOrEqual(MAX_RESULT_BYTES)
+    expect(String(payload['data'])).toContain('order-0')
+  })
+
+  it('still withholds a big result once a credential is anywhere in it', async () => {
+    const rows = Array.from({ length: 4000 }, (_, index) => ({ id: index, name: `order-${index}` }))
+    const outcome = await runToolCall(
+      { name: 'jira_list', args: {}, trust: 'remote' },
+      deps(async () => ok({ data: { rows, session: JWT } })),
+    )
+    expect(outcome.error?.code).toBe('result_withheld')
+    expect(outcome.error?.message).toContain('$.session')
+    expect(JSON.stringify(outcome)).not.toContain(JWT)
+  })
+
+  it('refuses an argument the tool never had before it reaches the network', async () => {
+    let called = false
+    const outcome = await runToolCall(
+      { name: 'jira_list', args: { role: 'admin' }, trust: 'remote' },
+      deps(async () => {
+        called = true
+        return ok({ data: [] })
+      }),
+    )
+    expect(called).toBe(false)
+    expect(outcome.error?.code).toBe('invalid_arguments')
+    expect(outcome.error?.retryable).toBe(false)
   })
 
   it('names a timeout rather than leaving the host to notice one', async () => {

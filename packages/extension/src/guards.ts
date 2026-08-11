@@ -57,7 +57,7 @@ export const AUDIT_LIMIT = 100
  */
 export class Refusal extends Error {
   constructor(
-    readonly code: 'trust_refused' | 'result_withheld' | 'unknown_tool',
+    readonly code: 'trust_refused' | 'result_withheld' | 'unknown_tool' | 'invalid_arguments',
     message: string,
   ) {
     super(message)
@@ -171,6 +171,98 @@ export function checkPolicy(
       { tool: name },
     )
   }
+  validateArgs(entry, args)
+}
+
+// --- argument validation ---------------------------------------------------
+
+/**
+ * Arguments the runtime owns rather than the recipe: `buildRequest` strips both before it builds
+ * anything, so neither is ever a parameter of the target's endpoint and no recipe has to declare
+ * them. `confirm` is checked by `checkPolicy`; `raw` is read by `runToolCall`.
+ */
+const RUNTIME_ARGS = new Set(['confirm', 'raw'])
+
+/**
+ * T-015.13 — every argument is checked against the recipe's own `request.input_schema` before a
+ * request is built from it.
+ *
+ * The CLI used to do this by converting the schema to Zod at load time; the converter went with
+ * the CLI and nothing replaced it, which left `buildRequest` putting whatever a host sent into the
+ * query string or the JSON body. That does not break the trust table, but it widens every recorded
+ * read into an arbitrary parameterised call: a parameter the app never sent (`role=admin`), a
+ * `limit` of a million, a GraphQL `variables` object of the caller's choosing.
+ *
+ * Strict on purpose: an undeclared parameter is REFUSED rather than dropped, because a caller that
+ * believes it filtered the results and silently did not is worse off than one that was told no.
+ * The subset understood here is the subset inference emits (`type`, `properties`, `required`,
+ * `items`, and a closed `enum`); a schema that constrains nothing constrains nothing.
+ */
+export function validateArgs(entry: SurfaceTool, args: Record<string, unknown>): void {
+  const schema = entry.tool.request.input_schema as Record<string, unknown>
+  const faults = check(args, schema, '', pageFilledParams(entry))
+  if (faults.length === 0) return
+  throw new Refusal(
+    'invalid_arguments',
+    `"${entry.qualified_name}" was not called the way ${siteOf(entry.base_url)} was recorded using it: ` +
+      `${faults.join('; ')}. Douze did not run it.`,
+  )
+}
+
+/**
+ * Parameters the extension fills from page state, never the caller — `buildRequest` leaves their
+ * placeholders in the URL for the executor. A recipe declares them as required path parameters, so
+ * they are exempt from the required check or every call to such a tool would be refused.
+ */
+const pageFilledParams = (entry: SurfaceTool): Set<string> =>
+  new Set(
+    entry.credential_source.flatMap((source) =>
+      source.kind === 'page_state' && source.param ? [source.param] : [],
+    ),
+  )
+
+function check(value: unknown, schema: Record<string, unknown>, path: string, exempt: ReadonlySet<string>): string[] {
+  const type = schema['type']
+  if (typeof type === 'string' && !isType(value, type)) return [`${path || 'the arguments'} must be ${type}`]
+  const allowed = schema['enum']
+  if (Array.isArray(allowed) && !allowed.includes(value)) {
+    return [`${path} must be one of ${allowed.map((option) => JSON.stringify(option)).join(', ')}`]
+  }
+  const items = schema['items']
+  if (Array.isArray(value) && isRecord(items)) {
+    return value.flatMap((item, index) => check(item, items, `${path}[${index}]`, EMPTY))
+  }
+  const properties = schema['properties']
+  // No declared properties is no constraint: inference emits `{}` for a shape it could not pin
+  // down, and inventing a constraint there would refuse calls the recording proves are fine.
+  if (!isRecord(value) || !isRecord(properties)) return []
+  const faults: string[] = []
+  for (const [key, child] of Object.entries(value)) {
+    if (path === '' && RUNTIME_ARGS.has(key)) continue
+    const sub = properties[key]
+    if (isRecord(sub)) faults.push(...check(child, sub, join(path, key), EMPTY))
+    else faults.push(`"${join(path, key)}" is not a parameter of this tool`)
+  }
+  for (const key of (schema['required'] as string[] | undefined) ?? []) {
+    if (!(key in value) && !exempt.has(key) && !RUNTIME_ARGS.has(key)) faults.push(`"${join(path, key)}" is required`)
+  }
+  return faults
+}
+
+const EMPTY: ReadonlySet<string> = new Set()
+
+const join = (path: string, key: string): string => (path === '' ? key : `${path}.${key}`)
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value)
+
+function isType(value: unknown, type: string): boolean {
+  if (type === 'integer') return typeof value === 'number' && Number.isInteger(value)
+  if (type === 'number') return typeof value === 'number'
+  if (type === 'array') return Array.isArray(value)
+  if (type === 'object') return isRecord(value)
+  if (type === 'null') return value === null
+  return typeof value === type
 }
 
 /** AC-EXE-002.1 — 401, 403, or a login redirect all mean the same thing to the user. */
@@ -242,26 +334,38 @@ export interface Shaped {
   note?: string
 }
 
+/** The payload the recipe's path selected, still structured and not yet capped. */
+export interface Selected {
+  data: unknown
+  note?: string
+}
+
 /**
- * REQ-RUN-004 — trimmed to the recipe's Primary Payload Path and capped, so a chat context is not
- * spent on response envelopes. Ported from the CLI's shape.ts with `Buffer` replaced by
- * `TextEncoder`: there is no Buffer in a service worker.
+ * REQ-RUN-004 — trimmed to the recipe's Primary Payload Path, and nothing else.
+ *
+ * Split from the cap because the secret gate has to run BETWEEN the two: it walks a JSON document,
+ * and a truncated one is a string that no longer parses.
  */
-export function shapeResult(
+export function selectPayload(
   body: unknown,
   options: { primary_payload_path?: string | undefined; raw?: boolean | undefined } = {},
-): Shaped {
+): Selected {
   const path = options.primary_payload_path
-  let data = body
-  let note: string | undefined
-
-  if (!options.raw && path) {
-    const picked = selectPath(body, path)
-    // Returning the envelope beats returning nothing: a stale path must not eat the response.
-    if (picked === MISSING) note = `primary_payload_path "${path}" did not resolve; returning the full body.`
-    else data = picked
+  if (options.raw || !path) return { data: body }
+  const picked = selectPath(body, path)
+  // Returning the envelope beats returning nothing: a stale path must not eat the response.
+  if (picked === MISSING) {
+    return { data: body, note: `primary_payload_path "${path}" did not resolve; returning the full body.` }
   }
+  return { data: picked }
+}
 
+/**
+ * AC-RUN-004.2 — capped, so a chat context is not spent on one response. Ported from the CLI's
+ * shape.ts with `Buffer` replaced by `TextEncoder`: there is no Buffer in a service worker.
+ */
+export function capResult(selected: Selected): Shaped {
+  const { data, note } = selected
   const text = json(data)
   const encoded = byteLength(text)
   if (encoded <= MAX_RESULT_BYTES) return note === undefined ? { data } : { data, note }
@@ -277,6 +381,12 @@ export function shapeResult(
     ...(note === undefined ? {} : { note }),
   }
 }
+
+/** Both halves, for a caller that has nothing to do between them. */
+export const shapeResult = (
+  body: unknown,
+  options: { primary_payload_path?: string | undefined; raw?: boolean | undefined } = {},
+): Shaped => capResult(selectPayload(body, options))
 
 /** Distinguishes "the path selected `undefined`" from "the path does not exist". */
 export const MISSING = Symbol('missing')
@@ -333,6 +443,9 @@ export function cutToBytes(value: string, limit: number): string {
  * legitimately look like credentials") and both pipes need it; split by trust, because exempting a
  * tool so the MCP client on your own machine can read a token must not also start sending that
  * token to a relay operator.
+ *
+ * Give it the payload as data, never a serialised or truncated copy of it: the detector reads a
+ * JSON *document*, and a string it cannot parse is judged by entropy alone.
  */
 export function gateResult(tool: string, result: unknown, exposed: readonly string[]): void {
   if (exposed.includes(tool)) return
@@ -399,11 +512,7 @@ export function buildRequest(
   // Parameters the PAGE fills, not the caller: the extension substitutes them after reading the
   // value out of page state. Left in the URL untouched here — resolving them to nothing produced
   // `/v1/project/apikey//origins`, which is a 404 wearing a different hat.
-  const pageFilled = new Set(
-    entry.credential_source.flatMap((source) =>
-      source.kind === 'page_state' && source.param ? [source.param] : [],
-    ),
-  )
+  const pageFilled = pageFilledParams(entry)
 
   const resolvedPath = path.replace(/\{(\w+)\}/g, (whole, name: string) => {
     if (pageFilled.has(name)) return whole
@@ -481,6 +590,14 @@ export async function runToolCall(
 
   try {
     const entry = deps.surface().find((candidate) => candidate.qualified_name === call.name)
+    // `unknown_tool` and `trust_refused` read differently on purpose, and that does let a host
+    // probe names it was never pushed — a guessed `shop_delete_order` comes back "never for a
+    // hosted assistant" while `shop_nope` comes back "no such tool". Kept: the qualified name is
+    // `recipe_tool`, and every recipe with one read tool is already on the surface that host was
+    // handed, so what leaks is which sibling names exist inside recipes it can already list.
+    // Collapsing the two would cost the user the only two messages that say what to do next —
+    // "allow changes for this assistant" and "run it from an app on this computer" — which is a
+    // bad trade for a party that must guess `recipe_tool` exactly to learn a name.
     if (!entry) throw new Refusal('unknown_tool', `Douze has no tool called "${call.name}".`)
     // Both halves of the trust table, deliberately: the surface was already filtered at push time,
     // and this runs anyway, because a host that lies about what it sent must not get through.
@@ -500,10 +617,17 @@ export async function runToolCall(
       })
     }
 
-    const shaped = shapeResult(response.body, {
+    const selected = selectPayload(response.body, {
       primary_payload_path: entry.tool.response.primary_payload_path,
       raw: call.args['raw'] === true,
     })
+    // Gated on the STRUCTURED payload, before the cap and before the envelope. Gating the finished
+    // envelope withheld every large result: the cap hands back JSON cut mid-structure, which no
+    // longer parses, so the detector fell through to its entropy rule — and 32 KB of space-free
+    // JSON scores far above the threshold. Truncation existed to make a big result usable; gating
+    // after it made a big result impossible.
+    gateResult(call.name, selected.data, deps.exposed)
+    const shaped = capResult(selected)
     const result = {
       content: [
         {
@@ -512,7 +636,6 @@ export async function runToolCall(
         },
       ],
     }
-    gateResult(call.name, result, deps.exposed)
     done('ok', Date.now() - started, response.status ?? 0)
     return { result }
   } catch (error) {

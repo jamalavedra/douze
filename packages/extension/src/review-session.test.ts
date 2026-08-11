@@ -253,14 +253,31 @@ describe('a capture carrying a credential cannot become a recipe (TR-6)', () => 
     expect(storedFixtures()).toEqual([])
   })
 
-  it('fails on the fixture gate when the token is in the traffic instead', async () => {
+  it('redacts a token out of the URL on its way into a fixture rather than writing it out', async () => {
     const review = await openReview([
       exchange(0, { url: `https://app.test/api/orders?share=${JWT}` }),
       exchange(1, { url: `https://app.test/api/orders?share=${JWT}x` }),
     ])
     review.approveReads()
 
-    await expect(review.save()).rejects.toThrow(/credential-shaped value at/)
+    // `toFixture` copied `exchange.url` verbatim while re-redacting the headers and bodies beside
+    // it, so the token reached a file `exportRecipe` writes out.
+    await expect(review.save()).resolves.toMatchObject({ recipe: 'shop-orders' })
+    expect(storedFixtures().length).toBeGreaterThan(0)
+    expect(JSON.stringify([...items.entries()])).not.toContain(JWT)
+  })
+
+  it('refuses when the token is the query parameter NAME, which reaches the schema itself', async () => {
+    const review = await openReview([
+      exchange(0, { url: `https://app.test/api/orders?${JWT}=1&page=2` }),
+      exchange(1, { url: `https://app.test/api/orders?${JWT}=1&page=3` }),
+    ])
+    review.approveReads()
+
+    // A parameter name becomes an `input_schema` property, so this one is caught by the recipe
+    // gate before any fixture is written — and the gate sees it only because `findSurvivingSecrets`
+    // walks keys as well as values.
+    await expect(review.save()).rejects.toThrow(/credential at/)
     expect(storedNames()).toEqual([])
     expect(storedFixtures()).toEqual([])
   })

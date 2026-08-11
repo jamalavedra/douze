@@ -319,6 +319,33 @@ describe('secrets in key position (REQ-CAP-005, TR-6)', () => {
     expect(findSurvivingSecrets(redacted)).toEqual([])
   })
 
+  /**
+   * The same shape in the one slot it was missed. A URL carrying a SET rather than a mapping puts
+   * the token in key position — `?<jwt>=1` — and the query loop tested only the value, so the URL
+   * came back byte-identical and the gate, which walked `searchParams.values()`, saw nothing.
+   */
+  it('flags and redacts a credential-shaped query parameter name', () => {
+    const url = `https://app.example.com/api/thing?${jwt}=1&page=2`
+    expect(findSurvivingSecrets(url)).toEqual(['$'])
+
+    const redacted = redactUrl(url)
+    expect(redacted).not.toContain(jwt)
+    expect(redacted).toContain('page=2')
+    expect(decodeURIComponent(redacted)).toContain(`«redacted:string:${jwt.length}»=1`)
+    expect(findSurvivingSecrets(redacted)).toEqual([])
+    expect(redactUrl(redacted)).toBe(redacted)
+  })
+
+  it('flags and redacts a credential-shaped fragment parameter name', () => {
+    const url = `https://app.example.com/cb#${jwt}=1&state=x`
+    expect(findSurvivingSecrets(url)).toEqual(['$'])
+
+    const redacted = redactUrl(url)
+    expect(decodeURIComponent(redacted)).not.toContain(jwt)
+    expect(findSurvivingSecrets(redacted)).toEqual([])
+    expect(redactUrl(redacted)).toBe(redacted)
+  })
+
   it('leaves ordinary keys alone', () => {
     const body = { order_id: 10_482, customer_name: 'Ada' }
     expect(redactBody(body)).toEqual(body)

@@ -1,4 +1,4 @@
-import { findSurvivingSecrets, redactBody, redactHeaders, type Exchange } from '@douze/shared'
+import { findSurvivingSecrets, redactBody, redactHeaders, redactUrl, type Exchange } from '@douze/shared'
 
 /** REQ-REC-004 — a real, redacted exchange stored beside the recipe for load checks and drift. */
 export interface Fixture {
@@ -14,7 +14,11 @@ export function toFixture(tool: string, exchange: Exchange): Fixture {
     recorded_at: new Date(exchange.started_at).toISOString(),
     request: {
       method: exchange.method,
-      url: exchange.url,
+      // Re-redacted like the headers and the bodies beside it, and for the same reason: the store
+      // ran redaction on the way in, and a fixture is written out to disk by `exportRecipe`. An
+      // exchange that reached here from anywhere else — a HAR import, an older store — carries
+      // whatever its URL carried.
+      url: redactUrl(exchange.url),
       headers: redactHeaders(exchange.request_headers),
       ...(exchange.request_body !== undefined ? { body: redactBody(exchange.request_body) } : {}),
     },
