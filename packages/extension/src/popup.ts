@@ -33,6 +33,7 @@ const el = {
   finishedAction: $<HTMLButtonElement>('finished-action'),
   error: $<HTMLParagraphElement>('error'),
   connect: $<HTMLButtonElement>('connect'),
+  stored: $<HTMLButtonElement>('stored'),
   useDebugger: $<HTMLInputElement>('use-debugger'),
   noise: $<HTMLTextAreaElement>('noise'),
   saveNoise: $<HTMLButtonElement>('save-noise'),
@@ -193,6 +194,11 @@ el.watch.addEventListener('click', async () => {
 // there is nothing that has to be up first.
 el.connect.addEventListener('click', () => {
   void chrome.runtime.sendMessage({ type: 'douze:connect' })
+})
+
+/** The same arrangement for the same reason: the worker opens the tab, this popup closes. */
+el.stored.addEventListener('click', () => {
+  void chrome.runtime.sendMessage({ type: 'douze:data' })
 })
 
 el.done.addEventListener('click', async () => {

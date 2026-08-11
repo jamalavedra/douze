@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>What Douze has stored</title>
+    <!--
+      The third full page, and a third one on purpose: review.html is one capture (`?session=`)
+      and connect.html is one link, while deleting a recording, importing a .har and exporting
+      skills are all about the whole set — a list neither of the other two has anywhere to put.
+      Everything here reaches a store method the deleted CLI used to be the only caller of.
+    -->
+    <link rel="stylesheet" href="page.css" />
+  </head>
+  <body>
+    <main>
+      <header class="hero">
+        <div class="brand">
+          <img class="brand-icon" src="icon128.png" alt="" />
+          <p class="eyebrow">Douze</p>
+        </div>
+        <div aria-live="polite">
+          <h1>What Douze has stored</h1>
+          <p class="sub">
+            Recordings stay in this browser until you delete them. They contain the pages you were
+            signed into, so they are worth going through.
+          </p>
+        </div>
+      </header>
+
+      <section id="recordings">
+        <h2 class="section-heading">Recordings</h2>
+        <p class="sub" id="recordings-empty" hidden>
+          Nothing recorded yet. Click the Douze button on a site to start.
+        </p>
+        <ul class="steps" id="sessions"></ul>
+      </section>
+
+      <section id="import-har">
+        <h2 class="section-heading">Import a recording from a file</h2>
+        <p class="sub">
+          A .har file saved from Chrome's own Network panel becomes a recording here. Anything in
+          it that still carries a password or a token is refused rather than stored, and every
+          refusal is listed below by address.
+        </p>
+        <label class="field-label" for="har-name">Call this recording</label>
+        <input class="field" id="har-name" type="text" autocomplete="off" placeholder="Orders dashboard" />
+        <label class="field-label" for="har-file">The .har file</label>
+        <input class="field" id="har-file" type="file" accept=".har,.json,application/json" />
+        <div class="actions">
+          <p>Nothing is uploaded. The file is read in this browser.</p>
+          <button type="button" class="primary" id="har-import">Import</button>
+        </div>
+        <section class="notice" id="har-report" hidden aria-live="polite">
+          <p id="har-summary"></p>
+          <p class="sub" id="har-refused-copy" hidden>
+            These were not stored, because they still carried something that looks like a
+            credential:
+          </p>
+          <ul class="steps" id="har-refused"></ul>
+          <button type="button" class="quiet" id="har-review" hidden>Set up what this recording can do</button>
+        </section>
+      </section>
+
+      <section id="skills">
+        <h2 class="section-heading">Skills</h2>
+        <p class="sub" id="recipes-empty" hidden>No skills yet. Record a site, then choose what to keep.</p>
+        <ul class="steps" id="recipes"></ul>
+        <div class="actions">
+          <p>One file with every skill and its example answers in it.</p>
+          <button type="button" class="quiet" id="export">Save to a file</button>
+        </div>
+        <label class="field-label" for="skills-file">Add skills from a file</label>
+        <input class="field" id="skills-file" type="file" multiple accept=".json,.yaml,.yml" />
+        <div class="actions">
+          <p>A file saved above, or recipe .yaml files on their own.</p>
+          <button type="button" class="quiet" id="import">Add them</button>
+        </div>
+        <section class="confirm" id="conflict" hidden>
+          <p id="conflict-copy"></p>
+          <button type="button" class="primary" id="conflict-yes">Replace them</button>
+          <button type="button" class="quiet" id="conflict-no">Cancel</button>
+        </section>
+        <p class="sub" id="import-report" role="status" hidden></p>
+      </section>
+
+      <p id="error" role="alert"></p>
+    </main>
+    <script type="module" src="data.js"></script>
+  </body>
+</html>

@@ -27,8 +27,23 @@ import type { SurfaceTool } from './recipes.js'
 export const MAX_RESULT_BYTES = 32 * 1024
 
 /**
- * Our own ceiling on one call, deliberately under the host's 120 s (packages/mcp-host/src/host.ts)
- * so a slow target is reported as `timeout` by name rather than as the host's generic one.
+ * Our own ceiling on one call.
+ *
+ * **What constrains it is the host, not the worker.** The MV3 service worker is not the limit:
+ * `@douze/mcp-host` sends a `ping` every 20 s for as long as a call is outstanding, and every
+ * inbound frame resets Chrome's 30 s idle timer, so the worker stays alive as long as the host is
+ * waiting. The limit is `CALL_TIMEOUT_MS` in packages/mcp-host/src/host.ts (120 s): past that the
+ * host has already answered the client `timeout` and thrown our `tool.result` away.
+ *
+ * So this sits just under it. A dashboard export that genuinely takes 2–4 minutes cannot be
+ * reported through this host at any value set here — raising ours only swaps our named `timeout`,
+ * which says which tool and how long, for the host's generic one. Making such a call possible is a
+ * change to the host's ceiling first (another package), and this constant follows it, not the
+ * other way round. `guards.test.ts` reads that constant out of the host's source and fails if the
+ * two ever cross.
+ *
+ * The old CLI's 300 s (`DOUZE_CALL_CEILING_MS`) was configurable because the CLI *was* the client
+ * and owned both ends of the wait; nothing in the extension owns the far end any more.
  */
 export const DEFAULT_TIMEOUT_MS = 110_000
 
@@ -57,7 +72,13 @@ export const AUDIT_LIMIT = 100
  */
 export class Refusal extends Error {
   constructor(
-    readonly code: 'trust_refused' | 'result_withheld' | 'unknown_tool' | 'invalid_arguments',
+    readonly code:
+      | 'trust_refused'
+      | 'result_withheld'
+      | 'unknown_tool'
+      | 'invalid_arguments'
+      | 'permission_required'
+      | 'executor_unavailable',
     message: string,
   ) {
     super(message)
@@ -611,11 +632,7 @@ export async function runToolCall(
       ),
     )
     classify(entry, response)
-    if (!response.ok && response.error !== undefined) {
-      throw new DouzeError('extension_disconnected', `"${call.name}" could not run: ${response.error}`, {
-        tool: call.name,
-      })
-    }
+    if (!response.ok && response.error !== undefined) throw executionFailure(call.name, response.error)
 
     const selected = selectPayload(response.body, {
       primary_payload_path: entry.tool.response.primary_payload_path,
@@ -643,6 +660,34 @@ export async function runToolCall(
     done(failure.code, Date.now() - started)
     return { error: failure }
   }
+}
+
+/**
+ * The two `executeRelay` failures that will still be true on the next attempt, matched on the
+ * sentences relay.ts writes (`relay.test.ts` pins both against these patterns, so a reworded
+ * refusal fails there rather than silently becoming retryable here).
+ *
+ * A missing host permission needs a click in Chrome and an agent cannot produce one; an executor
+ * tab that could not be opened on the target origin is the same kind of fact. Reporting either as
+ * `extension_disconnected`/`retryable: true` — which is what every `response.error` used to become
+ * — tells the agent to try again, and it will, for as long as it is allowed to.
+ */
+export const PERMISSION_MISSING = /has no permission for/
+export const EXECUTOR_MISSING = /executor tab/
+
+const executionFailure = (tool: string, error: string): Error => {
+  // The relay's own sentence already names the fix — allow the permission, or open the site —
+  // so it is carried through verbatim rather than replaced with a shorter one that does not.
+  if (PERMISSION_MISSING.test(error)) return new Refusal('permission_required', `"${tool}" did not run. ${error}`)
+  if (EXECUTOR_MISSING.test(error)) {
+    return new Refusal(
+      'executor_unavailable',
+      `"${tool}" did not run: ${error}. Open that site in a Chrome tab, then ask again.`,
+    )
+  }
+  // Everything else — the page's own fetch failing, an injection Chrome refused — may well work on
+  // the next attempt, and keeps the code and the retry it always had.
+  return new DouzeError('extension_disconnected', `"${tool}" could not run: ${error}`, { tool })
 }
 
 /** Codes a caller can usefully retry; everything else is a decision that will not change. */

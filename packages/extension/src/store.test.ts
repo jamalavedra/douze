@@ -1,168 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { type Exchange, findSurvivingSecrets } from '@douze/shared'
 import { CaptureStore } from './store.js'
+import { installFakeIndexedDB, uninstallFakeIndexedDB, upgradeCount } from './testing.js'
 
 /**
- * The extension's vitest runs on plain Node with no jsdom, so browser globals are installed on
- * `globalThis` for the duration of a test — the same thing `relay.test.ts` does for `chrome.*`.
- * No IndexedDB implementation is available in this workspace and none is worth adding for one
- * module, so what follows is an in-memory fake covering exactly the surface `store.ts` uses:
- * object stores keyed by `id`, compound indexes, bound key ranges, `getAll`/`getAllKeys`, a
- * backwards key cursor, and a versioned open with `oldVersion`.
- *
- * It therefore exercises THIS module's logic — index choice, ranges, ordering, the write gate —
- * and proves nothing about a real browser's IndexedDB: transaction lifetimes, auto-commit,
- * structured-clone limits and quota behaviour are out of its reach.
+ * The IndexedDB these run against is `testing.ts`'s in-memory fake — see that file for exactly
+ * what it covers and what it therefore proves nothing about.
  */
-
-type Rec = Record<string, unknown>
-type Key = string | number | Array<string | number>
-
-/** IndexedDB key ordering, cut down to what this module stores: number < string < array. */
-const rank = (value: Key): number => (Array.isArray(value) ? 3 : typeof value === 'string' ? 2 : 1)
-
-function compare(a: Key, b: Key): number {
-  if (rank(a) !== rank(b)) return rank(a) - rank(b)
-  if (Array.isArray(a) && Array.isArray(b)) {
-    for (let i = 0; i < Math.min(a.length, b.length); i += 1) {
-      const part = compare(a[i] as Key, b[i] as Key)
-      if (part !== 0) return part
-    }
-    return a.length - b.length
-  }
-  return (a as number) < (b as number) ? -1 : (a as number) > (b as number) ? 1 : 0
-}
-
-class FakeKeyRange {
-  constructor(
-    readonly lower: Key,
-    readonly upper: Key,
-  ) {}
-
-  static bound(lower: Key, upper: Key): FakeKeyRange {
-    return new FakeKeyRange(lower, upper)
-  }
-
-  includes(key: Key): boolean {
-    return compare(key, this.lower) >= 0 && compare(key, this.upper) <= 0
-  }
-}
-
-interface FakeStoreData {
-  keyPath: string
-  records: Map<string, Rec>
-  indexes: Map<string, string[]>
-}
-
-interface FakeDbData {
-  version: number
-  stores: Map<string, FakeStoreData>
-}
-
-interface FakeRequest<T> {
-  result: T
-  error: null
-  onsuccess: (() => void) | null
-  onerror: (() => void) | null
-  onupgradeneeded?: ((event: { oldVersion: number }) => void) | null
-}
-
-const databases = new Map<string, FakeDbData>()
-let upgrades = 0
-
-function respond<T>(result: T): FakeRequest<T> {
-  const request: FakeRequest<T> = { result, error: null, onsuccess: null, onerror: null }
-  queueMicrotask(() => request.onsuccess?.())
-  return request
-}
-
-function entriesOf(data: FakeStoreData, keyPath: string[], range: FakeKeyRange) {
-  const entries: Array<{ key: Key; primary: string; value: Rec }> = []
-  for (const [primary, value] of data.records) {
-    const key = keyPath.map((part) => value[part] as string | number)
-    if (range.includes(key)) entries.push({ key, primary, value })
-  }
-  return entries.sort((a, b) => compare(a.key, b.key) || compare(a.primary, b.primary))
-}
-
-function indexFacade(data: FakeStoreData, keyPath: string[]) {
-  return {
-    getAll: (range: FakeKeyRange) => respond(entriesOf(data, keyPath, range).map((entry) => entry.value)),
-    getAllKeys: (range: FakeKeyRange) => respond(entriesOf(data, keyPath, range).map((entry) => entry.primary)),
-    openKeyCursor: (range: FakeKeyRange, direction: string) => {
-      const entries = entriesOf(data, keyPath, range)
-      const chosen = direction === 'prev' ? entries.at(-1) : entries[0]
-      return respond(chosen ? { key: chosen.key, primaryKey: chosen.primary } : null)
-    },
-  }
-}
-
-function storeFacade(data: FakeStoreData) {
-  return {
-    put: (value: Rec) => {
-      data.records.set(String(value[data.keyPath]), structuredClone(value))
-      return respond(undefined)
-    },
-    get: (key: string) => respond(data.records.get(key)),
-    delete: (key: string) => {
-      data.records.delete(key)
-      return respond(undefined)
-    },
-    getAll: () => respond([...data.records.values()]),
-    index: (name: string) => {
-      const keyPath = data.indexes.get(name)
-      if (!keyPath) throw new Error(`no such index: ${name}`)
-      return indexFacade(data, keyPath)
-    },
-  }
-}
-
-function dbFacade(data: FakeDbData) {
-  const store = (name: string): FakeStoreData => {
-    const found = data.stores.get(name)
-    if (!found) throw new Error(`no such object store: ${name}`)
-    return found
-  }
-  return {
-    createObjectStore: (name: string, options: { keyPath: string }) => {
-      const created: FakeStoreData = { keyPath: options.keyPath, records: new Map(), indexes: new Map() }
-      data.stores.set(name, created)
-      return {
-        createIndex: (indexName: string, keyPath: string[]) => {
-          created.indexes.set(indexName, keyPath)
-        },
-      }
-    },
-    transaction: () => ({ objectStore: (name: string) => storeFacade(store(name)) }),
-    close: () => undefined,
-  }
-}
-
-const fakeIndexedDB = {
-  open: (name: string, version: number) => {
-    const data = databases.get(name) ?? { version: 0, stores: new Map() }
-    databases.set(name, data)
-    const request: FakeRequest<ReturnType<typeof dbFacade>> = {
-      result: dbFacade(data),
-      error: null,
-      onsuccess: null,
-      onerror: null,
-      onupgradeneeded: null,
-    }
-    queueMicrotask(() => {
-      if (version > data.version) {
-        const oldVersion = data.version
-        data.version = version
-        upgrades += 1
-        request.onupgradeneeded?.({ oldVersion })
-      }
-      request.onsuccess?.()
-    })
-    return request
-  },
-}
-
-const globals = globalThis as Record<string, unknown>
 
 const exchange = (sessionId: string, position: number, extra: Partial<Exchange> = {}): Exchange => ({
   // Unique across sessions, as the pipeline's UUIDs are — `id` is the primary key. Kept short:
@@ -192,17 +36,13 @@ describe('extension capture store (T-015.1)', () => {
   let counter = 0
 
   beforeEach(() => {
-    databases.clear()
-    upgrades = 0
+    installFakeIndexedDB()
     counter += 1
     name = `douze-test-${counter}`
-    globals['indexedDB'] = fakeIndexedDB
-    globals['IDBKeyRange'] = FakeKeyRange
   })
 
   afterEach(() => {
-    delete globals['indexedDB']
-    delete globals['IDBKeyRange']
+    uninstallFakeIndexedDB()
   })
 
   const open = (): Promise<CaptureStore> => CaptureStore.open(name)
@@ -212,11 +52,11 @@ describe('extension capture store (T-015.1)', () => {
     const session = await store.startSession({ name: 'Shop orders', origins: ['https://app.test'] })
     await store.appendExchange(exchange(session.id, 0))
     store.close()
-    expect(upgrades).toBe(1)
+    expect(upgradeCount()).toBe(1)
 
     const reopened = await open()
     // Same version — the upgrade branch must not run again, and nothing may be recreated.
-    expect(upgrades).toBe(1)
+    expect(upgradeCount()).toBe(1)
     const detail = await reopened.session(session.id)
     expect(detail?.session.name).toBe('Shop orders')
     expect(detail?.exchanges).toHaveLength(1)
@@ -282,16 +122,13 @@ describe('the write gate (AC-CAP-005, TR-6)', () => {
   let counter = 0
 
   beforeEach(() => {
-    databases.clear()
+    installFakeIndexedDB()
     counter += 1
     name = `douze-gate-${counter}`
-    globals['indexedDB'] = fakeIndexedDB
-    globals['IDBKeyRange'] = FakeKeyRange
   })
 
   afterEach(() => {
-    delete globals['indexedDB']
-    delete globals['IDBKeyRange']
+    uninstallFakeIndexedDB()
   })
 
   const withSession = async (): Promise<{ store: CaptureStore; id: string }> => {
@@ -373,16 +210,13 @@ describe('annotation spans (AC-CAP-007.2)', () => {
   let counter = 0
 
   beforeEach(() => {
-    databases.clear()
+    installFakeIndexedDB()
     counter += 1
     name = `douze-span-${counter}`
-    globals['indexedDB'] = fakeIndexedDB
-    globals['IDBKeyRange'] = FakeKeyRange
   })
 
   afterEach(() => {
-    delete globals['indexedDB']
-    delete globals['IDBKeyRange']
+    uninstallFakeIndexedDB()
   })
 
   it('scopes a span to the exchanges captured since the previous note', async () => {

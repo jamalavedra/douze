@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest'
+import { PERMISSION_MISSING } from './guards.js'
 import {
   credentialHeaders,
   executeRelay,
@@ -180,6 +181,9 @@ describe('an origin the user never granted (AC-EXE-001.1)', () => {
     expect(response.error).toContain('https://api.example')
     expect(response.error).toMatch(/record the site again/i)
     expect(queriedTabs).toBe(false)
+    // `runToolCall` reads this sentence to know the failure is one no retry can fix; rewording it
+    // without moving the pattern would quietly make a permanent refusal retryable again.
+    expect(response.error).toMatch(PERMISSION_MISSING)
   })
 })
 
