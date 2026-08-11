@@ -26,7 +26,7 @@ const testOrigin = (): import('vite').Plugin => ({
  * self-contained files with no import statements. They deliberately import nothing at runtime,
  * which is what keeps the bundler from splitting a chunk out of them; `smoke.mjs` asserts it.
  *
- * The three pages — popup, review and connect — are JS entries here and static HTML in `public/`,
+ * The four pages — popup, review, connect and data — are JS entries here and static HTML in `public/`,
  * rather than HTML rollup inputs. Vite would rewrite an HTML input's script tags to hashed paths
  * under `assets/`, which is exactly what `popup.html` and the manifest must not have; keeping all
  * three the same shape means the popup build is untouched by the two new pages.
@@ -47,6 +47,7 @@ export default defineConfig({
         popup: resolve(import.meta.dirname, 'src/popup.ts'),
         review: resolve(import.meta.dirname, 'src/pages/review.ts'),
         connect: resolve(import.meta.dirname, 'src/pages/connect.ts'),
+        data: resolve(import.meta.dirname, 'src/pages/data.ts'),
       },
       output: {
         format: 'es',

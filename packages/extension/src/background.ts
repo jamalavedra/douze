@@ -5,6 +5,8 @@ import type {
   CaptureBatch,
   ConnectCommand,
   ConnectState,
+  DataCommand,
+  DataState,
   GestureEvent,
   PageEvent,
   PopupCommand,
@@ -26,6 +28,7 @@ import {
   type RelayPairing,
 } from './attach.js'
 import { DebuggerCapture } from './debugger-capture.js'
+import { importHar } from './har.js'
 import { installOracle } from './oracle.js'
 import { RECONCILE_GRACE_MS, Reconciler, admits, decodeBody, finalize, type ExchangeDraft } from './pipeline.js'
 import { RecipeStore, type SurfaceTool } from './recipes.js'
@@ -351,6 +354,21 @@ function ingest(batch: PageEvent[], tabId: number, pageOrigin?: string): void {
 
 // --- session lifecycle ----------------------------------------------------
 
+/**
+ * The MAIN-world `fetch` patch and the ISOLATED bridge, registered for exactly as long as the
+ * state that justifies them.
+ *
+ * `persistAcrossSessions: false` is not a performance choice: `recording` lives in
+ * `chrome.storage.session`, which Chrome clears on browser restart, and a registration that
+ * outlived it left every recorded origin carrying a patched `fetch` with nothing left in the
+ * extension that knew why — no session to stop, no badge, and no `onStartup` listener to
+ * reconcile it. `false` matches the two lifetimes: Chrome keeps a non-persistent registration for
+ * the whole browser session, worker evictions included (which is why a mid-session eviction still
+ * records), and drops it on the restart that also drops the session state.
+ *
+ * The unregister on stop stays, because a session that ends before the browser does must take the
+ * injection with it — this only fixes the case where nothing gets to run a stop at all.
+ */
 async function registerScripts(origins: string[]): Promise<void> {
   await chrome.scripting.unregisterContentScripts({ ids: RECONCILE_IDS }).catch(() => {})
   if (!origins.length) return
@@ -364,7 +382,7 @@ async function registerScripts(origins: string[]): Promise<void> {
       matches,
       allFrames: true,
       matchOriginAsFallback: true,
-      persistAcrossSessions: true,
+      persistAcrossSessions: false,
     },
     {
       id: 'douze-bridge',
@@ -374,7 +392,7 @@ async function registerScripts(origins: string[]): Promise<void> {
       matches,
       allFrames: true,
       matchOriginAsFallback: true,
-      persistAcrossSessions: true,
+      persistAcrossSessions: false,
     },
   ])
 }
@@ -488,27 +506,44 @@ async function openConnect(): Promise<void> {
   await chrome.tabs.create({ url: chrome.runtime.getURL('connect.html') })
 }
 
+/** The data page — what is stored on this computer. Opened by the worker, as the other two are. */
+async function openData(): Promise<void> {
+  await chrome.tabs.create({ url: chrome.runtime.getURL('data.html') })
+}
+
 // --- review ---------------------------------------------------------------
 
 /**
  * Inference is expensive and every command names its session, so the session is built once and
- * kept. It is in-memory only.
+ * kept, alongside the exchange count it was built from. It is in-memory only.
+ *
+ * The count it was built from is kept beside it because a review can be opened while the site is
+ * still being recorded: inference ran over the exchanges that had landed by then, and a session
+ * kept by id alone would show that same candidate set for the rest of the recording. The daemon
+ * re-inferred when the count moved, and so does this.
+ *
+ * Only `load` re-infers, though — it is the command that redraws the whole candidate set, so it is
+ * the one place a rebuild costs nothing. Rebuilding under `enable`/`disable`/`save` would throw
+ * away the approvals the page sent moments earlier, for a capture that happened to grow between
+ * two of its own messages.
  *
  * ponytail: a worker Chrome respawns mid-review loses unsaved edits and approvals, and the page
  * silently rebuilds from the capture. Persist the session if anyone ever loses work to it.
  */
-const reviews = new Map<string, ReviewSession>()
+const reviews = new Map<string, { session: ReviewSession; count: number }>()
 
-async function reviewSession(sessionId: string): Promise<ReviewSession> {
+async function reviewSession(sessionId: string, reinfer: boolean): Promise<ReviewSession> {
+  const stores = await openStores()
+  const count = await stores.captures.countExchanges(sessionId)
   const open = reviews.get(sessionId)
-  if (open) return open
-  const session = await ReviewSession.open(sessionId, await openStores())
-  reviews.set(sessionId, session)
+  if (open && (!reinfer || open.count === count)) return open.session
+  const session = await ReviewSession.open(sessionId, stores)
+  reviews.set(sessionId, { session, count })
   return session
 }
 
 async function onReviewCommand(command: ReviewCommand): Promise<ReviewState | ReviewSaved | { ok: true }> {
-  const session = await reviewSession(command.sessionId)
+  const session = await reviewSession(command.sessionId, command.type === 'douze:review:load')
   if (command.type === 'douze:review:load') {
     return { site: session.site(), recipe: session.recipeName(), candidates: session.candidates() }
   }
@@ -530,6 +565,57 @@ async function onReviewCommand(command: ReviewCommand): Promise<ReviewState | Re
   await session.save()
   // Read back rather than trusting a report shape: what is approved now is what the surface holds.
   return { tools: session.candidates().filter((c) => c.approved).map((c) => c.name) }
+}
+
+// --- what is stored on this computer --------------------------------------
+
+/**
+ * The routes behind the data page. Each one reaches a store method that had no caller at all
+ * after the CLI was deleted: `importHar` (`douze import`), `RecipeStore.exportAll`/`importFiles`
+ * (`douze export` / `douze import`), and `CaptureStore.deleteSession`, which nothing anywhere
+ * could reach — so a recording of an authenticated dashboard stayed in IndexedDB, under
+ * `unlimitedStorage`, until the extension itself was removed.
+ */
+async function dataState(extra: Partial<DataState> = {}): Promise<DataState> {
+  const { captures, recipes } = await openStores()
+  return {
+    sessions: await captures.sessions(),
+    recipes: recipes
+      .recipes()
+      .map((recipe) => ({ name: recipe.name, tools: recipe.tools.filter((tool) => tool.approved).length }))
+      .sort((a, b) => a.name.localeCompare(b.name)),
+    ...extra,
+  }
+}
+
+async function onDataCommand(command: DataCommand): Promise<DataState> {
+  try {
+    const { captures, recipes } = await openStores()
+    if (command.type === 'douze:data:delete') {
+      // Behind the capture queue, like `stopSession`: deleting a session that is still being
+      // written to must not race the append, or the rows written after the delete survive it.
+      await sequence(() => captures.deleteSession(command.sessionId))
+      // The in-memory review of a capture that no longer exists is not a review of anything.
+      reviews.delete(command.sessionId)
+      return await dataState()
+    }
+    if (command.type === 'douze:data:import-har') {
+      // Same queue for the same reason, and because an import is hundreds of writes: interleaving
+      // them with a live recording's appends would put both behind each other's transactions.
+      const har = await sequence(() => importHar(command.har, command.name, captures))
+      return await dataState({ har })
+    }
+    if (command.type === 'douze:data:export') return await dataState({ files: await recipes.exportAll() })
+    if (command.type === 'douze:data:import') {
+      const imported = await recipes.importFiles(command.files, command.overwrite === true ? { overwrite: true } : {})
+      return await dataState({ imported })
+    }
+    return await dataState()
+  } catch (error) {
+    // As on the connect page: the sentence is what the reader can do about it, and the screen is
+    // re-rendered from a state that reflects that nothing changed.
+    return dataState({ error: String((error as Error)?.message ?? error) })
+  }
 }
 
 // --- connect --------------------------------------------------------------
@@ -794,7 +880,7 @@ async function siteTools(origin: string): Promise<SiteTool[]> {
 
 // --- listeners (top level, synchronous) -----------------------------------
 
-type Inbound = CaptureBatch | PopupCommand | ReviewCommand | ConnectCommand
+type Inbound = CaptureBatch | PopupCommand | ReviewCommand | ConnectCommand | DataCommand
 
 /**
  * Everything except a capture batch comes from an extension page — the popup, the review page,
@@ -830,6 +916,7 @@ chrome.runtime.onMessage.addListener((message: Inbound, sender, sendResponse) =>
       // their commands names its own session rather than reading the worker's live state.
       if (message.type.startsWith('douze:review:')) return onReviewCommand(message as ReviewCommand)
       if (message.type.startsWith('douze:connect:')) return onConnectCommand(message as ConnectCommand)
+      if (message.type.startsWith('douze:data:')) return onDataCommand(message as DataCommand)
       if (message.type === 'douze:start') return startSession(message)
       if (message.type === 'douze:stop') return stopSession()
       if (message.type === 'douze:annotate') {
@@ -852,6 +939,10 @@ chrome.runtime.onMessage.addListener((message: Inbound, sender, sendResponse) =>
       }
       if (message.type === 'douze:connect') {
         await openConnect()
+        return status()
+      }
+      if (message.type === 'douze:data') {
+        await openData()
         return status()
       }
       return status()

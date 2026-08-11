@@ -1,170 +1,25 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Recipe } from '@douze/shared'
 import type { RelayPairing } from './attach.js'
-import type { ConnectState, PageEvent } from './messages.js'
+import type { ConnectState, DataState, PageEvent, ReviewState } from './messages.js'
 import { RecipeStore } from './recipes.js'
 import { ReviewSession } from './review-session.js'
 import { CaptureStore } from './store.js'
+import { installFakeIndexedDB, uninstallFakeIndexedDB } from './testing.js'
 
 /**
  * WO-015 T-015.1 — the service worker recorded into its own store, driven the way Chrome drives
  * it: through the message listener it registers at the top level.
  *
  * No jsdom and no browser, as everywhere else in this package: `chrome.*` and `indexedDB` are
- * installed on `globalThis` for the duration of a test. The IndexedDB fake is `store.test.ts`'s,
- * because the point here is that a real `CaptureStore` is written and read back — the fake covers
+ * installed on `globalThis` for the duration of a test. The IndexedDB is `testing.ts`'s fake,
+ * because the point here is that a real `CaptureStore` is written and read back — it covers
  * exactly what `store.ts` uses (compound indexes, bound ranges, a backwards key cursor) and
  * proves nothing about a real browser's transaction lifetimes or quota.
  *
  * `vi.resetModules()` before each import is what makes the worker fresh: the module registers its
  * listeners and starts its `hydrated` promise at import time, exactly as Chrome respawning it does.
  */
-
-// --- IndexedDB fake (see store.test.ts) ------------------------------------
-
-type Rec = Record<string, unknown>
-type Key = string | number | Array<string | number>
-
-const rank = (value: Key): number => (Array.isArray(value) ? 3 : typeof value === 'string' ? 2 : 1)
-
-function compare(a: Key, b: Key): number {
-  if (rank(a) !== rank(b)) return rank(a) - rank(b)
-  if (Array.isArray(a) && Array.isArray(b)) {
-    for (let i = 0; i < Math.min(a.length, b.length); i += 1) {
-      const part = compare(a[i] as Key, b[i] as Key)
-      if (part !== 0) return part
-    }
-    return a.length - b.length
-  }
-  return (a as number) < (b as number) ? -1 : (a as number) > (b as number) ? 1 : 0
-}
-
-class FakeKeyRange {
-  constructor(
-    readonly lower: Key,
-    readonly upper: Key,
-  ) {}
-
-  static bound(lower: Key, upper: Key): FakeKeyRange {
-    return new FakeKeyRange(lower, upper)
-  }
-
-  includes(key: Key): boolean {
-    return compare(key, this.lower) >= 0 && compare(key, this.upper) <= 0
-  }
-}
-
-interface FakeStoreData {
-  keyPath: string
-  records: Map<string, Rec>
-  indexes: Map<string, string[]>
-}
-
-interface FakeDbData {
-  version: number
-  stores: Map<string, FakeStoreData>
-}
-
-interface FakeRequest<T> {
-  result: T
-  error: null
-  onsuccess: (() => void) | null
-  onerror: (() => void) | null
-  onupgradeneeded?: ((event: { oldVersion: number }) => void) | null
-}
-
-const databases = new Map<string, FakeDbData>()
-
-function respond<T>(result: T): FakeRequest<T> {
-  const request: FakeRequest<T> = { result, error: null, onsuccess: null, onerror: null }
-  queueMicrotask(() => request.onsuccess?.())
-  return request
-}
-
-function entriesOf(data: FakeStoreData, keyPath: string[], range: FakeKeyRange) {
-  const entries: Array<{ key: Key; primary: string; value: Rec }> = []
-  for (const [primary, value] of data.records) {
-    const key = keyPath.map((part) => value[part] as string | number)
-    if (range.includes(key)) entries.push({ key, primary, value })
-  }
-  return entries.sort((a, b) => compare(a.key, b.key) || compare(a.primary, b.primary))
-}
-
-function indexFacade(data: FakeStoreData, keyPath: string[]) {
-  return {
-    getAll: (range: FakeKeyRange) => respond(entriesOf(data, keyPath, range).map((entry) => entry.value)),
-    getAllKeys: (range: FakeKeyRange) => respond(entriesOf(data, keyPath, range).map((entry) => entry.primary)),
-    openKeyCursor: (range: FakeKeyRange, direction: string) => {
-      const entries = entriesOf(data, keyPath, range)
-      const chosen = direction === 'prev' ? entries.at(-1) : entries[0]
-      return respond(chosen ? { key: chosen.key, primaryKey: chosen.primary } : null)
-    },
-  }
-}
-
-function storeFacade(data: FakeStoreData) {
-  return {
-    put: (value: Rec) => {
-      data.records.set(String(value[data.keyPath]), structuredClone(value))
-      return respond(undefined)
-    },
-    get: (key: string) => respond(data.records.get(key)),
-    delete: (key: string) => {
-      data.records.delete(key)
-      return respond(undefined)
-    },
-    getAll: () => respond([...data.records.values()]),
-    index: (name: string) => {
-      const keyPath = data.indexes.get(name)
-      if (!keyPath) throw new Error(`no such index: ${name}`)
-      return indexFacade(data, keyPath)
-    },
-  }
-}
-
-function dbFacade(data: FakeDbData) {
-  const store = (name: string): FakeStoreData => {
-    const found = data.stores.get(name)
-    if (!found) throw new Error(`no such object store: ${name}`)
-    return found
-  }
-  return {
-    createObjectStore: (name: string, options: { keyPath: string }) => {
-      const created: FakeStoreData = { keyPath: options.keyPath, records: new Map(), indexes: new Map() }
-      data.stores.set(name, created)
-      return {
-        createIndex: (indexName: string, keyPath: string[]) => {
-          created.indexes.set(indexName, keyPath)
-        },
-      }
-    },
-    transaction: () => ({ objectStore: (name: string) => storeFacade(store(name)) }),
-    close: () => undefined,
-  }
-}
-
-const fakeIndexedDB = {
-  open: (name: string, version: number) => {
-    const data = databases.get(name) ?? { version: 0, stores: new Map() }
-    databases.set(name, data)
-    const request: FakeRequest<ReturnType<typeof dbFacade>> = {
-      result: dbFacade(data),
-      error: null,
-      onsuccess: null,
-      onerror: null,
-      onupgradeneeded: null,
-    }
-    queueMicrotask(() => {
-      if (version > data.version) {
-        const oldVersion = data.version
-        data.version = version
-        request.onupgradeneeded?.({ oldVersion })
-      }
-      request.onsuccess?.()
-    })
-    return request
-  },
-}
 
 // --- chrome fake -----------------------------------------------------------
 
@@ -231,6 +86,8 @@ interface FakeChrome {
   created: string[]
   badge: string
   registered: string[]
+  /** The whole script objects, so a test can read the options and not only the ids. */
+  scripts: Array<Record<string, unknown>>
   local: Map<string, unknown>
   alarms: string[]
   notifications: { id: string; title: string; message: string }[]
@@ -257,6 +114,7 @@ function installChrome(): FakeChrome {
     created: [],
     badge: '',
     registered: [],
+    scripts: [],
     local,
     alarms: [],
     notifications: [],
@@ -313,8 +171,9 @@ function installChrome(): FakeChrome {
       },
     },
     scripting: {
-      registerContentScripts: async (scripts: Array<{ id: string }>) => {
-        state.registered = scripts.map((script) => script.id)
+      registerContentScripts: async (scripts: Array<Record<string, unknown>>) => {
+        state.registered = scripts.map((script) => String(script['id']))
+        state.scripts = scripts
       },
       unregisterContentScripts: async () => undefined,
       // The one injection `executeRelay` makes for a cookie-authenticated tool: the ISOLATED-world
@@ -519,15 +378,13 @@ const fakeFetch = async (url: string, init: { method: string; headers: Record<st
 
 /** `seed` lands in `chrome.storage.local` BEFORE the worker starts, as a stored pairing does. */
 async function bootWorker(seed: Record<string, unknown> = {}): Promise<void> {
-  databases.clear()
+  installFakeIndexedDB()
   fake = installChrome()
   FakeSocket.opened.length = 0
   relayCalls.length = 0
   relayAnswer = () => ({ status: 201, body: { token: 'minted-token', mcp_path: '/m/minted' } })
   globals['fetch'] = fakeFetch
   for (const [key, value] of Object.entries(seed)) fake.local.set(key, value)
-  globals['indexedDB'] = fakeIndexedDB
-  globals['IDBKeyRange'] = FakeKeyRange
   globals['WebSocket'] = FakeSocket
   vi.resetModules()
   await import('./background.js')
@@ -544,8 +401,7 @@ beforeEach(() => bootWorker())
 
 afterEach(() => {
   delete globals['chrome']
-  delete globals['indexedDB']
-  delete globals['IDBKeyRange']
+  uninstallFakeIndexedDB()
   delete globals['WebSocket']
   globals['fetch'] = realFetch
   delete globals['__douze']
@@ -640,6 +496,20 @@ describe('a session recorded with no daemon anywhere (T-015.1)', () => {
     await capture(exchangeEvents('r1', 'GET', 'https://evil.test/api/steal'), 'https://evil.test')
     await settle()
     expect((await douze().recorded(id)).exchanges).toHaveLength(0)
+  })
+
+  /**
+   * The registration and the state that justifies it must not outlive each other. `recording`
+   * lives in `chrome.storage.session`, which Chrome clears on browser restart; a persistent
+   * registration survived that, so every recorded origin kept a patched `fetch` and an injected
+   * bridge with nothing left that knew why — and no `onStartup` listener to reconcile them.
+   */
+  it('registers the content scripts for this browser session only, as the recording state is', async () => {
+    await douze().startSession('Shop', ['https://app.test'], { tabId: 7 })
+    expect(fake.scripts.map((script) => [script['id'], script['persistAcrossSessions']])).toEqual([
+      ['douze-main', false],
+      ['douze-bridge', false],
+    ])
   })
 })
 
@@ -1383,6 +1253,179 @@ describe('sharing Douze with a hosted assistant (T-015.10)', () => {
     socket.drop(1008)
     await settle()
     expect((await connect({ type: 'douze:connect:status' })).bridge).toBe('refused')
+  })
+})
+
+/**
+ * WO-015 review round — the three ported features that reached nothing. `importHar`,
+ * `RecipeStore.exportAll`/`importFiles` and `CaptureStore.deleteSession` were implemented and
+ * unit-tested with no caller anywhere outside their own tests: the CLI that used to reach them was
+ * deleted and nothing replaced it. These drive the routes the data page uses.
+ */
+describe('what Douze has stored, from the data page', () => {
+  const data = async (message: Record<string, unknown>): Promise<DataState> =>
+    (await sendFrom(extensionPage(), message)) as DataState
+
+  const record = async (name: string): Promise<string> => {
+    const id = await douze().startSession(name, ['https://app.test'], { tabId: 7 })
+    await capture(exchangeEvents(`${name}-1`, 'GET', 'https://app.test/api/orders'))
+    await capture(exchangeEvents(`${name}-2`, 'POST', 'https://app.test/api/orders'))
+    await douze().stopSession()
+    return id
+  }
+
+  /** One JSON entry of a HAR, with the content type a test wants on it. */
+  const harEntry = (url: string, mimeType = 'application/json'): unknown => ({
+    startedDateTime: '2026-08-05T10:00:00.000Z',
+    time: 10,
+    request: { method: 'GET', url, headers: [] },
+    response: {
+      status: 200,
+      headers: [{ name: 'content-type', value: 'application/json' }],
+      content: { mimeType, size: 10, text: JSON.stringify({ ok: true }) },
+    },
+  })
+
+  it('lists every recording with what it retained', async () => {
+    const first = await record('Orders')
+    const second = await record('Invoices')
+
+    const state = await data({ type: 'douze:data:list' })
+    // As a map, not a list: both sessions can start inside the same millisecond, and the order
+    // `sessions()` sorts by is `started_at` — asserting it here would be asserting the clock.
+    expect(new Map(state.sessions.map((session) => [session.id, [session.name, session.exchange_count]]))).toEqual(
+      new Map([
+        [first, ['Orders', 2]],
+        [second, ['Invoices', 2]],
+      ]),
+    )
+  })
+
+  /**
+   * The privacy half of this: a recording of a signed-in dashboard sat in IndexedDB under
+   * `unlimitedStorage` with nothing anywhere that could remove it.
+   */
+  it('deletes a recording and everything under it, leaving the others alone', async () => {
+    const doomed = await record('Orders')
+    const kept = await record('Invoices')
+
+    const state = await data({ type: 'douze:data:delete', sessionId: doomed })
+    expect(state.sessions.map((session) => session.id)).toEqual([kept])
+
+    const captures = await openCaptures()
+    expect(await captures.session(doomed)).toBeNull()
+    expect(await captures.countExchanges(doomed)).toBe(0)
+    expect((await captures.session(kept))?.exchanges).toHaveLength(2)
+  })
+
+  it('imports a .har as a recording and reports what the write gate refused, one by one', async () => {
+    const state = await data({
+      type: 'douze:data:import-har',
+      name: 'From a file',
+      har: {
+        log: {
+          entries: [
+            harEntry('https://app.test/api/a'),
+            // The token rides in the content type, which redaction does not walk — so the store's
+            // gate refuses this one entry and the import keeps the rest.
+            harEntry('https://app.test/api/token', `application/json;profile=${JWT}`),
+            harEntry('https://app.test/api/b'),
+            harEntry('https://www.google-analytics.com/collect'),
+          ],
+        },
+      },
+    })
+
+    expect(state.har?.imported).toBe(2)
+    expect(state.har?.skipped).toBe(1)
+    expect(state.har?.refused.map((entry) => entry.url)).toEqual(['https://app.test/api/token'])
+    expect(state.har?.refused[0]?.reason).toMatch(/credential at/)
+    // The refusal is a report, not a lost import: the session is listed with what it did keep.
+    expect(state.sessions.map((session) => [session.name, session.exchange_count])).toEqual([['From a file', 2]])
+    expect(JSON.stringify(state)).not.toContain(JWT)
+  })
+
+  it('exports every recipe with its fixtures, and takes the same files back', async () => {
+    await approveShop()
+
+    const exported = await data({ type: 'douze:data:export' })
+    const files = exported.files ?? []
+    expect(files.map((file) => file.path)).toEqual([
+      'recipes/shop.yaml',
+      'fixtures/shop/create_order.json',
+      'fixtures/shop/delete_order.json',
+      'fixtures/shop/list_orders.json',
+    ])
+    expect(exported.recipes).toEqual([{ name: 'shop', tools: 3 }])
+
+    // A second browser: the same files, imported into a worker that has never seen them.
+    await bootWorker()
+    const imported = await data({ type: 'douze:data:import', files })
+    expect(imported.imported?.ok).toBe(true)
+    expect(imported.imported?.imported).toEqual(['shop'])
+    expect(imported.recipes).toEqual([{ name: 'shop', tools: 3 }])
+  })
+
+  it('refuses an import that would overwrite a skill until it is told to, by name', async () => {
+    await approveShop()
+    const files = (await data({ type: 'douze:data:export' })).files ?? []
+
+    const refused = await data({ type: 'douze:data:import', files })
+    expect(refused.imported?.ok).toBe(false)
+    expect(refused.imported?.conflicts).toEqual(['shop'])
+    // AC-REC-003 — nothing is written unless the whole set validates and no name collides.
+    expect(refused.imported?.imported).toEqual([])
+
+    const taken = await data({ type: 'douze:data:import', files, overwrite: true })
+    expect(taken.imported?.ok).toBe(true)
+    expect(taken.imported?.imported).toEqual(['shop'])
+  })
+
+  it('answers with the reason and changes nothing when the file holds no entries', async () => {
+    const state = await data({ type: 'douze:data:import-har', name: 'Nonsense', har: { log: { entries: [] } } })
+    expect(state.error).toMatch(/no entries/i)
+    expect(state.sessions).toEqual([])
+  })
+})
+
+/**
+ * A review opened while the site is still being recorded was inferred from the exchanges that had
+ * landed by then. The session was cached by id alone, so it stayed that way for the rest of the
+ * recording — the daemon rebuilt on a count change, and so does this.
+ */
+describe('a review opened while the recording is still running', () => {
+  it('rebuilds when the capture has grown, and reuses the session when it has not', async () => {
+    const id = await douze().startSession('Shop', ['https://app.test'], { tabId: 7 })
+    for (const n of [1, 2, 3]) await capture(exchangeEvents(`r${n}`, 'GET', 'https://app.test/api/orders'))
+    await settle()
+
+    const load = async (): Promise<ReviewState> =>
+      (await sendFrom(extensionPage(), { type: 'douze:review:load', sessionId: id })) as ReviewState
+    expect((await load()).candidates.map((candidate) => candidate.name)).toEqual(['list_orders'])
+
+    for (const n of [1, 2, 3]) await capture(exchangeEvents(`w${n}`, 'POST', 'https://app.test/api/orders'))
+    await settle()
+    expect((await load()).candidates.map((candidate) => candidate.name).sort()).toEqual([
+      'create_order',
+      'list_orders',
+    ])
+
+    // Nothing new captured: the same session is handed back, so an approval made on the page is
+    // still there when the page asks again.
+    await sendFrom(extensionPage(), { type: 'douze:review:enable', sessionId: id, names: ['list_orders'] })
+    const again = await load()
+    expect(again.candidates.find((candidate) => candidate.name === 'list_orders')?.approved).toBe(true)
+
+    // And a capture landing between the page's own `enable` and its `save` does not take the
+    // approval with it: only `load` re-infers, because only `load` redraws the list.
+    await capture(exchangeEvents('r4', 'GET', 'https://app.test/api/orders'))
+    await settle()
+    const saved = (await sendFrom(extensionPage(), { type: 'douze:review:save', sessionId: id })) as {
+      tools?: string[]
+      error?: string
+    }
+    expect(saved.error).toBeUndefined()
+    expect(saved.tools).toEqual(['list_orders'])
   })
 })
 

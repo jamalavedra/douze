@@ -6,6 +6,9 @@
  */
 import type { CandidateView, EditableField } from '@douze/studio/browser'
 import type { AuditEntry } from './guards.js'
+import type { HarImportResult } from './har.js'
+import type { ExportedFile, ImportResult } from './recipes.js'
+import type { SessionSummary } from './store.js'
 
 export interface CapturedBody {
   /** Decoded text, present when the payload was textual. */
@@ -88,6 +91,8 @@ export type PopupCommand =
   | { type: 'douze:review'; sessionId: string }
   /** Open the page that shares Douze with a hosted assistant. Opened by the worker, for the same reason. */
   | { type: 'douze:connect' }
+  /** Open the page listing what Douze has stored on this computer. Same reason again. */
+  | { type: 'douze:data' }
   /** What is already set up on this site — the popup's quiet summary. */
   | { type: 'douze:site-tools'; origin: string }
   /**
@@ -144,6 +149,46 @@ export interface ReviewState {
 /** What `douze:review:save` answers with: the tools now on the surface. */
 export interface ReviewSaved {
   tools: string[]
+}
+
+/**
+ * Data page → service worker: what Douze has stored on this computer, and the three doors in and
+ * out of it. Each of these was a CLI subcommand (`douze import`, `douze export`, and the daemon's
+ * own session delete) and had no replacement at all in the extension; the store methods behind
+ * them existed and could not be reached.
+ *
+ * Same convention as the connect page: every command answers with the whole `DataState`, with the
+ * report of what it just did alongside, so the page never infers what changed.
+ */
+export type DataCommand =
+  | { type: 'douze:data:list' }
+  /** REQ-CAP-006 — a .har becomes a Capture Session. `har` is the parsed file. */
+  | { type: 'douze:data:import-har'; name: string; har: unknown }
+  /** The recording and every exchange, annotation and byte under it. There is no undo. */
+  | { type: 'douze:data:delete'; sessionId: string }
+  | { type: 'douze:data:export' }
+  /**
+   * AC-REC-003 — `overwrite` is the answer to a `conflicts` the page just showed the reader by
+   * name. Absent means refuse the whole set again rather than take anything.
+   */
+  | { type: 'douze:data:import'; files: ExportedFile[]; overwrite?: boolean }
+
+/** What every `douze:data:*` command answers with. */
+export interface DataState {
+  /** Newest first, each with what it retained — the count the badge showed while recording. */
+  sessions: SessionSummary[]
+  recipes: { name: string; tools: number }[]
+  /**
+   * `douze:data:import-har` only. Carried whole, `refused` included: an import that quietly
+   * reported a total would be claiming traffic the write gate did not store.
+   */
+  har?: HarImportResult
+  /** `douze:data:export` only — the files, for the page to hand to a download. */
+  files?: ExportedFile[]
+  /** `douze:data:import` only, conflicts and errors included. */
+  imported?: ImportResult
+  /** Set when the action could not be carried out; nothing changed. */
+  error?: string
 }
 
 /**

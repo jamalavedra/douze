@@ -1,7 +1,6 @@
 import { parseRecipe, serializeRecipe } from '@douze/shared'
 import {
   approve as approveCandidate,
-  approveReads as approveReadCandidates,
   authFrom,
   baseUrlFrom,
   candidateViews,
@@ -34,6 +33,17 @@ import type { CaptureStore } from './store.js'
  *
  * Cost: inference is ~55 ms for 5 000 exchanges (measured on a synthetic capture across five
  * resources), so it runs inline. Nothing here needs chunking or an alarm to survive the worker.
+ *
+ * **AC-REC-002.3 is a UI default here, not a server-side rule, and that is deliberate.** douzed
+ * had two approval routes — `enable <name>` and a bulk `approveReads()` that took no arguments —
+ * so "bulk-enable is reads-only" could be enforced in the one that named nothing. The extension
+ * has a single route: `douze:review:enable` carries the names, and every name in it is a tick box
+ * the user set on the review page. There is no unnamed bulk path left to constrain, and a
+ * surviving `approveReads()` with no caller would advertise an enforcement point nothing reaches,
+ * so it was removed rather than kept as decoration. What still holds the line is the review page's
+ * seed — `bulk_approvable`, which is reads — so nothing a user has not read is selected for them;
+ * `pages.test.ts` pins that. The sender check in background.ts keeps the route inside our own
+ * pages either way.
  */
 export class ReviewSession {
   private constructor(
@@ -91,11 +101,6 @@ export class ReviewSession {
 
   unapprove(names: string[]): void {
     for (const name of names) unapproveCandidate(findCandidate(this.items, name))
-  }
-
-  /** AC-REC-002.3 — reads only; a write or a destructive tool is approved one at a time. */
-  approveReads(): void {
-    approveReadCandidates(this.items)
   }
 
   /**

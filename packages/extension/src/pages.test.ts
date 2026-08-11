@@ -23,11 +23,20 @@ describe('the extension build', () => {
   const input = (config as { build: { rollupOptions: { input: Record<string, string> } } }).build.rollupOptions
     .input
 
-  it('emits an entry module for all three pages', () => {
-    expect(Object.keys(input).sort()).toEqual(['background', 'bridge', 'connect', 'interceptor', 'popup', 'review'])
+  it('emits an entry module for all four pages', () => {
+    expect(Object.keys(input).sort()).toEqual([
+      'background',
+      'bridge',
+      'connect',
+      'data',
+      'interceptor',
+      'popup',
+      'review',
+    ])
     expect(input['popup']).toMatch(/src\/popup\.ts$/)
     expect(input['review']).toMatch(/src\/pages\/review\.ts$/)
     expect(input['connect']).toMatch(/src\/pages\/connect\.ts$/)
+    expect(input['data']).toMatch(/src\/pages\/data\.ts$/)
   })
 
   it('gives each page an HTML file that loads its bundle by the name rollup writes', () => {
@@ -35,6 +44,7 @@ describe('the extension build', () => {
       ['popup', 'popup.js'],
       ['review', 'review.js'],
       ['connect', 'connect.js'],
+      ['data', 'data.js'],
     ] as const) {
       const html = source('..', 'public', `${page}.html`)
       expect(html).toContain(`src="${script}"`)
@@ -46,9 +56,73 @@ describe('the extension build', () => {
     expect(output.entryFileNames).toBe('[name].js')
   })
 
-  it('shares one stylesheet between the two full-page views', () => {
-    expect(source('..', 'public', 'review.html')).toContain('href="page.css"')
-    expect(source('..', 'public', 'connect.html')).toContain('href="page.css"')
+  it('shares one stylesheet between the full-page views', () => {
+    for (const page of ['review', 'connect', 'data'] as const) {
+      expect(source('..', 'public', `${page}.html`)).toContain('href="page.css"')
+    }
+  })
+})
+
+/**
+ * WO-015 review round — `importHar`, `RecipeStore.exportAll`/`importFiles` and
+ * `CaptureStore.deleteSession` were ported, unit-tested, and then reachable from nothing: no
+ * message, no control, no page. The CLI that used to call them was deleted with no replacement.
+ * These pin the wiring; `background.test.ts` drives the routes themselves.
+ */
+describe('the data page', () => {
+  const html = source('..', 'public', 'data.html')
+  const data = source('pages', 'data.ts')
+  const background = source('background.ts')
+  const popup = source('popup.ts')
+
+  it('reaches every store method the CLI used to be the only caller of', () => {
+    for (const [command, call] of [
+      ['douze:data:list', 'await captures.sessions()'],
+      ['douze:data:delete', 'captures.deleteSession(command.sessionId)'],
+      ['douze:data:import-har', 'importHar(command.har, command.name, captures)'],
+      ['douze:data:export', 'await recipes.exportAll()'],
+      ['douze:data:import', 'recipes.importFiles(command.files'],
+    ] as const) {
+      expect(data).toContain(command)
+      expect(background).toContain(call)
+    }
+    expect(background).toContain("if (message.type.startsWith('douze:data:'))")
+  })
+
+  /**
+   * `imported` on its own is the dishonest report: `refused[]` exists so a file the write gate
+   * partly rejected cannot be shown as if it had all landed. Every refusal is listed with its
+   * address and the reason the gate gave.
+   */
+  it('shows every refused entry rather than only counting it', () => {
+    expect(data).toContain('const refused = report.refused')
+    expect(data).toContain("el('p', { className: 'warn', textContent: entry.reason })")
+    expect(html).toContain('still carried something that looks like a\n            credential')
+  })
+
+  it('offers overwrite by name when an import collides, and changes nothing until asked', () => {
+    expect(data).toContain('report?.conflicts ?? []')
+    expect(data).toContain('Douze already has ${conflicts.join(\', \')}. Nothing was changed.')
+    expect(data).toContain("{ type: 'douze:data:import', files: pending, overwrite: true }")
+    expect(html).toContain('<button type="button" class="primary" id="conflict-yes">Replace them</button>')
+  })
+
+  it('takes two clicks to delete a recording, and says what the second one does', () => {
+    expect(data).toContain("textContent: armed ? 'Delete for good' : 'Delete'")
+    expect(data).toContain("{ type: 'douze:data:delete', sessionId: session.id }")
+  })
+
+  it('is opened through the worker from the popup, like the other two pages', () => {
+    expect(popup).toContain("chrome.runtime.sendMessage({ type: 'douze:data' })")
+    expect(popup).not.toContain('tabs.create')
+    expect(background).toContain("if (message.type === 'douze:data')")
+    expect(background).toContain("chrome.runtime.getURL('data.html')")
+  })
+
+  it('puts every user-supplied string through textContent, never innerHTML', () => {
+    expect(data).not.toContain('innerHTML')
+    expect(data).not.toContain('insertAdjacentHTML')
+    expect(html).not.toContain('<div role="button"')
   })
 })
 
@@ -121,7 +195,10 @@ describe('the review page', () => {
       expect(background).toContain(call)
     }
     expect(background).toContain('await session.save()')
-    expect(background).toContain("ReviewSession.open(sessionId, await openStores())")
+    expect(background).toContain('ReviewSession.open(sessionId, stores)')
+    // Re-inferred on `load` when the capture has grown since — a review opened mid-recording
+    // otherwise shows the candidate set as it was when the page was first opened.
+    expect(background).toContain("reviewSession(command.sessionId, command.type === 'douze:review:load')")
   })
 
   it('talks to the worker rather than to a daemon', () => {

@@ -126,6 +126,15 @@ const openReview = async (exchanges: Exchange[], name?: string): Promise<ReviewS
   return ReviewSession.open('cap', { captures: capturesOf(detailOf(exchanges, name)), recipes })
 }
 
+/**
+ * What the review page's seed does, in one line: approve every candidate it pre-selects, which is
+ * the reads. There is no `approveReads()` on the session any more — see the class doc — so the
+ * tests that only need "the reads are on" spell the same selection the page spells.
+ */
+const approveReads = (review: ReviewSession): void => {
+  review.approve(review.candidates().filter((candidate) => candidate.bulk_approvable).map((c) => c.name))
+}
+
 const storedNames = (): string[] =>
   [...items.keys()].filter((key) => key.startsWith('recipe:')).map((key) => key.slice('recipe:'.length))
 
@@ -162,10 +171,19 @@ describe('review inside the extension (T-015.3)', () => {
     expect(review.recipeName()).toBe('recipe-2026-audit')
   })
 
-  it('approves reads only in bulk, and named tools individually', async () => {
+  /**
+   * Approval is by name and only by name. `bulk_approvable` is what the review page seeds its
+   * selection from (AC-REC-002.3, now a UI default — see the class doc), so it is asserted here as
+   * the data behind that seed rather than as a method the session enforces.
+   */
+  it('approves and unapproves named candidates, and marks only reads as bulk-approvable', async () => {
     const review = await openReview(RECORDED)
 
-    review.approveReads()
+    expect(review.candidates().filter((c) => c.bulk_approvable).map((c) => c.name)).toEqual([
+      'get_order',
+      'list_orders',
+    ])
+    approveReads(review)
     const approved = (): string[] => review.candidates().filter((c) => c.approved).map((c) => c.name)
     expect(approved()).toEqual(['get_order', 'list_orders'])
 
@@ -181,7 +199,7 @@ describe('review inside the extension (T-015.3)', () => {
     const recipes = await RecipeStore.open()
     const review = await ReviewSession.open('cap', { captures: capturesOf(detailOf(RECORDED)), recipes })
 
-    review.approveReads()
+    approveReads(review)
     expect(await review.save()).toEqual({ recipe: 'shop-orders', tools: 2 })
 
     const recipe = recipes.recipe('shop-orders')
@@ -245,7 +263,7 @@ describe('a capture carrying a credential cannot become a recipe (TR-6)', () => 
 
   it('fails on the recipe gate before a single fixture is written', async () => {
     const review = await openReview(leakedAuth)
-    review.approveReads()
+    approveReads(review)
 
     // The auth block is what the capture implies, so the token would land in the recipe itself.
     await expect(review.save()).rejects.toThrow(/credential at \$\.auth\.credential_source\[0\]\.expression/)
@@ -258,7 +276,7 @@ describe('a capture carrying a credential cannot become a recipe (TR-6)', () => 
       exchange(0, { url: `https://app.test/api/orders?share=${JWT}` }),
       exchange(1, { url: `https://app.test/api/orders?share=${JWT}x` }),
     ])
-    review.approveReads()
+    approveReads(review)
 
     // `toFixture` copied `exchange.url` verbatim while re-redacting the headers and bodies beside
     // it, so the token reached a file `exportRecipe` writes out.
@@ -272,7 +290,7 @@ describe('a capture carrying a credential cannot become a recipe (TR-6)', () => 
       exchange(0, { url: `https://app.test/api/orders?${JWT}=1&page=2` }),
       exchange(1, { url: `https://app.test/api/orders?${JWT}=1&page=3` }),
     ])
-    review.approveReads()
+    approveReads(review)
 
     // A parameter name becomes an `input_schema` property, so this one is caught by the recipe
     // gate before any fixture is written — and the gate sees it only because `findSurvivingSecrets`

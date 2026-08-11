@@ -1,6 +1,9 @@
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { DouzeError, type RelayRequest, type RelayResponse, type SideEffect } from '@douze/shared'
 import {
+  DEFAULT_TIMEOUT_MS,
   MAX_RESULT_BYTES,
   RateLimiter,
   attachedSurface,
@@ -229,6 +232,23 @@ describe('session-expiry classification (AC-EXE-002.1)', () => {
   })
 })
 
+// --- the per-call ceiling --------------------------------------------------
+
+/**
+ * What actually caps a call is `@douze/mcp-host`'s own timer: past it the host has already told
+ * the client `timeout` and dropped our `tool.result`, so a longer ceiling here buys nothing and
+ * only costs the named refusal. Read out of the host's source rather than asserted as a literal,
+ * so raising either constant past the other fails here instead of in production.
+ */
+describe('the per-call ceiling (T-015.9)', () => {
+  it('stays under the ceiling the host gives up at', () => {
+    const host = readFileSync(join(import.meta.dirname, '..', '..', 'mcp-host', 'src', 'host.ts'), 'utf8')
+    const declared = host.match(/CALL_TIMEOUT_MS = ([\d_]+)/)?.[1]
+    expect(declared).toBeDefined()
+    expect(DEFAULT_TIMEOUT_MS).toBeLessThan(Number((declared as string).replaceAll('_', '')))
+  })
+})
+
 // --- the rate limiter ------------------------------------------------------
 
 describe('per-tool rate limiting under service-worker eviction (AC-EXE-003.1)', () => {
@@ -270,14 +290,34 @@ describe('per-tool rate limiting under service-worker eviction (AC-EXE-003.1)', 
     }
   })
 
+  /**
+   * One call per tool under a limit of 5 proved nothing: no tool was ever throttled, and sorting
+   * the order erased the ordering the assertion was about — collapsing the limiter onto a single
+   * shared bucket left the whole suite green. So this exhausts `a`'s window first and asserts `b`
+   * runs while `a` is still parked behind it.
+   */
   it('gives each tool its own queue, so a throttled tool never blocks another', async () => {
-    const limiter = new RateLimiter()
-    const order: string[] = []
-    await Promise.all([
-      limiter.run('a', 5, async () => void order.push('a')),
-      limiter.run('b', 5, async () => void order.push('b')),
-    ])
-    expect(order.sort()).toEqual(['a', 'b'])
+    vi.useFakeTimers()
+    try {
+      // A ceiling above the 60 s window, so the second `a` waits rather than being refused; the
+      // point here is the queue, not the bound.
+      const limiter = new RateLimiter(90_000)
+      const order: string[] = []
+      const run = (key: string, label: string): Promise<void> =>
+        limiter.run(key, 1, async () => void order.push(label))
+
+      await run('a', 'a1')
+      const parked = run('a', 'a2')
+      await run('b', 'b1')
+
+      // `a2` is waiting out `a`'s window; `b` shares neither the bucket nor the chain.
+      expect(order).toEqual(['a1', 'b1'])
+      await vi.advanceTimersByTimeAsync(60_000)
+      await parked
+      expect(order).toEqual(['a1', 'b1', 'a2'])
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 
@@ -377,6 +417,16 @@ const ok = (body: unknown): RelayResponse => ({
   headers: {},
   body,
   duration_ms: 5,
+  redirected_to_login: false,
+})
+
+/** What `executeRelay` answers with when it could not run the call at all — `fail()` in relay.ts. */
+const failed = (error: string): RelayResponse => ({
+  id: 'r',
+  ok: false,
+  headers: {},
+  duration_ms: 5,
+  error,
   redirected_to_login: false,
 })
 
@@ -495,6 +545,45 @@ describe('one inbound tool.call, end to end (T-015.9)', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  /**
+   * `executeRelay` answers with `error` set for everything it could not do locally, and every one
+   * of those used to come back `extension_disconnected` / `retryable: true` — including the two an
+   * agent can retry forever without ever fixing: a host permission only a click in Chrome grants,
+   * and an executor tab that could not be opened on the target origin.
+   */
+  it('reports a missing host permission as something no retry can fix, and names the fix', async () => {
+    const outcome = await runToolCall(
+      { name: 'jira_list', args: {}, trust: 'remote' },
+      deps(async () =>
+        failed(
+          'Douze has no permission for https://jira.test, so it cannot run this there. Click the ' +
+            'Douze button in Chrome, record the site again, and allow the permission it asks for.',
+        ),
+      ),
+    )
+    expect(outcome.error?.code).toBe('permission_required')
+    expect(outcome.error?.retryable).toBe(false)
+    expect(outcome.error?.message).toContain('allow the permission it asks for')
+  })
+
+  it('reports an executor tab that could not be opened the same way', async () => {
+    const outcome = await runToolCall(
+      { name: 'jira_list', args: {}, trust: 'local' },
+      deps(async () => failed('could not open an executor tab on https://jira.test: Error: no window')),
+    )
+    expect(outcome.error?.code).toBe('executor_unavailable')
+    expect(outcome.error?.retryable).toBe(false)
+  })
+
+  it('leaves a failure inside the page retryable, because the next attempt may well work', async () => {
+    const outcome = await runToolCall(
+      { name: 'jira_list', args: {}, trust: 'local' },
+      deps(async () => failed('Failed to fetch')),
+    )
+    expect(outcome.error?.code).toBe('extension_disconnected')
+    expect(outcome.error?.retryable).toBe(true)
   })
 
   it('audits every call with the tool, the trust level and how it ended', async () => {
