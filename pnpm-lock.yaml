@@ -113,6 +113,9 @@ importers:
 
   packages/relay:
     dependencies:
+      '@douze/mcp-host':
+        specifier: workspace:*
+        version: link:../mcp-host
       '@douze/shared':
         specifier: workspace:*
         version: link:../shared
