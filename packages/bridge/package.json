@@ -12,7 +12,7 @@
   "dependencies": {
     "@douze/mcp-host": "workspace:*",
     "@douze/shared": "workspace:*",
-    "ws": "8.18.3"
+    "ws": "8.21.2"
   },
   "devDependencies": {
     "@types/ws": "8.18.1",

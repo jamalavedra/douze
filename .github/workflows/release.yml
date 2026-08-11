@@ -36,7 +36,8 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       # WO-015 T-015.13 — the extension is the only artifact. The daemon, the `douze` CLI and the
-      # `.mcpb` that existed to spawn them are gone; `@douze/bridge` ships over npx, not here.
+      # `.mcpb` that existed to spawn them are gone. `@douze/bridge` is not published: a developer
+      # who wants the local pipe builds it from the repo (see packages/bridge/README.md).
       - name: Build the release artifacts
         run: pnpm release:local
 

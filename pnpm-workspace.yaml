@@ -1,2 +1,7 @@
 packages:
   - packages/*
+
+# A version published minutes ago is the shape a supply-chain attack arrives in. Waiting a day
+# means a compromised release is usually pulled before any clone or CI run can install it. This
+# belongs in the repo rather than a developer's global config so CI and every clone enforce it.
+minimumReleaseAge: 1440
