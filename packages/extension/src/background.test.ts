@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { Recipe, codeKey, mintNonce, proof, secretHashKey, sha256Hex } from '@douze/shared'
+import { Recipe, codeKey, mintNonce, mintSalt, proof, secretHashKey, sha256Hex } from '@douze/shared'
 import type { RelayPairing } from './attach.js'
 import type { ConnectState, DataState, PageEvent, ReviewState } from './messages.js'
 import { RecipeStore } from './recipes.js'
@@ -697,25 +697,29 @@ const pushedNames = (socket: FakeSocket): string[][] =>
 const challenge = async (
   socket: FakeSocket,
   credential: { code?: string; secret?: string },
-  tricks: { proof?: string; nonce?: string } = {},
-): Promise<{ nonce: string; proof: string }> => {
+  tricks: { proof?: string; nonce?: string; salt?: string } = {},
+): Promise<{ nonce: string; proof: string; salt: string }> => {
   const hello = socket.frames('hello')[0] ?? {}
   const extensionNonce = String(hello['nonce'] ?? '')
   const bridgeNonce = tricks.nonce ?? mintNonce()
   const port = Number(new URL(socket.url).port)
+  // A bridge running on a code salts it per process and says so here; one running on the stored
+  // secret stretches nothing and sends no salt at all.
+  const salt = credential.secret === undefined ? (tricks.salt ?? mintSalt()) : ''
   const key =
     credential.secret === undefined
-      ? await codeKey(credential.code ?? '')
+      ? await codeKey(credential.code ?? '', salt)
       : await secretHashKey(await sha256Hex(credential.secret))
   const frame = {
     type: 'bridge.challenge',
     nonce: bridgeNonce,
-    proof: tricks.proof ?? (await proof(key, { role: 'bridge', port, extensionNonce, bridgeNonce })),
+    ...(salt ? { salt } : {}),
+    proof: tricks.proof ?? (await proof(key, { role: 'bridge', port, extensionNonce, bridgeNonce, salt })),
   }
   socket.deliver(frame)
   // The proof is Web Crypto, so the worker answers a macrotask or several later, not synchronously.
   await until(() => socket.frames('bridge.proof').length > 0)
-  return { nonce: bridgeNonce, proof: frame.proof }
+  return { nonce: bridgeNonce, proof: frame.proof, salt }
 }
 
 /** Waits for something the worker does asynchronously, or gives up and lets the assertion fail. */
@@ -1031,18 +1035,30 @@ describe('a call in flight when the socket drops (T-015.8)', () => {
 })
 
 describe('a host that refuses the pairing (T-015.8/12)', () => {
-  it('stops dialling the bridge on 1008 and asks for a code instead of retrying forever', async () => {
+  /**
+   * A 1008 from a bridge port is the word of a peer that has proved nothing — binding one of
+   * 8912–8916 takes no privilege — so it stops that port and touches nothing else. It used to
+   * overwrite the stored pairing with `{ blocked: true }`, which handed any local process a
+   * one-frame way to unpair the user's real bridge and stop all five ports for good; a paired
+   * bridge prints no new code, so there was no way back.
+   */
+  it('stops dialling the port that said 1008, and leaves the pairing it cannot vouch for alone', async () => {
     const socket = await attach({ 'attach:bridge': { secret: 'stale' } }, '127.0.0.1')
-    const before = FakeSocket.opened.length
+    const port = new URL(socket.url).port
     socket.drop(1008)
     await settle()
 
     expect(fake.notifications.at(-1)?.title).toContain('could not pair')
-    expect(fake.local.get('attach:bridge')).toEqual({ blocked: true })
+    // Storage is for the user and for peers that proved themselves. This peer is neither.
+    expect(fake.local.get('attach:bridge')).toEqual({ secret: 'stale' })
 
     fake.onAlarm.emit({ name: 'douze-attach' })
     await settle()
-    expect(FakeSocket.opened.length).toBe(before)
+    // That port is done for this worker's life; the other four are still swept, because a squatter
+    // on one must not be able to silence the range a real bridge might be listening on.
+    const dialledAgain = FakeSocket.opened.filter((opened) => opened.url.includes('127.0.0.1'))
+    expect(dialledAgain.filter((opened) => new URL(opened.url).port === port)).toHaveLength(1)
+    expect(dialledAgain.length).toBeGreaterThan(1)
   })
 
   it('stops re-dialling a relay that rejected its token, and says the link needs remaking', async () => {

@@ -63,13 +63,15 @@ export interface RelayPairing {
  * The bridge half. `secret` is the 32-byte credential the bridge minted on the first pairing and
  * handed back on the raw `welcome` — after the handshake, never before it; `code` is what the user
  * typed in from the bridge's stderr and is spent the moment a pairing succeeds. Neither is ever
- * put on the wire: both are only ever HMAC keys. `blocked` means a host answered 1008 — see
- * `onClose`.
+ * put on the wire: both are only ever HMAC keys.
+ *
+ * Nothing else belongs here, and in particular a refusal does not: this object is only ever written
+ * by the user typing a code or by a bridge that PROVED itself, never by a peer that merely closed a
+ * socket (see `refused`).
  */
 export interface BridgePairing {
   secret?: string
   code?: string
-  blocked?: boolean
 }
 
 /** Per-trust exemptions from the result secret gate. See `gateResult` for why it is split. */
@@ -223,9 +225,17 @@ class Attachment {
     const bridgeNonce = payload['nonce']
     if (!isNonce(bridgeNonce)) return
     this.challenged = true
-    const key = await this.handshakeKey()
+    const salt = payload['salt']
+    const key = await this.handshakeKey(salt)
     if (!key) return
-    const transcript = { port: this.target.port, extensionNonce: this.nonce, bridgeNonce }
+    // `''` unless the far side is running on a code: an unsalted transcript and a salted one are
+    // different strings, so the two ends cannot half-agree about which they are proving.
+    const transcript = {
+      port: this.target.port,
+      extensionNonce: this.nonce,
+      bridgeNonce,
+      salt: typeof salt === 'string' ? salt : '',
+    }
     const expected = await proof(key, { role: 'bridge', ...transcript })
     if (!proofMatches(expected, payload['proof'])) return
     if (this.socket !== socket || socket.readyState !== 1) return
@@ -234,11 +244,16 @@ class Attachment {
     this.send(socket, { type: 'bridge.proof', proof: await proof(key, { role: 'extension', ...transcript }) })
   }
 
-  /** `sha256(secret)` once paired — what the bridge stores — or the stretched code before that. */
-  private async handshakeKey(): Promise<CryptoKey | null> {
+  /**
+   * `sha256(secret)` once paired — what the bridge stores — or the stretched code before that,
+   * against the salt the bridge minted for its code. A code with no salt on the challenge is not
+   * derivable: a bridge running on a code always sends one.
+   */
+  private async handshakeKey(salt: unknown): Promise<CryptoKey | null> {
     const pairing = this.manager.bridge
     if (pairing.secret) return secretHashKey(await sha256Hex(pairing.secret))
-    return pairing.code ? codeKey(pairing.code) : null
+    if (!pairing.code || !isNonce(salt)) return null
+    return this.manager.stretch(pairing.code, salt)
   }
 
   private onWelcome(socket: WebSocket, heartbeatMs: number, payload: unknown): void {
@@ -337,6 +352,22 @@ class Manager {
    */
   private refusedToken: string | null = null
   /**
+   * Bridge ports that answered 1008, held **in memory and per port**. Nothing about a refusal is
+   * written down: a 1008 can come from any process that got to a loopback port first, and none of
+   * them has proved anything. Per port, because five ports are dialled and a squatter on one must
+   * not silence the four a real bridge might be on; in memory, because a worker Chrome respawns
+   * should try once more in case that port has a real bridge on it now.
+   */
+  private readonly refusedBridges = new Set<string>()
+  /**
+   * The stretched pairing code, kept for as long as the code and salt behind it hold.
+   *
+   * `codeKey` is 600 000 PBKDF2 rounds and five ports are dialled on every 30-second alarm, so a
+   * derivation per socket would have a pending code cost ~1.5 s of worker CPU per tick. This is the
+   * mirror of the cache the bridge keeps for exactly the same reason.
+   */
+  private stretched: { code: string; salt: string; key: Promise<CryptoKey> } | null = null
+  /**
    * A relay refusal waiting to be explained to the user, held until the next tick.
    *
    * The relay closes the old socket 1008 the moment it answers `POST /rotate`, which the user just
@@ -356,6 +387,22 @@ class Manager {
   /** Whether anything at all is up right now — what the connect page shows. */
   get connected(): boolean {
     return [...this.attachments.values()].some((attachment) => attachment.connected)
+  }
+
+  /** Whether a bridge that proved itself is attached right now. */
+  private get bridgeUp(): boolean {
+    return [...this.attachments.values()].some(
+      (attachment) => attachment.target.kind === 'bridge' && attachment.connected,
+    )
+  }
+
+  /**
+   * What the connect page calls a refused bridge: a port said 1008 and nothing else took its place.
+   * Not stored, so it is gone when the worker is — which is right for a claim made by a peer that
+   * proved nothing, and it means the page stops saying "refused" the moment a real bridge attaches.
+   */
+  get bridgeRefused(): boolean {
+    return this.refusedBridges.size > 0 && !this.bridgeUp
   }
 
   private async load(): Promise<void> {
@@ -379,8 +426,19 @@ class Manager {
     const relay = this.relay && this.relay.token !== this.refusedToken ? relayTarget(this.relay) : null
     this.drop('relay:', relay?.key)
     if (relay) this.attachment(relay).connect()
-    if (this.bridge.blocked || (!this.bridgePaired && !this.bridge.code)) return this.drop('bridge:')
-    for (const port of BRIDGE_PORT_RANGE) this.attachment(bridgeTarget(port)).connect()
+    if (!this.bridgePaired && !this.bridge.code) return this.drop('bridge:')
+    for (const port of BRIDGE_PORT_RANGE) {
+      const target = bridgeTarget(port)
+      if (!this.refusedBridges.has(target.key)) this.attachment(target).connect()
+    }
+  }
+
+  /** The stretched code, derived at most once per (code, salt) pair. See `stretched`. */
+  stretch(code: string, salt: string): Promise<CryptoKey> {
+    if (this.stretched?.code === code && this.stretched.salt === salt) return this.stretched.key
+    const key = codeKey(code, salt)
+    this.stretched = { code, salt, key }
+    return key
   }
 
   /** T-015.9 — exempt (or re-gate) one tool's results at one trust level. */
@@ -403,9 +461,18 @@ class Manager {
   }
 
   /**
-   * A host said 1008. For the bridge that means the code was wrong or the credential was rebuilt
-   * without us; either way another dial cannot help, so bridge dialling stops until the user
-   * supplies a fresh code. For the relay it means the token is dead and the link must be remade.
+   * A host said 1008.
+   *
+   * For the relay that is authenticated — the token was presented over TLS to the address the user
+   * configured — so it means the token is dead and the link must be remade.
+   *
+   * For a bridge it is **the word of a peer that has proved nothing**: binding one of 8912–8916
+   * takes no privilege, and an unverified close is exactly what a squatter can produce on demand.
+   * So it costs that one port and nothing else. It must never touch storage: wiping the pinned
+   * secret here would let any local process unpair the user's real bridge with a single close, and
+   * a paired bridge prints no new code to recover with. It is also ordinary traffic — two clients
+   * each spawn a bridge, and the one the user did not type a code for refuses on its own deadline
+   * seconds after the other paired.
    */
   async refused(target: Target): Promise<void> {
     if (target.kind === 'relay') {
@@ -414,13 +481,17 @@ class Manager {
       this.drop('relay:')
       return
     }
-    this.bridge = { blocked: true }
-    await chrome.storage.local.set({ [BRIDGE_KEY]: this.bridge })
-    this.drop('bridge:')
+    this.refusedBridges.add(target.key)
+    this.drop(target.key)
+    // Only when no bridge is actually up: with a working one attached, this is a port the user has
+    // no reason to hear about. With none, it is the one signal that says the code did not take — a
+    // wrong code produces exactly this, because the extension goes quiet on a proof it cannot
+    // verify and the bridge closes the socket a moment later.
+    if (this.bridgeUp) return
     this.deps.notify(
       'douze-bridge-refused',
       'Douze could not pair with the app on this computer',
-      'Restart the app that runs Douze, then open the extension and enter the pairing code it prints.',
+      'Check the pairing code the app printed and enter it again. If it has expired, restart the app for a fresh one.',
     )
   }
 
@@ -428,6 +499,7 @@ class Manager {
   async pair(code: string): Promise<void> {
     this.bridge = { code: code.trim() }
     await chrome.storage.local.set({ [BRIDGE_KEY]: this.bridge })
+    this.refusedBridges.clear()
     this.drop('bridge:')
     await this.tick()
   }
@@ -504,6 +576,7 @@ export function startAttachments(deps: AttachDeps): {
   tick: () => Promise<void>
   pushSurface: () => void
   connected: () => boolean
+  bridgeRefused: () => boolean
   pair: (code: string) => Promise<void>
   setExposed: (trust: Trust, tool: string, allow: boolean) => Promise<void>
 } {
@@ -516,6 +589,7 @@ export function startAttachments(deps: AttachDeps): {
     tick: () => created.tick(),
     pushSurface: () => created.pushSurface(),
     connected: () => created.connected,
+    bridgeRefused: () => created.bridgeRefused,
     pair: (code) => created.pair(code),
     setExposed: (trust, tool, allow) => created.setExposed(trust, tool, allow),
   }

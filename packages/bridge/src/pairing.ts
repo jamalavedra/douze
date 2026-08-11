@@ -26,22 +26,31 @@ import { dirname, join } from 'node:path'
  * 4. Every later run reads that file and never prompts again.
  *
  * The code is short because a human retypes it into the extension; the credential it buys is not,
- * because nothing retypes that. `ATTEMPTS` closes the gap between the two — see below.
+ * because nothing retypes that. The gap between the two is closed by making each guess expensive
+ * (PBKDF2), making the work non-reusable across installs (a per-process salt), and giving the code
+ * a lifetime — not by the attempt cap, which only bounds guessing done at the bridge.
  */
 
 /**
  * Crockford's alphabet minus the characters people transcribe wrongly (0/O, 1/I/L, U).
- * 8 characters is ~39 bits, which is only safe alongside the attempt cap below.
+ *
+ * 8 characters is ~39 bits, and what makes that safe is **not** the attempt cap below: the bridge
+ * answers a challenge to anything that says hello, so one captured challenge is an offline oracle
+ * and no cap on this process can slow a search that is not running against it. What pays for 39
+ * bits is the cost of a candidate (600 000 PBKDF2 rounds), the per-process salt that stops one
+ * table from being computed once and spent against every install, and the ten minutes the code
+ * stays alive at all (`CODE_TTL_MS` in bridge.ts).
  */
 const ALPHABET = '23456789ABCDEFGHJKMNPQRSTVWXYZ'
 const CODE_LENGTH = 8
 
 /**
- * Failed attachments allowed before this process refuses every socket for the rest of its life.
+ * Wrong proofs allowed before this process refuses every socket for the rest of its life.
  *
- * This is what makes a 39-bit code safe on a port every local process can reach: at ten guesses
- * per process, brute force needs ~10^10 bridge restarts, and only the user's own MCP client can
- * restart a bridge. Without it the code alone would be guessable in an afternoon.
+ * This is the online bound and only the online bound: guessing the credential *at* the bridge costs
+ * one of these per guess, so ten is all a guesser gets. It is deliberately not spent on peers that
+ * merely take a challenge and leave — see `turnAway` in bridge.ts, where counting those would hand
+ * any local process a ten-socket way to lock the user out of their own pairing.
  */
 export const ATTEMPTS = 10
 
@@ -82,8 +91,9 @@ export const readCredential = (): Credential | null => {
 
 /**
  * `mode` only applies when the file is created, so a re-pair over an existing file would keep
- * whatever permissions that one had — hence the explicit chmod, the same correction
- * `packages/cli/src/remote-bridge.ts` had to make for `relay.json`.
+ * whatever permissions that one had — hence the explicit chmod. This is the only credential Douze
+ * writes to disk at all: the relay pairing lives in extension storage (`attach:relay`), so there is
+ * no second file to keep in step with this one.
  */
 export const writeCredential = (secret: string): Credential => {
   const credential: Credential = { secret_hash: sha256(secret).toString('hex'), paired_at: new Date().toISOString() }
