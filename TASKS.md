@@ -401,76 +401,118 @@ per-client adapters.
 
 ---
 
-## WO-015 — Extension-only: the extension becomes the whole product (PLANNED)
+## WO-015 — One brain, two pipes: the extension becomes the product (PLANNED)
 
-Decided 2026-08-11. A consumer with no terminal has nothing that starts douzed: the `.mcpb` was
+Decided 2026-08-11. A consumer with no terminal has nothing that starts douzed — the `.mcpb` was
 doing that job by proxy, because Claude Desktop spawns `douze --mcp` and that process hosts the
-daemon. Dropping `.mcpb` therefore means dropping the daemon, and the extension — which already
-captures, redacts, and executes — takes over storage, recipes, inference, review, and the relay
-connection. One Web Store install, no Node, no terminal, no launcher, no code signing.
+daemon. So the extension, which already captures, redacts and executes, takes over storage,
+recipes, inference, review and the outbound connection, and the stateful daemon goes away.
 
-### What three spikes established (2026-08-11)
+**The shape.** The extension is the single source of truth and the only thing a consumer installs.
+Two transports attach to it and hold no state of their own:
 
-- **The MCP SDK runs under MV3.** It selects ajv (which uses `new Function`) only under Node export
-  conditions; a browser-target bundle resolves `@cfworker/json-schema`, a pure interpreter. Verified
-  by bundling `McpServer` for the browser and running initialize/tools/list/tools/call under
-  `node --disallow-code-generation-from-strings`, which imposes MV3's restriction. ~230 KB minified
-  (~530 KB if `incur` comes along, which it need not — the extension can register tools straight
-  from the registry). Guard the build with a grep for `new Function` in the worker bundle: a
-  bundler config that forces Node conditions would silently swap ajv back in.
-- **Session state cannot live in the worker.** Chrome evicts service workers at will and an
-  incoming WebSocket frame cannot wake a dead one — only extension events can, and `chrome.alarms`
-  has a 30-second floor. An in-flight call cannot be persisted. **Therefore the relay owns MCP
-  sessions**: it terminates `initialize` and `tools/list` from a tool surface the extension pushes
-  on connect, and forwards only `tools/call`. The extension stays a stateless executor that
-  reconnects, which is what its 20 s heartbeat and reconnect alarm already do. This also fixes a
-  user-visible case: a connector added while Chrome is closed would otherwise list zero tools.
-  Consequence to disclose: **the relay now holds tool names, descriptions, and schemas** per user,
-  which its log discipline deliberately excludes today.
-- **Most logic is portable.** Inference is pure TS. Descriptions already default to a deterministic
-  template with no model call (Q3: the offline proxy scores 96.4% against a ≥90% bar; the model
-  path's headroom is 100%), so shipping template-only is defensible and the model path can return
-  behind an options page. The review UI is one self-contained HTML string and becomes an extension
-  page, which deletes the expired-link failure mode entirely.
+```
+  ChatGPT / claude.ai / Dust ──https──▶ relay ──┐
+                                                ├──ws──▶ EXTENSION ──▶ your signed-in tabs
+  Claude Code / Cursor / Desktop ──stdio──▶ bridge ──┘        (recipes, storage, inference,
+                                                               review UI, guards, audit)
+```
 
-### What it costs, recorded before starting rather than discovered later
+Both speak the **same attachment protocol** to the extension, which therefore has one
+implementation and does not care which is on the far side. The relay is the cloud pipe already
+built and deployed (WO-014); the bridge is a new ~200-line local pipe that restores stdio MCP for
+developer clients. Neither may ever hold recipes, storage or inference — if a pipe grows state,
+this design has failed.
 
-- **Local stdio MCP dies.** An extension cannot speak stdio or listen on a port, and native
-  messaging needs a local binary — a daemon by another name. Claude Desktop, Claude Code, Cursor,
-  VS Code and Windsurf would attach through the relay instead, inheriting WO-014's scoping: reads
-  always, writes only on `--allow-writes`, **destructive never, with no configuration that puts
-  them back**, plus a third party in the data path where there was a 1.2 ms loopback hop. This is
-  the sharpest regression in the port and it lands on the audience that exists today.
-- **Gone outright:** headless mode (definitionally — it exists to run with Chrome closed), the CLI,
-  `.mcpb`, eject as it stands, hand-editable git-diffable recipe YAML, `tail`-able audit files, and
-  doctor's git-commit patches.
-- **Needs replacement, not porting:** SQLite → IndexedDB, the recipes directory → extension
-  storage, JSONL audit → a stored ring buffer with a viewer.
-- **Test blast radius:** ~190 unit tests and all 51 e2e specs are invalidated or need a new
-  extension-only harness. The current architecture has never passed C-1 either, so this rewrites the
-  local half before the product has been proven once against a real dashboard.
+**Trust is a property of the attachment, decided by the extension, never claimed by the pipe.**
+The extension derives it from what it dialled: a loopback `ws://127.0.0.1` bridge that the user
+paired in person is `local`; anything else is `remote`. Guards live in the extension in one place
+and read that level:
 
-### The variant that keeps the developer path (decide at the end of phase 1, not now)
+| | `remote` (relay) | `local` (bridge) |
+|---|---|---|
+| read tools | always | always |
+| write tools | opt-in per attachment | always |
+| destructive tools | never, no setting restores them | allowed, `confirm: true` required |
+| result secret gate | enforced, `expose` list to exempt | enforced |
 
-Phase 1 is identical either way, so it does not block: the extension becomes self-sufficient and
-consumers install nothing else. Afterwards the daemon can either be deleted outright, or shrink to
-a **thin transport shim** — no storage, no registry, no inference, ~200 lines — that a developer
-installs deliberately and the extension dials on loopback exactly as it dials the relay, restoring
-local stdio MCP with full trust and no cloud in the path. That is a smaller daemon, not a second
-implementation of anything.
+This is why the developer regression the earlier plan accepted does not happen: Claude Code keeps
+everything it has today, with no cloud in the path. The rule "destructive is never remote" stops
+being arbitrary — a relay operator or a stolen URL can forge a `confirm` argument, a process on
+your own machine that you paired is a different claim.
 
-### Tasks
+### Package graph after the port
 
-- [ ] T-015.1 — Extension storage: IndexedDB for sessions/exchanges/annotations replacing `capture-store.ts`, keeping **one** write path that re-applies redaction and throws on `findSurvivingSecrets` — the gate exists because HAR import bypasses the extension's own redaction, so any future ingest must route through it too.
-- [ ] T-015.2 — Recipes and fixtures in extension storage replacing `registry.ts`, with `storage.onChanged` as the hot-reload signal and `parseRecipe` unchanged.
-- [ ] T-015.3 — Port the inference engine and deterministic descriptions into the extension; model descriptions behind an options page, absent by default.
-- [ ] T-015.4 — Review as an extension page reusing `app.ts`; the connect page from the abandoned no-terminal branch (`worktree-agent-ac11a15a706492d83`) ports here.
-- [ ] T-015.5 — Extension-side execution guards: destructive confirm, degraded refusal, per-tool rate limit, timeout, session-expiry classification, result shaping, audit — all currently daemon-owned and all of which must run before dispatch on every inbound path.
-- [ ] T-015.6 — Relay-owned sessions: the relay answers `initialize`/`tools/list` from a surface the extension pushes on connect and forwards `tools/call`; extension bridge with reconnect on `chrome.alarms`; relay grace period (~35–45 s) for a waking worker, and **never** auto-re-execute a call in flight at disconnect.
-- [ ] T-015.7 — Pairing without a terminal: connect/rotate/disconnect from an extension page, credential in extension storage.
-- [ ] T-015.8 — New e2e harness driving the extension with no daemon, replacing the 51 specs that boot douzed.
+| Package | Role |
+|---|---|
+| `@douze/shared` | schemas, redaction, protocols — unchanged |
+| `@douze/studio` | inference, descriptions, review page — becomes a library the extension bundles; its server-side halves go |
+| `@douze/extension` | the product |
+| `@douze/mcp-host` | **new** — MCP termination + the attachment protocol, shared by both pipes |
+| `@douze/relay` | HTTP/WSS transport, multi-tenant auth — keeps its own concerns, gains `mcp-host` |
+| `@douze/bridge` | **new** — stdio transport + loopback WS + pairing |
+| ~~`@douze/douzed`~~, ~~`@douze/cli`~~ | deleted at the end of phase 4 |
 
----
+One MCP termination implementation serving two transports is the point; two would be the failure.
+
+### The attachment protocol (the linchpin — settle it before phases 2 and 3)
+
+Extension → host: `hello{extension_version}`, `pong`, `surface.push{tools[]}` on connect and on
+every recipe change, `tool.result{id, result | error}`.
+Host → extension: `welcome{heartbeat_ms}`, `ping`, `tool.call{id, name, args, trust}`.
+
+The host owns MCP sessions entirely — `initialize` and `tools/list` are answered from the cached
+surface, so a connector added while Chrome is closed still lists tools instead of looking broken,
+and a `surface.push` becomes `notifications/tools/list_changed`. The extension tracks no session
+state, because a service worker Chrome can evict cannot hold any: an in-flight promise is not
+persistable and an inbound frame cannot wake a dead worker. `tool.call` is the only thing that
+needs the browser awake, which is a constraint Douze already has.
+
+### Phases
+
+Each phase ends somewhere shippable. Phase 0 is not optional.
+
+**Phase 0 — de-risk before rewriting (days).** Close C-1 on the *current* architecture: record a
+real Openfort session, approve, and complete a read from a client. Answer Q5 — whether MAIN-world
+interception survives real sites' CSP — on three real targets. Both test exactly the parts this
+port carries over unchanged (inference is pure TS, execution already lives in the extension), so a
+failure here invalidates the product, not just the plan. Also open the Chrome Web Store listing
+early: review latency and the data-disclosure wording are on the critical path and neither is code.
+
+**Phase 1 — the extension stands alone (1–2 weeks).** Capture → approve → recipes, with no daemon
+running at all.
+- [ ] T-015.1 — IndexedDB replaces `capture-store.ts`: sessions, exchanges ordered by `(session_id, position)`, annotation spans. **Exactly one write path**, re-applying redaction and throwing on `findSurvivingSecrets`. That gate exists because HAR import bypasses the extension's own redaction; any future ingest must route through it or the guarantee is silently gone. `unlimitedStorage` permission.
+- [ ] T-015.2 — Recipes and fixtures in extension storage replacing `registry.ts`; `storage.onChanged` is the hot-reload signal; `parseRecipe` unchanged. Plus **export/import as the same YAML** — a download and a file picker. Recipes stay readable, diffable and portable, which is a stated principle, and it doubles as the migration path off `~/.douze/recipes`.
+- [ ] T-015.3 — Port the inference engine and deterministic descriptions unchanged (both are pure TS). Model descriptions behind an options page, off by default: template-only already scores 96.4% against a ≥90% bar (Q3). **Cap any model fetch under 30 s** — a worker-issued fetch that takes longer is a documented worker-kill condition.
+- [ ] T-015.4 — Review as an extension page reusing `app.ts`, which deletes the expired-link failure mode. The connect page from the abandoned branch (`worktree-agent-ac11a15a706492d83`) ports here alongside it.
+- [ ] T-015.5 — HAR import in the extension behind a file picker, routed through T-015.1's gate.
+- [ ] V-015.1 — With the daemon binary absent from the machine: record on the fixture, infer, approve, and see the recipe in storage; a capture carrying a JWT is refused by the gate; export then re-import round-trips a recipe byte-identically.
+
+**Phase 2 — the cloud pipe (1 week).** Hosted assistants work end to end.
+- [ ] T-015.6 — `@douze/mcp-host`: MCP termination (initialize, tools/list from cached surface, tools/call → `tool.call`, listChanged on `surface.push`) plus the attachment protocol, transport-agnostic.
+- [ ] T-015.7 — Relay adopts `mcp-host` and stops forwarding opaque JSON-RPC: it owns sessions, caches each endpoint's surface, and applies a ~35–45 s grace period for a waking worker. **Never auto-re-execute a call in flight at disconnect** — tools can be writes; fail with a retryable error. Disclose that the relay now holds tool names, descriptions and schemas, which its log discipline excludes today.
+- [ ] T-015.8 — Extension attachment client: one outbound WS implementation, reconnect on `chrome.alarms` (30 s floor), 20 s heartbeat, surface push on change.
+- [ ] T-015.9 — Guards in the extension, trust-aware and running before dispatch on every inbound path: destructive confirm, degraded refusal, per-tool rate limit, timeout, session-expiry classification, result shaping, result secret gate, audit.
+- [ ] T-015.10 — Connect / rotate / disconnect from an extension page; pairing credential in extension storage; the URL shown once with a copy button and the trust disclosure.
+- [ ] V-015.2 — A fake connector speaking streamable-HTTP MCP completes list + read with no daemon anywhere; a write is refused until opted in; a destructive call is refused whatever it sends; the same run against the deployed relay.
+
+**Phase 3 — the local pipe (3–5 days).** Developer clients come back at full trust.
+- [ ] T-015.11 — `@douze/bridge`: stdio MCP ↔ loopback WS, built on `mcp-host`, no state. Distributed for people who have a terminal (`npx`), never required by a consumer.
+- [ ] T-015.12 — Pairing so a random local process cannot silently attach and inherit `local` trust: the bridge presents a code, the user confirms it in the extension, the extension pins it. Loopback alone is not consent.
+- [ ] V-015.3 — A real stdio client (Claude Code) lists and calls tools through the bridge; a destructive tool succeeds with `confirm: true` and is refused without it; an unpaired bridge is refused.
+
+**Phase 4 — retire the daemon (1 week + review latency).**
+- [ ] T-015.13 — Delete `@douze/douzed` and `@douze/cli`. No shims, no re-exports. Headless mode and `.mcpb` go with them; eject is dropped rather than half-ported, and is a future work order if wanted.
+- [ ] T-015.14 — New e2e harness driving the extension with no daemon, replacing the 51 specs that boot douzed. Keep the fixture app and the artifact secret-sweep.
+- [ ] T-015.15 — Docs rewritten for one install: README, INTERN_VERIFICATION's inventories, and a migration note for anyone with recipes in `~/.douze`.
+- [ ] V-015.4 — Full suite green on the new harness; secret sweep clean over extension storage; the Web Store build contains no `new Function` (a bundler config that forces Node conditions silently swaps ajv back in — grep the worker bundle as a build guard).
+
+### Risks held open deliberately
+
+- **Web Store review.** Broad host permissions plus an outbound connection to a third-party relay is exactly what a reviewer stops on. The per-site permission prompts help; the listing must state plainly what leaves the machine and when. Start it in phase 0.
+- **Worker eviction during long work.** Inference is fast enough, but any long-running loop or a fetch over 30 s kills the worker. Everything long must be resumable or chunked.
+- **Bundle size.** ~230 KB for MCP alone if the SDK ends up in the extension; with relay-owned sessions it should not need to be there at all.
+- **This rewrites the local half before C-1 has ever proven the product once.** Phase 0 exists precisely because of that, and is why it is not optional.
 
 ## Open Questions (PRD 5.3 — resolve during implementation)
 
