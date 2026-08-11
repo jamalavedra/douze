@@ -63,6 +63,9 @@ importers:
       '@douze/studio':
         specifier: workspace:*
         version: link:../studio
+      zod:
+        specifier: 4.4.3
+        version: 4.4.3
     devDependencies:
       '@types/chrome':
         specifier: 0.2.2

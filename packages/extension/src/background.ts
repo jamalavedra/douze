@@ -1,3 +1,5 @@
+// First, and before any schema is built: see the file for why.
+import './zod-config.js'
 import { NOISE_HOSTS, type CaptureSession, type Exchange, type NoiseConfig } from '@douze/shared'
 import type {
   CaptureBatch,

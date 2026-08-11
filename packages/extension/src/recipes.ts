@@ -93,16 +93,20 @@ export class RecipeStore {
 
   static async open(): Promise<RecipeStore> {
     const store = new RecipeStore()
-    await store.refresh()
     // AC-RUN-002.1 — an approval anywhere in the extension reaches the surface immediately;
     // `storage.onChanged` is the same signal the daemon got from chokidar, minus the debounce
     // (a `set` is atomic, so there is no half-written record to wait out).
+    //
+    // The listener goes on BEFORE the first read, not after: a write landing between the two would
+    // otherwise be missed by the read (too early) and by the listener (not yet attached), leaving a
+    // surface that is stale until the next unrelated write. Refreshing twice at startup is free.
     store.listener = (changes, area): void => {
       if (area !== 'local') return
       if (!Object.keys(changes).some(isOurs)) return
       void store.refresh()
     }
     chrome.storage.onChanged.addListener(store.listener)
+    await store.refresh()
     return store
   }
 
