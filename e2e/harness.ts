@@ -4,6 +4,12 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
+/**
+ * WO-015 T-015.13 — what is left of the harness after the daemon went: the browser launcher, the
+ * fixture app, a stdio MCP client, and `waitFor`. The `Douzed` class and `spawnMcp` booted
+ * processes that no longer exist, so they and every spec that used them are gone; see
+ * `e2e/README.md` for what T-015.14 has to put back.
+ */
 export const REPO = resolve(import.meta.dirname, '..')
 export const HELIUM = '/Applications/Helium.app/Contents/MacOS/Helium'
 export const EXTENSION = join(REPO, 'packages/extension/dist')
@@ -55,13 +61,6 @@ export async function launchHelium(
     },
   }
 }
-
-/** `douze --mcp` from source, the way every spec that is not testing the shipped bundle wants it. */
-export const spawnMcp = (home: string): ChildProcess =>
-  spawn(TSX, [join(REPO, 'packages/cli/src/bin.ts'), '--mcp'], {
-    env: { ...process.env, DOUZE_HOME: home },
-    stdio: ['pipe', 'pipe', 'pipe'],
-  })
 
 /** A server-initiated message. `params` carries progress, which COV_CON_003 asserts on. */
 export interface Notification {
@@ -184,116 +183,6 @@ export class FixtureApp {
     this.process.kill()
     await exited
     this.process = undefined as never
-  }
-}
-
-/** A douzed instance rooted at a scratch DOUZE_HOME, so specs never touch a real install. */
-export class Douzed {
-  readonly home: string
-  private process?: ChildProcess
-  port = 0
-  token = ''
-
-  /**
-   * `remote: true` boots the daemon through `douze start` instead of douzed's own bin, because
-   * the outbound relay bridge is started by the CLI's foreground path and nowhere else. It reads
-   * `relay.json` from this home at startup, so a spec writes that file before calling start().
-   */
-  constructor(readonly options: { remote?: boolean } = {}) {
-    this.home = mkdtempSync(join(tmpdir(), 'douze-home-'))
-    // Specs stage recipes and fixtures before the daemon boots, so the dirs must exist first.
-    for (const dir of ['recipes', 'fixtures']) mkdirSync(join(this.home, dir), { recursive: true })
-  }
-
-  get recipesDir(): string {
-    return join(this.home, 'recipes')
-  }
-
-  get fixturesDir(): string {
-    return join(this.home, 'fixtures')
-  }
-
-  async start(): Promise<void> {
-    const entry = this.options.remote
-      ? [join(REPO, 'packages/cli/src/bin.ts'), 'start']
-      : [join(REPO, 'packages/douzed/src/bin.ts')]
-    this.process = spawn(TSX, entry, {
-      // DOUZE_PORT=0 keeps specs off the 8787-8791 range the shipped daemon walks. Without it
-      // every scratch daemon — including the detached ones a client auto-starts, which inherit
-      // this env — competes for 8787 with each other and with whatever is really running on the
-      // developer's machine. The harness reads the port back from the runtime file regardless.
-      // DOUZE_FOREGROUND keeps `douze start` in this process rather than detaching a child the
-      // harness could not then reap.
-      env: {
-        ...process.env,
-        DOUZE_HOME: this.home,
-        DOUZE_PORT: '0',
-        ...(this.options.remote ? { DOUZE_FOREGROUND: '1' } : {}),
-      },
-      stdio: 'inherit',
-    })
-    await waitFor(async () => {
-      const runtime = await this.runtime()
-      if (!runtime) return false
-      this.port = runtime.port
-      return (await fetch(`http://127.0.0.1:${this.port}/health`)).ok
-    }, 'douzed')
-    this.token = (await import('node:fs')).readFileSync(join(this.home, 'token'), 'utf8').trim()
-  }
-
-  private async runtime(): Promise<{ port: number; pid: number } | null> {
-    try {
-      const fs = await import('node:fs')
-      return JSON.parse(fs.readFileSync(join(this.home, 'douzed.json'), 'utf8'))
-    } catch {
-      return null
-    }
-  }
-
-  api(path: string, init: RequestInit = {}): Promise<Response> {
-    return fetch(`http://127.0.0.1:${this.port}${path}`, {
-      ...init,
-      headers: { 'x-douze-token': this.token, 'content-type': 'application/json', ...init.headers },
-    })
-  }
-
-  /**
-   * Awaited, like the fixture's: douzed now walks a fixed port range rather than taking an
-   * ephemeral port, so a daemon still shutting down squats a port every later spec needs, and
-   * five leaked ones fill the range outright.
-   *
-   * The detached kill is the load-bearing half. A client that auto-starts douzed spawns it
-   * `detached` and unref'd (see DaemonClient.startDetached), so it is not `this.process` and
-   * survives the kill below — the runtime file it wrote is the only handle anyone has on it.
-   */
-  async stop(): Promise<void> {
-    const detached = (await this.runtime())?.pid
-    if (this.process) {
-      const exited = new Promise<void>((resolve) => this.process?.once('exit', () => resolve()))
-      this.process.kill()
-      await exited
-      this.process = undefined as never
-    }
-    if (detached !== undefined && detached !== process.pid) await reap(detached)
-    rmSync(this.home, { recursive: true, force: true })
-  }
-}
-
-/** SIGTERM and then wait for the pid to actually go, so its port is free for the next spec. */
-async function reap(pid: number, timeoutMs = 5_000): Promise<void> {
-  try {
-    process.kill(pid, 'SIGTERM')
-  } catch {
-    return // already gone
-  }
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    try {
-      process.kill(pid, 0)
-    } catch {
-      return
-    }
-    await new Promise((r) => setTimeout(r, 50))
   }
 }
 

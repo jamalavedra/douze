@@ -1,22 +1,13 @@
 import { z } from 'zod'
-import { Exchange, AnnotationSpan, CaptureSession } from './capture.js'
 import { CredentialSource } from './recipe.js'
 
 /**
- * ADR-003 — the JSON protocol the extension speaks to douzed over `ws://127.0.0.1:<port>`.
- * Two families: `exchange.*` flows extension → daemon (capture), `relay.*` flows
- * daemon → extension and back (execution).
+ * WO-015 T-015.13 — the extension no longer speaks to a local daemon, so the capture protocol
+ * (`ClientMessage`/`ServerMessage`, `exchange.*`) went with douzed: capture is a call into the
+ * extension's own store now, not a frame on a socket. What is left is the shape of one relayed
+ * HTTP call, which the extension still executes from an Executor Tab, and the vocabulary the
+ * attachment protocol (`@douze/mcp-host`) and the relay share.
  */
-
-export const ClientMessage = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('hello'), token: z.string(), extension_version: z.string() }),
-  z.object({ type: z.literal('pong') }),
-  z.object({ type: z.literal('exchange.append'), exchange: Exchange }),
-  z.object({ type: z.literal('exchange.session.start'), session: CaptureSession }),
-  z.object({ type: z.literal('exchange.session.stop'), session_id: z.string(), retained: z.number() }),
-  z.object({ type: z.literal('exchange.annotate'), span: AnnotationSpan }),
-  z.object({ type: z.literal('relay.response'), id: z.string(), response: z.lazy(() => RelayResponse) }),
-])
 
 /** A single relayed request, issued by the extension from an Executor Tab. */
 export const RelayRequest = z.object({
@@ -46,32 +37,16 @@ export const RelayResponse = z.object({
   redirected_to_login: z.boolean().default(false),
 })
 
-export const ServerMessage = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('welcome'), heartbeat_ms: z.number() }),
-  /** ADR-003 — sent inside the 30s window to keep the MV3 service worker alive. */
-  z.object({ type: z.literal('ping') }),
-  z.object({ type: z.literal('relay.request'), request: RelayRequest }),
-])
-
-export type ClientMessage = z.infer<typeof ClientMessage>
-export type ServerMessage = z.infer<typeof ServerMessage>
 export type RelayRequest = z.infer<typeof RelayRequest>
 export type RelayResponse = z.infer<typeof RelayResponse>
 
-/** ADR-003 — douzed pings well inside Chrome's 30-second service-worker idle timeout. */
+/** ADR-003 — a host pings well inside Chrome's 30-second service-worker idle timeout. */
 export const HEARTBEAT_MS = 20_000
 
 /**
- * The extension can only find douzed by probing loopback, so both sides walk this range in order.
- * 8787 is not ours alone — RStudio Server's default is exactly that — and a squatter on it must
- * move the daemon one port along rather than out of the extension's reach entirely.
- */
-export const PORT_RANGE = [8787, 8788, 8789, 8790, 8791] as const
-export const DEFAULT_PORT = PORT_RANGE[0]
-
-/**
  * REQ-CON-004 — the four failure states a chat client must be able to explain without a
- * terminal. The wording lives here so the CLI, MCP, and relay all say the same thing.
+ * terminal. The wording lives here so the extension, both pipes, and the relay all say the same
+ * thing.
  */
 export const RelayErrorCode = z.enum([
   'relay_unreachable',
@@ -100,45 +75,14 @@ export class DouzeError extends Error {
 }
 
 /**
- * WO-014 — the JSON protocol douzed speaks to the relay over a single outbound `wss://`.
- * The daemon dials out and opens no listener, so every frame below travels that one socket.
- *
- * Frames carry a `sid` because several platform clients can hold an MCP session against the same
- * daemon at once: each gets its own MCP server instance, so their JSON-RPC ids cannot collide and
- * each runs its own `initialize` handshake. The relay never parses `message` — it reads `sid` to
- * pick a socket and forwards the payload untouched, which is what keeps tool arguments and result
- * bodies opaque to it beyond the transport itself.
- */
-
-export const RemoteDaemonMessage = z.discriminatedUnion('type', [
-  /** First frame after connect; the relay closes with 1008 if the token does not match. */
-  z.object({ type: z.literal('hello'), token: z.string(), daemon_version: z.string() }),
-  z.object({ type: z.literal('pong') }),
-  /** One JSON-RPC message from the daemon-side MCP server for `sid`. */
-  z.object({ type: z.literal('mcp.message'), sid: z.string(), message: z.unknown() }),
-  /** The daemon has finished tearing that session's MCP server instance down. */
-  z.object({ type: z.literal('session.closed'), sid: z.string() }),
-])
-
-export const RemoteRelayMessage = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('welcome'), heartbeat_ms: z.number() }),
-  z.object({ type: z.literal('ping') }),
-  /** A new platform MCP session; the daemon spins up an isolated MCP server instance for it. */
-  z.object({ type: z.literal('session.open'), sid: z.string() }),
-  /** One JSON-RPC message from the platform client. */
-  z.object({ type: z.literal('mcp.message'), sid: z.string(), message: z.unknown() }),
-  /** The relay expired or lost the platform session; the daemon tears that instance down. */
-  z.object({ type: z.literal('session.close'), sid: z.string() }),
-])
-
-export type RemoteDaemonMessage = z.infer<typeof RemoteDaemonMessage>
-export type RemoteRelayMessage = z.infer<typeof RemoteRelayMessage>
-
-/**
  * WO-014 — the body of `POST /register`, the one relay route anyone on the internet can reach
  * unauthenticated. `daemon_version` reaches a relay log line, so it is held to a character set
  * that cannot carry a newline and forge an entry of its own. `+` is in it because semver build
- * metadata (`0.1.0+abc`) is a version a daemon legitimately reports.
+ * metadata (`0.1.0+abc`) is a version a client legitimately reports.
+ *
+ * WO-015 T-015.13 — the opaque `mcp.message` frames this file used to carry alongside it are
+ * gone with the daemon. `@douze/mcp-host` owns the attachment protocol that replaced them, and
+ * owns it in one place precisely so the relay and the bridge cannot drift apart.
  */
 export const RemoteRegistration = z.object({
   daemon_version: z

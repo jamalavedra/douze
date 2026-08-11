@@ -1,8 +1,0 @@
-export { startDaemon, type Daemon } from './server.js'
-export { CaptureStore } from './capture-store.js'
-export { RecipeRegistry, type SurfaceTool, type RegistryState } from './registry.js'
-export { RelayBridge, buildRequest } from './relay.js'
-export { importHar } from './har-import.js'
-export { DriftWatcher, compare, type DoctorReport, type ToolReport } from './doctor.js'
-export { executeHeadless, Keychain, DEGRADED_NOTICE } from './headless.js'
-export * from './paths.js'

@@ -1,27 +1,111 @@
-import { mkdtempSync, readFileSync, existsSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 import { beforeEach, describe, expect, it } from 'vitest'
 import { Recipe, parseRecipe, serializeRecipe } from '@douze/shared'
-import { StudioSession, readFixtures, writeFixture, type StudioConfig } from './api.js'
-import { reviewPage } from './app.js'
-import { authFrom, baseUrlFrom } from './candidates.js'
-import { toFixture } from './fixtures.js'
+import {
+  authFrom,
+  baseUrlFrom,
+  candidateViews,
+  candidatesFrom,
+  editCandidate,
+  findCandidate,
+  prepareSave,
+  type CandidateView,
+  type EditableField,
+  type PreparedSave,
+  type RecipeConfig,
+} from './candidates.js'
+import { assertFixtureSafe, toFixture, type Fixture } from './fixtures.js'
 import { mergeRecipe } from './merge.js'
-import { infer } from './inference/engine.js'
+import { infer, type InferenceInput } from './inference/engine.js'
+import { approve as approveCandidate, approveReads as approveReadCandidates, type BulkResult } from './promotion.js'
 import { makeExchanges } from './testing.js'
-import type { JsonSchema } from './types.js'
+import type { Candidate, JsonSchema } from './types.js'
 
-let home: string
-let config: StudioConfig
+/**
+ * The persistence half `api.ts` used to hold, in memory (T-015.13). douzed owned a filesystem and
+ * the extension owns extension storage; what stayed in `@douze/studio` is the pure seam these
+ * tests are actually about — inference, the candidate view, `mergeRecipe` and `prepareSave` — so a
+ * Map is the store and the recipe is read back through `parseRecipe`, exactly as a real caller
+ * must. Everything below `save()` is the contract both real stores implement.
+ */
+interface Store {
+  recipes: Map<string, string>
+  fixtures: Map<string, Fixture>
+}
+
+interface SaveReport extends Omit<PreparedSave, 'fixtures'> {
+  fixtures: string[]
+  yaml: string
+}
+
+class Studio {
+  constructor(
+    readonly config: RecipeConfig,
+    readonly candidates: Candidate[],
+    private readonly store: Store,
+  ) {}
+
+  static fromExchanges(config: RecipeConfig, input: InferenceInput, store: Store): Studio {
+    const auth = config.auth ?? authFrom(input.exchanges)
+    return new Studio(auth ? { ...config, auth } : config, candidatesFrom(input, auth), store)
+  }
+
+  find(name: string): Candidate {
+    return findCandidate(this.candidates, name)
+  }
+
+  view(): CandidateView[] {
+    return candidateViews(this.candidates)
+  }
+
+  edit(name: string, field: EditableField, value: unknown): Candidate {
+    return editCandidate(this.find(name), field, value)
+  }
+
+  approveReads(): BulkResult {
+    return approveReadCandidates(this.candidates)
+  }
+
+  approve(name: string): Candidate {
+    return approveCandidate(this.find(name))
+  }
+
+  /** Fixtures first, then the recipe — the order `prepareSave` documents. */
+  save(): SaveReport {
+    const prepared = prepareSave(this.config, this.candidates, this.existing(), this.storedFixtures())
+    const written: string[] = []
+    for (const { reference, fixture } of prepared.fixtures) {
+      assertFixtureSafe(fixture)
+      this.store.fixtures.set(reference, fixture)
+      written.push(reference)
+    }
+    const yaml = serializeRecipe(prepared.recipe)
+    this.store.recipes.set(this.config.recipeName, yaml)
+    return { ...prepared, fixtures: written, yaml }
+  }
+
+  private existing(): Recipe | null {
+    const source = this.store.recipes.get(this.config.recipeName)
+    if (source === undefined) return null
+    const result = parseRecipe(source, `${this.config.recipeName}.yaml`)
+    return result.ok && result.recipe ? result.recipe : null
+  }
+
+  private storedFixtures(): Record<string, Fixture[]> {
+    const out: Record<string, Fixture[]> = {}
+    for (const [reference, fixture] of this.store.fixtures) {
+      if (!reference.startsWith(`${this.config.recipeName}/`)) continue
+      ;(out[fixture.tool] ??= []).push(fixture)
+    }
+    return out
+  }
+}
+
+let store: Store
+let config: RecipeConfig
 
 beforeEach(() => {
-  home = mkdtempSync(join(tmpdir(), 'douze-studio-'))
-  config = {
-    recipeName: 'orders',
-    baseUrl: 'https://app.example.com',
-    paths: { recipes: join(home, 'recipes'), fixtures: join(home, 'fixtures') },
-  }
+  store = { recipes: new Map(), fixtures: new Map() }
+  config = { recipeName: 'orders', baseUrl: 'https://app.example.com' }
 })
 
 const mixedSession = () =>
@@ -34,11 +118,10 @@ const mixedSession = () =>
     { method: 'DELETE', url: '/api/orders/1043', response_body: { data: { id: 1043 } }, provenance: 'Delete order' },
   ])
 
-const session = () => StudioSession.fromExchanges(config, { exchanges: mixedSession() })
+const session = () => Studio.fromExchanges(config, { exchanges: mixedSession() }, store)
 
 const readRecipe = () => {
-  const path = join(home, 'recipes', 'orders.yaml')
-  const result = parseRecipe(readFileSync(path, 'utf8'), 'orders.yaml')
+  const result = parseRecipe(store.recipes.get('orders') ?? '', 'orders.yaml')
   if (!result.ok || !result.recipe) throw new Error(result.error ?? 'unparsable recipe')
   return result.recipe
 }
@@ -151,15 +234,10 @@ describe('REQ-REC-004 fixtures', () => {
     studio.approveReads()
     const report = studio.save()
 
-    expect(report.fixtures.sort()).toEqual([join('orders', 'get_order.json'), join('orders', 'list_orders.json')])
-    expect(existsSync(join(home, 'fixtures', 'orders', 'list_orders.json'))).toBe(true)
-    expect(readFixtures(join(home, 'fixtures'), 'orders').map((f) => f.tool).sort()).toEqual([
-      'get_order',
-      'list_orders',
-    ])
-    expect(readRecipe().tools.find((t) => t.name === 'list_orders')?.fixtures).toEqual([
-      join('orders', 'list_orders.json'),
-    ])
+    expect(report.fixtures.sort()).toEqual(['orders/get_order.json', 'orders/list_orders.json'])
+    expect(store.fixtures.has('orders/list_orders.json')).toBe(true)
+    expect([...store.fixtures.values()].map((f) => f.tool).sort()).toEqual(['get_order', 'list_orders'])
+    expect(readRecipe().tools.find((t) => t.name === 'list_orders')?.fixtures).toEqual(['orders/list_orders.json'])
   })
 
   // AC-REC-004.2
@@ -176,8 +254,9 @@ describe('REQ-REC-004 fixtures', () => {
       },
     ])[0]
     if (!exchange) throw new Error('no exchange')
-    const path = writeFixture(join(home, 'fixtures'), 'orders', toFixture('get_handoff', exchange))
-    const written = readFileSync(join(home, 'fixtures', path), 'utf8')
+    const fixture = toFixture('get_handoff', exchange)
+    assertFixtureSafe(fixture)
+    const written = JSON.stringify(fixture)
     expect(written).not.toContain('eyJhbGciOi')
     expect(written).toContain('«redacted:')
   })
@@ -186,8 +265,7 @@ describe('REQ-REC-004 fixtures', () => {
   it('refuses to write a fixture assembled without redaction', () => {
     const raw = { tool: 'get_handoff', request: { method: 'GET', path: '/api/handoff', headers: {} },
       response: { status: 200, body: { handoff: 'sk_live_9f8e7d6c5b4a39281706' } } }
-    expect(() => writeFixture(join(home, 'fixtures'), 'orders', raw as never)).toThrow(/credential-shaped value/)
-    expect(existsSync(join(home, 'fixtures', 'orders', 'get_handoff.json'))).toBe(false)
+    expect(() => assertFixtureSafe(raw as never)).toThrow(/credential-shaped value/)
   })
 
   it('redacts credential headers into the stored fixture', () => {
@@ -202,7 +280,7 @@ describe('REQ-REC-004 fixtures', () => {
 })
 
 describe('REQ-REC-003 non-destructive regeneration', () => {
-  const reinfer = (exchanges = mixedSession()) => new StudioSession(config, infer({ exchanges }))
+  const reinfer = (exchanges = mixedSession()) => new Studio(config, infer({ exchanges }), store)
 
   // COV_REC_003.1
   it('keeps a user-edited description and stores the inferred one as a suggestion', () => {
@@ -289,81 +367,6 @@ describe('REQ-REC-003 non-destructive regeneration', () => {
   })
 })
 
-describe('the review page', () => {
-  const html = () => reviewPage({ id: 'abc-123', token: 'tok-xyz' })
-
-  it('inlines the session and token so its own fetches authenticate', () => {
-    expect(html()).toContain('const SESSION = "abc-123"')
-    expect(html()).toContain('const TOKEN = "tok-xyz"')
-  })
-
-  it('speaks plain English rather than the vocabulary of the recipe format', () => {
-    const page = html()
-    for (const copy of [
-      'Choose what to keep',
-      'Everything that only reads is selected. Turn on anything that makes changes.',
-      'Look things up',
-      'Make changes',
-      'Remove things',
-      'Only seen once',
-      'Name is a guess',
-      'Not checked yet',
-      'Changes your account.',
-      'Removes data. Asks first.',
-      'Select all',
-      'Clear',
-      'Keep ',
-      'skill',
-      'Details',
-    ]) {
-      expect(page).toContain(copy)
-    }
-    // The developer vocabulary the old screen used must not be back on the first screen.
-    expect(page).not.toContain('Approve')
-    expect(page).not.toContain('confidence')
-    // Nor may it name one client: the tools it turns on are for whichever MCP client is asking.
-    expect(page).not.toContain('Claude')
-  })
-
-  /**
-   * AC-REC-002.3 — the bulk API refuses to enable a write or a destructive tool, and the page must
-   * not route around it. Pre-selecting everything meant one click on the primary button approved a
-   * delete nobody had read.
-   */
-  it('seeds the selection with read-only skills, leaving the rest for a deliberate click', () => {
-    expect(html()).toContain('if (candidate.bulk_approvable) chosen.add(candidate.name)')
-  })
-
-  it('explains each consequence with words rather than colour alone', () => {
-    const page = html()
-    expect(page).toContain('Read-only.')
-    expect(page).toContain('Creates or updates data.')
-    expect(page).toContain('Always asks first.')
-  })
-
-  it('selects every inferred skill by default and offers clear/select-all controls', () => {
-    const page = html()
-    expect(page).toContain('for (const candidate of state.candidates) chosen.add(candidate.name)')
-    expect(page).toContain("byId('all').addEventListener")
-    expect(page).toContain("byId('none').addEventListener")
-  })
-
-  it('keeps motion subtle and respects reduced-motion preferences', () => {
-    const page = html()
-    expect(page).toContain('details[open] > :not(summary)')
-    expect(page).toContain('.primary:not(:disabled):hover')
-    expect(page).toContain('@media (prefers-reduced-motion: reduce)')
-  })
-
-  it('uses the shared 12 mark and cyan/red palette', () => {
-    const page = html()
-    expect(page).toContain('class="brand-icon"')
-    expect(page).toContain('data:image/png;base64,')
-    expect(page).toContain('--brand-blue: #00bce8')
-    expect(page).toContain('--brand-red: #f31b1b')
-  })
-})
-
 /**
  * The recipe used to take the schema default — `cookie` — for every site, so a dashboard that
  * authenticates with a bearer token produced tools that all failed with "you have been signed
@@ -407,19 +410,23 @@ describe('auth derived from the capture (AC-EXE-001.3)', () => {
    * first written with `cookie` kept it through every re-recording, and every call kept failing.
    */
   it('updates the auth of a recipe that already exists', () => {
-    const config = { recipeName: 'again', baseUrl: 'https://api.example.com', paths: { recipes: join(home, 'recipes'), fixtures: join(home, 'fixtures') } }
+    const config = { recipeName: 'again', baseUrl: 'https://api.example.com' }
     // First save: a capture with no page-supplied credential, so the schema default stands.
-    const first = StudioSession.fromExchanges(config, {
-      exchanges: makeExchanges([{ url: 'https://api.example.com/v1/players', response_body: { data: [] } }]),
-      annotations: [],
-    })
+    const first = Studio.fromExchanges(
+      config,
+      {
+        exchanges: makeExchanges([{ url: 'https://api.example.com/v1/players', response_body: { data: [] } }]),
+        annotations: [],
+      },
+      store,
+    )
     first.approveReads()
-    expect(readFileSync(first.save().path, 'utf8')).toContain('kind: cookie')
+    expect(first.save().yaml).toContain('kind: cookie')
 
     // Recorded again, this time with the token located in the page.
-    const second = StudioSession.fromExchanges(config, { exchanges: captured(), annotations: [] })
+    const second = Studio.fromExchanges(config, { exchanges: captured(), annotations: [] }, store)
     second.approveReads()
-    const written = readFileSync(second.save().path, 'utf8')
+    const written = second.save().yaml
     expect(written).toContain('kind: page_state')
     expect(written).toContain('page_origin: https://dashboard.example.com')
     expect(written).not.toContain('kind: cookie')
@@ -430,12 +437,13 @@ describe('auth derived from the capture (AC-EXE-001.3)', () => {
   })
 
   it('reaches the saved recipe, so the relay is told at call time', () => {
-    const session = StudioSession.fromExchanges(
-      { recipeName: 'derived', baseUrl: 'https://api.example.com', paths: { recipes: join(home, 'recipes'), fixtures: join(home, 'fixtures') } },
+    const session = Studio.fromExchanges(
+      { recipeName: 'derived', baseUrl: 'https://api.example.com' },
       { exchanges: captured(), annotations: [] },
+      store,
     )
     session.approveReads()
-    const written = readFileSync(session.save().path, 'utf8')
+    const written = session.save().yaml
     expect(written).toContain('page_state')
     expect(written).toContain('page_origin: https://dashboard.example.com')
     // A location, never a value — which is what lets it live in a committed file.
@@ -457,13 +465,10 @@ describe('a path credential nothing can fill (AC-EXE-001.3)', () => {
   ]
 
   const session = (extra: (e: ReturnType<typeof makeExchanges>[number]) => typeof e = (e) => e) =>
-    StudioSession.fromExchanges(
-      {
-        recipeName: 'keyless',
-        baseUrl: 'https://api.example.com',
-        paths: { recipes: join(home, 'recipes'), fixtures: join(home, 'fixtures') },
-      },
+    Studio.fromExchanges(
+      { recipeName: 'keyless', baseUrl: 'https://api.example.com' },
       { exchanges: makeExchanges(redactedPath).map(extra), annotations: [] },
+      store,
     )
 
   it('degrades the candidate and says why when the capture carries no hint', () => {
