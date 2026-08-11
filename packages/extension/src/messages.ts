@@ -87,16 +87,28 @@ export type PopupCommand =
   | { type: 'douze:review'; sessionId: string }
   /** Open the page that shares Douze with a hosted assistant. Opened by the worker, for the same reason. */
   | { type: 'douze:connect' }
+  /** What is already set up on this site — the popup's quiet summary. */
+  | { type: 'douze:site-tools'; origin: string }
 
 export interface PopupStatus {
   session: { id: string; name: string; origins: string[] } | null
   count: number
-  /** Origins the running session has actually recorded traffic to — the relay's future targets. */
+  /** Origins the running session has actually recorded traffic to — execution's future targets. */
   seenOrigins: string[]
-  connected: boolean
-  port: number
-  token: string
   noiseHosts: string[]
+}
+
+/** One approved tool on a site, as the popup lists it. */
+export interface SiteTool {
+  /** AC-RUN-001.2 — `<recipe>_<tool>`. */
+  name: string
+  description: string
+  side_effect: 'read' | 'write' | 'destructive'
+}
+
+/** What `douze:site-tools` answers with. */
+export interface SiteToolsResult {
+  tools: SiteTool[]
 }
 
 /**

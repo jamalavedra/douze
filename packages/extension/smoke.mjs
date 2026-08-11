@@ -56,12 +56,6 @@ try {
     ['Douze', 3, '116'],
   )
 
-  // Proof the worker's top-level registrations ran, not just that the file was fetched.
-  check(
-    'reconnect alarm registered at top level',
-    await worker.evaluate(async () => (await chrome.alarms.getAll()).map((a) => a.name)),
-    ['douze-reconnect'],
-  )
   check(
     'badge is clear with no session running',
     await worker.evaluate(() => chrome.action.getBadgeText({})),
@@ -69,34 +63,24 @@ try {
   )
   const popup = await context.newPage()
   await popup.goto(`chrome-extension://${extensionId}/popup.html`)
-  await popup.waitForSelector('#disconnected:not([hidden])')
+  // Opened over `chrome-extension://`, which is not a site Douze can watch. Nothing here waits on
+  // a service being up: with no daemon there is no "can't reach it" state to be in.
+  await popup.waitForSelector('#unsupported:not([hidden])')
   check('popup renders its brand', (await popup.textContent('.brand'))?.includes('Douze'), true)
   check('popup renders the 12 mark', await popup.getAttribute('.brand img', 'src'), 'icon128.png')
-  // With no daemon there is nothing to pair with, so the popup asks the user to open the app they
-  // added Douze to, and offers no controls at all — no port, no token, no start button. It names
-  // the clients and the connector file, because a user who installed the extension first has one
-  // of those apps open already. It cannot name only Claude: the service runs in whichever client
-  // they installed it in.
-  check(
-    'popup names the app to open and the connector, rather than the daemon',
-    [
-      (await popup.textContent('#disconnected'))?.includes("can't reach its background service"),
-      (await popup.textContent('#disconnected'))?.includes('Cursor'),
-      (await popup.textContent('#disconnected'))?.includes('Douze.mcpb'),
-    ],
-    [true, true, true],
-  )
-  check('popup offers no way to start while unpaired', await popup.isVisible('#watch'), false)
+  check('popup offers no way to record a page it cannot watch', await popup.isVisible('#watch'), false)
   check('popup asks for no port or token', await popup.locator('#port, #token').count(), 0)
+  check('popup has no daemon screen left to show', await popup.locator('#disconnected').count(), 0)
 
-  // Extension pages are the only context whose sendMessage the worker receives.
+  // Extension pages are the only context whose sendMessage the worker receives — and the round
+  // trip is also the proof that the top-level `onMessage` registration ran.
   check(
     'popup command round-trips through the worker',
     await popup.evaluate(async () => {
       const status = await chrome.runtime.sendMessage({ type: 'douze:status' })
-      return [status.session, status.count, status.connected]
+      return [status.session, status.count]
     }),
-    [null, 0, false],
+    [null, 0],
   )
   // An unnamed session is named after the site, not refused: only a missing tab can stop it.
   check(
@@ -126,7 +110,7 @@ try {
     const app = await context.newPage()
     await app.goto(FIXTURE)
     // startSession reloads the tab itself: registrations do not reach an already-loaded tab.
-    await worker.evaluate((o) => globalThis.__douze.startSession('orders', [o]), FIXTURE)
+    const sessionId = await worker.evaluate((o) => globalThis.__douze.startSession('orders', [o]), FIXTURE)
     await app.waitForSelector('#create')
     check(
       'interceptor is in the page after startSession reloaded it',
@@ -141,18 +125,19 @@ try {
     // Then idle past the 2s attribution window so the later polls have no gesture to claim.
     await app.waitForTimeout(3500)
 
-    const captured = await worker.evaluate(() =>
-      globalThis.__douze
-        .pending()
-        .filter((m) => m.type === 'exchange.append')
-        .map((m) => ({
-          url: m.exchange.url,
-          method: m.exchange.method,
-          background: m.exchange.background,
-          name: m.exchange.provenance?.accessible_name ?? null,
-          hasReq: m.exchange.request_body !== undefined,
-          hasRes: m.exchange.response_body !== undefined,
+    // Read back out of the extension's own store — there is no outbox to inspect, because there
+    // is nothing to send anything to.
+    const captured = await worker.evaluate(
+      async (id) =>
+        (await globalThis.__douze.recorded(id)).exchanges.map((exchange) => ({
+          url: exchange.url,
+          method: exchange.method,
+          background: exchange.background,
+          name: exchange.provenance?.accessible_name ?? null,
+          hasReq: exchange.request_body !== undefined,
+          hasRes: exchange.response_body !== undefined,
         })),
+      sessionId,
     )
     const post = captured.find((e) => e.method === 'POST' && e.url.endsWith('/api/orders'))
     const get = captured.find((e) => e.method === 'GET' && e.url.endsWith('/api/orders'))
@@ -177,8 +162,9 @@ try {
     check('badge reflects the captured count (AC-CAP-001.3)', await worker.evaluate(() => globalThis.__douze.badgeCount()), captured.length)
 
     await worker.evaluate(() => globalThis.__douze.annotate('creates an order'))
-    const span = await worker.evaluate(() =>
-      globalThis.__douze.pending().find((m) => m.type === 'exchange.annotate')?.span ?? null,
+    const span = await worker.evaluate(
+      async (id) => (await globalThis.__douze.recorded(id)).annotations.at(-1) ?? null,
+      sessionId,
     )
     check('annotation spans the exchanges since the last note (AC-CAP-007.2)', [span?.note, span?.start_position], ['creates an order', 0])
 

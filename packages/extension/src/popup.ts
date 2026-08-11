@@ -1,9 +1,11 @@
-import { siteTools, type SiteTool } from './daemon.js'
-import type { PopupCommand, PopupStatus } from './messages.js'
+import type { PopupCommand, PopupStatus, SiteTool, SiteToolsResult } from './messages.js'
 
 /**
- * T-001.8 — one screen, one primary button, no port and no token. Pairing happens in the
- * service worker; this only ever reads the result.
+ * T-001.8 — one screen, one primary button, no port and no token.
+ *
+ * WO-015 T-015.1 — and no "can't reach the service" screen either: recording writes to the
+ * extension's own store, so there is nothing to be running, nothing to pair with, and no state
+ * where the button has to be withheld. What is left is whether Douze can watch THIS page.
  *
  * `chrome.permissions.request` must be the first statement in a click handler, so the active
  * tab and its origin are cached at popup load rather than read on click.
@@ -12,7 +14,6 @@ import type { PopupCommand, PopupStatus } from './messages.js'
 const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T
 
 const el = {
-  disconnected: $<HTMLElement>('disconnected'),
   unsupported: $<HTMLElement>('unsupported'),
   ready: $<HTMLElement>('ready'),
   watching: $<HTMLElement>('watching'),
@@ -67,8 +68,8 @@ function showError(message: string | null): void {
   el.error.textContent = message ?? ''
 }
 
-function show(state: 'disconnected' | 'unsupported' | 'ready' | 'watching' | 'finished'): void {
-  for (const name of ['disconnected', 'unsupported', 'ready', 'watching', 'finished'] as const) {
+function show(state: 'unsupported' | 'ready' | 'watching' | 'finished'): void {
+  for (const name of ['unsupported', 'ready', 'watching', 'finished'] as const) {
     el[name].hidden = name !== state
   }
 }
@@ -94,7 +95,6 @@ function render(status: PopupStatus & { error?: string }): void {
     renderFinished(status)
     return show('finished')
   }
-  if (!status.connected) return show('disconnected')
   if (!activeOrigin) return show('unsupported')
   return show('ready')
 }
@@ -228,10 +228,13 @@ async function boot(): Promise<void> {
   el.hostname.textContent = activeHostname
   el.name.value = defaultName(activeHostname)
 
-  const status = await send({ type: 'douze:status' })
-  render(status)
-  if (status.connected && activeOrigin) {
-    renderTools(await siteTools({ port: status.port, token: status.token }, activeOrigin))
+  render(await send({ type: 'douze:status' }))
+  if (activeOrigin) {
+    const answer = (await chrome.runtime.sendMessage({
+      type: 'douze:site-tools',
+      origin: activeOrigin,
+    })) as SiteToolsResult
+    renderTools(answer.tools)
   }
   setInterval(async () => render(await send({ type: 'douze:status' })), 1000)
 }
