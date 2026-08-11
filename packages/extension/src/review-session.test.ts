@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import type { Exchange } from '@douze/shared'
+import type { Exchange, Tool } from '@douze/shared'
 import { RecipeStore } from './recipes.js'
 import { ReviewSession } from './review-session.js'
 import type { CaptureStore, SessionDetail } from './store.js'
@@ -252,6 +252,113 @@ describe('review inside the extension (T-015.3)', () => {
     const review = await openReview(RECORDED)
     await expect(review.save()).rejects.toThrow(/nothing is approved/)
     expect(storedNames()).toEqual([])
+  })
+})
+
+/**
+ * WO-016 — `classify` is a heuristic over names and the review page groups by what it decided, so
+ * a reader who SEES `POST /api/orders` in the wrong group is the only backstop there is. These are
+ * that correction, end to end: what gets stored, what the tool then says about itself, and whether
+ * it survives the next recording.
+ */
+describe('a reviewer correcting what inference guessed (WO-016)', () => {
+  /** The input schema as the tests below read it, with no tool and no schema both meaning "{}". */
+  const schemaOf = (tool: Tool | undefined): { required?: string[]; properties?: Record<string, unknown> } =>
+    (tool?.request.input_schema ?? {}) as { required?: string[]; properties?: Record<string, unknown> }
+
+  /** A search that answers on POST and a word list that reads "transfer" as moving money. */
+  const FALSE_POSITIVE: Exchange[] = [
+    exchange(0),
+    exchange(5, {
+      method: 'POST',
+      url: 'https://app.test/api/transfers/search',
+      request_body: { q: 'jan' },
+      response_body: { results: [{ id: 7 }] },
+    }),
+    exchange(6, {
+      method: 'POST',
+      url: 'https://app.test/api/transfers/search',
+      request_body: { q: 'feb' },
+      response_body: { results: [{ id: 8 }] },
+    }),
+  ]
+
+  it('promotes a write to destructive, and says so in the tool’s own words', async () => {
+    const recipes = await RecipeStore.open()
+    const review = await ReviewSession.open('cap', { captures: capturesOf(detailOf(RECORDED)), recipes })
+
+    expect(review.candidates().find((c) => c.name === 'create_order')?.side_effect).toBe('write')
+    review.edit('create_order', 'side_effect', 'destructive')
+    review.approve(['create_order'])
+    await expect(review.save()).resolves.toMatchObject({ recipe: 'shop-orders' })
+
+    const tool = recipes.recipe('shop-orders')?.tools.find((t) => t.name === 'create_order')
+    expect(tool?.side_effect).toBe('destructive')
+    // The description is rewritten from the new class. Left alone it would keep its write phrasing
+    // and never mention either half of what the policy now demands.
+    expect(tool?.description).toContain('cannot be undone')
+    expect(tool?.description).toContain('confirm')
+    // AC-REC-002.4 — and the schema demands the word, which is what makes this recipe saveable at
+    // all: `RecipeStore.save` re-parses, so reaching this line means the store took it.
+    expect(schemaOf(tool).required).toContain('confirm')
+    expect(recipes.surface().tools.map((t) => t.qualified_name)).toEqual(['shop-orders_create_order'])
+  })
+
+  /**
+   * The correction has to outlive the next recording. Inference classifies `POST /api/orders` as a
+   * write every single time, and `mergeRecipe` rebuilds `request.input_schema` from it — so this
+   * covers both halves: the label is preserved because it is `user_edited`, and the confirm is
+   * re-asserted by `prepareSave` because merge dropped it. Nothing here re-approves the promoted
+   * tool: its `approved` comes from the store, exactly as a second visit to a recorded site.
+   */
+  it('keeps a promotion through a re-record rather than letting inference revert it', async () => {
+    const recipes = await RecipeStore.open()
+    const first = await ReviewSession.open('cap', { captures: capturesOf(detailOf(RECORDED)), recipes })
+    first.edit('create_order', 'side_effect', 'destructive')
+    first.approve(['create_order'])
+    await first.save()
+
+    const again = await ReviewSession.open('cap', { captures: capturesOf(detailOf(RECORDED)), recipes })
+    expect(again.candidates().find((c) => c.name === 'create_order')?.side_effect).toBe('write')
+    again.approve(['list_orders'])
+    await expect(again.save()).resolves.toMatchObject({ recipe: 'shop-orders' })
+
+    const tool = recipes.recipe('shop-orders')?.tools.find((t) => t.name === 'create_order')
+    expect(tool?.side_effect).toBe('destructive')
+    expect(tool?.approved).toBe(true)
+    expect(schemaOf(tool).required).toContain('confirm')
+    // AC-REC-003.1 — the guess is not thrown away, it is offered.
+    expect(tool?.flags.suggestions?.['side_effect']).toBe('write')
+  })
+
+  it('demotes a read-by-POST the word list caught, and takes the confirm back off', async () => {
+    const recipes = await RecipeStore.open()
+    const review = await ReviewSession.open('cap', { captures: capturesOf(detailOf(FALSE_POSITIVE)), recipes })
+
+    const caught = review.candidates().find((c) => c.side_effect === 'destructive')
+    expect(caught?.name).toBeDefined()
+    const name = caught?.name ?? ''
+    // Approved first, so the confirm is really there to be removed.
+    review.approve([name])
+    review.edit(name, 'side_effect', 'write')
+    await expect(review.save()).resolves.toMatchObject({ recipe: 'shop-orders' })
+
+    const tool = recipes.recipe('shop-orders')?.tools.find((t) => t.name === name)
+    expect(tool?.side_effect).toBe('write')
+    expect(schemaOf(tool).required ?? []).not.toContain('confirm')
+    expect(schemaOf(tool).properties).not.toHaveProperty('confirm')
+    expect(tool?.description).not.toContain('cannot be undone')
+  })
+
+  /**
+   * `read` is the one class a hosted assistant reaches with nothing turned on, so it is not a
+   * destination: every move this control offers narrows what an assistant may do, and a hand-set
+   * `read` would be the only one that widens it.
+   */
+  it('refuses to let a change be relabelled as a lookup', async () => {
+    const review = await openReview(RECORDED)
+    expect(() => review.edit('create_order', 'side_effect', 'read')).toThrow(/cannot be set by hand/)
+    expect(review.candidates().find((c) => c.name === 'create_order')?.side_effect).toBe('write')
   })
 })
 

@@ -1784,3 +1784,40 @@ describe('a review opened while the recording is still running', () => {
   })
 })
 
+/**
+ * WO-016 — the review page's order is correct-then-keep: the name, the description and now the
+ * consequence are all edited before the first tick box is sent. Every one of those came back as an
+ * error, because the worker saved after every edit and `save()` refuses to write a recipe with
+ * nothing approved in it. The page's only handling for a failed edit is to put the old value back,
+ * so a correction made at the moment the reader spotted the mistake was reverted in front of them.
+ */
+describe('a correction made before anything has been ticked (WO-016)', () => {
+  it('is accepted, kept, and written by the save that follows it', async () => {
+    const id = await douze().startSession('Shop', ['https://app.test'], { tabId: 7 })
+    for (const n of [1, 2, 3]) await capture(exchangeEvents(`w${n}`, 'POST', 'https://app.test/api/orders'))
+    await settle()
+
+    const edit = (await sendFrom(extensionPage(), {
+      type: 'douze:review:edit',
+      sessionId: id,
+      name: 'create_order',
+      field: 'side_effect',
+      value: 'destructive',
+    })) as { ok?: true; error?: string }
+    expect(edit.error).toBeUndefined()
+    // Nothing was written — there was nothing approved to write — and nothing was lost either.
+    expect(fake.local.get('recipe:shop')).toBeUndefined()
+
+    const state = (await sendFrom(extensionPage(), { type: 'douze:review:load', sessionId: id })) as ReviewState
+    expect(state.candidates.find((c) => c.name === 'create_order')?.side_effect).toBe('destructive')
+
+    await sendFrom(extensionPage(), { type: 'douze:review:enable', sessionId: id, names: ['create_order'] })
+    const saved = (await sendFrom(extensionPage(), { type: 'douze:review:save', sessionId: id })) as {
+      tools?: string[]
+      error?: string
+    }
+    expect(saved.error).toBeUndefined()
+    expect(saved.tools).toEqual(['create_order'])
+  })
+})
+

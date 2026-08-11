@@ -571,9 +571,17 @@ async function onReviewCommand(command: ReviewCommand): Promise<ReviewState | Re
   }
   if (command.type === 'douze:review:edit') {
     session.edit(command.name, command.field, command.value)
-    // AC-REC-002.2 — the edit reaches the recipe immediately, so the surface picks it up without
-    // the user remembering to press anything.
-    await session.save()
+    /**
+     * AC-REC-002.2 — the edit reaches the recipe immediately, so the surface picks it up without
+     * the user remembering to press anything.
+     *
+     * Only once something is approved. `save()` refuses to write a recipe with nothing in it, and
+     * the review page's own order is correct-then-keep: every edit made before the first tick came
+     * back as "Couldn't save that. Nothing has changed", which was true of the recipe and not of
+     * the correction the page then threw away. It is held in the session either way, and the Keep
+     * button saves it.
+     */
+    if (session.candidates().some((candidate) => candidate.approved)) await session.save()
     return { ok: true }
   }
   if (command.type === 'douze:review:enable') {

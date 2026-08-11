@@ -84,7 +84,7 @@ pre { background: var(--surface-soft); border-radius: 8px; font-size: 12px; marg
 .steps li { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; }
 .trust { background: var(--surface-soft); border: 1px solid var(--line); border-radius: 18px; margin-top: 30px; padding: 4px 24px 22px; }
 .trust li { color: var(--muted); font-size: 13px; }
-.confirm { background: var(--surface); border: 1px solid var(--danger); border-radius: 12px; margin-top: 14px; padding: 16px 18px; }
+.confirm { background: var(--surface); border: 1px solid var(--danger); border-radius: 12px; color: var(--fg); margin-top: 14px; max-width: 52ch; padding: 16px 18px; }
 .confirm p { font-size: 14px; }
 .quiet.danger { color: var(--danger); }
 .success, .notice { background: var(--surface); border: 1px solid var(--line); border-radius: 18px; padding: 24px; }

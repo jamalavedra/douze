@@ -72,6 +72,47 @@ function editable(
   return node
 }
 
+/**
+ * WO-016 — the two consequences a reader may move a skill between, worded as the group headings
+ * above them are so the choice and the list it lands in read as the same thing.
+ *
+ * "Look things up" is not offered, here or in `editCandidate`: a lookup is the ONE class a hosted
+ * assistant can reach with nothing turned on, so letting this control produce one would be the
+ * only move that widens what an assistant may do. Everything on this menu narrows it.
+ */
+const CONSEQUENCES = [
+  ['write', 'Makes changes to your account'],
+  ['destructive', "Removes things — can't be undone, so it always asks first"],
+] as const
+
+/**
+ * Which group a skill sits in is decided by matching words in its name, so it is sometimes wrong,
+ * and the reader looking at the list is the only one who can tell. This is how they say so.
+ */
+function consequencePicker(candidate: CandidateView): HTMLElement {
+  const select = el('select') as HTMLSelectElement
+  for (const [kind, label] of CONSEQUENCES) select.append(el('option', { value: kind, textContent: label }))
+  select.value = candidate.side_effect
+  select.addEventListener('change', async () => {
+    try {
+      await send({
+        type: 'douze:review:edit',
+        sessionId: SESSION,
+        name: candidate.name,
+        field: 'side_effect',
+        value: select.value,
+      })
+      fail('')
+      // The skill moves to the other group, which is the whole feedback this needs to give.
+      await load()
+    } catch {
+      select.value = candidate.side_effect
+      fail(SAVE_FAILED)
+    }
+  })
+  return el('label', { className: 'reclassify', textContent: 'What this skill does: ' }, [select])
+}
+
 function item(candidate: CandidateView): HTMLElement {
   const consequence = el('p', {
     className: 'consequence',
@@ -98,6 +139,9 @@ function item(candidate: CandidateView): HTMLElement {
   ]
   const detailParts: Node[] = [
     editable('p', candidate, 'description', 'full-desc'),
+    // A read is inferred from the method rather than from a word list, so there is nothing here
+    // for a reader to correct — and see `CONSEQUENCES` for why it is not a destination either.
+    ...(candidate.side_effect === 'read' ? [] : [consequencePicker(candidate)]),
     el('p', { className: 'meta' }, [
       el('span', { textContent: seen }),
       editable('code', candidate, 'name', 'name'),

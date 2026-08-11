@@ -12,6 +12,13 @@ import type { ConnectCommand, ConnectState } from '../messages.js'
  * encouraging default.
  */
 
+interface ConfirmSpec {
+  copy: string
+  yes: string
+  command: ConnectCommand
+  failed: string
+}
+
 /**
  * Everything that breaks something somebody is already using: what the second click does, the
  * command it sends, and what to say if it could not be done. One shape for all three, because the
@@ -36,10 +43,55 @@ const CONFIRM = {
     command: { type: 'douze:connect:unpair' },
     failed: "Couldn't unpair. The app on this computer still has every tool.",
   },
-} as const satisfies Record<string, { copy: string; yes: string; command: ConnectCommand; failed: string }>
+} as const satisfies Record<string, ConfirmSpec>
 
-type Action = keyof typeof CONFIRM
 type Trust = 'local' | 'remote'
+
+/**
+ * What the page says a hosted assistant may do, named rather than written twice: the confirm
+ * dialog below grants exactly this, in exactly these words, so the sentence read at the moment of
+ * granting cannot drift from the one the page shows afterwards.
+ */
+const SCOPE = {
+  on: 'Hosted assistants can look things up and make changes here. Deleting is never possible from a hosted assistant — no flag, no exception.',
+  off: 'Hosted assistants get read tools only. Changing and deleting are never possible from a hosted assistant — no flag, no exception.',
+} as const
+
+const WRITES_STATE = {
+  on: 'Looking things up, and making changes — creating and updating things on the sites you recorded.',
+  off: 'Looking things up. Nothing a hosted assistant sends can change anything.',
+} as const
+
+/**
+ * WO-016 — the two grants that cannot be taken back, which were the two this page did on the first
+ * click while rotate and stop — both trivially reversible — went through the dialog.
+ *
+ * Every other control here changes what happens NEXT: turn writes off and the next change does not
+ * happen, unpair and the next call gets nothing. These two do not. A change made through a hosted
+ * assistant stays made, and a password-shaped value sent to a relay and a model provider has been
+ * read by both before the setting can be put back.
+ *
+ * The copy is the page's own — what the page will say once the grant is on, plus the trust
+ * disclosure it already carries — because that copy is accurate and there is nothing to add to it.
+ */
+const allowWrites = (): ConfirmSpec => ({
+  copy: `Allow changes too? ${WRITES_STATE.on} ${SCOPE.on} Going back to read-only later stops the next change, not the ones already made.`,
+  yes: 'Allow changes too',
+  command: { type: 'douze:connect:writes', allow: true },
+  failed: "Couldn't change what hosted assistants may do. Nothing changed.",
+})
+
+const allowRemoteResults = (tool: string): ConfirmSpec => ({
+  copy:
+    `Let ${tool}'s answers reach hosted assistants? Douze holds back any answer containing ` +
+    'something shaped like a password, key or token; this stops it holding this one back. The ' +
+    'relay operator can read and inject every message that crosses it, and the AI platform stores ' +
+    'whatever your tools return, under its retention policy rather than yours. Stopping it later ' +
+    'does not unsend what has already gone.',
+  yes: 'Allow for hosted assistants',
+  command: { type: 'douze:connect:expose', trust: 'remote', tool, allow: true },
+  failed: "Couldn't allow it. Nothing changed.",
+})
 
 /** How each trust level is named to the reader — never "local" and "remote", which are our words. */
 const WHO: Record<Trust, string> = {
@@ -64,7 +116,7 @@ let state: ConnectState = {
   exposed: { local: [], remote: [] },
   bridge: 'unpaired',
 }
-let pending: Action | null = null
+let pending: ConfirmSpec | null = null
 
 const byId = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T
 const fail = (sentence: string): void => {
@@ -111,12 +163,8 @@ function render(): void {
   byId('ready').hidden = !state.configured
   byId<HTMLInputElement>('mcp-url').value = state.mcp_url
   byId<HTMLInputElement>('relay-url').value = state.url
-  byId('scope').textContent = state.allow_writes
-    ? 'Hosted assistants can look things up and make changes here. Deleting is never possible from a hosted assistant — no flag, no exception.'
-    : 'Hosted assistants get read tools only. Changing and deleting are never possible from a hosted assistant — no flag, no exception.'
-  byId('writes-state').textContent = state.allow_writes
-    ? 'Looking things up, and making changes — creating and updating things on the sites you recorded.'
-    : 'Looking things up. Nothing a hosted assistant sends can change anything.'
+  byId('scope').textContent = state.allow_writes ? SCOPE.on : SCOPE.off
+  byId('writes-state').textContent = state.allow_writes ? WRITES_STATE.on : WRITES_STATE.off
   byId('writes').textContent = state.allow_writes ? 'Go back to read-only' : 'Allow changes too'
   byId('link-state').textContent = !state.configured
     ? 'Not shared with anything yet.'
@@ -127,9 +175,8 @@ function render(): void {
   // Nothing to withdraw when nothing was ever granted. `refused` still has a stored block to clear.
   byId<HTMLButtonElement>('unpair').disabled = state.bridge === 'unpaired'
   renderExposed()
-  byId('confirm').hidden = true
+  dialog.close()
   byId('copied').hidden = true
-  pending = null
 }
 
 /** The two exemption lists, drawn separately because they mean two different things. */
@@ -222,8 +269,14 @@ byId('copy').addEventListener('click', async () => {
 })
 
 byId('writes').addEventListener('click', () => {
+  // The grant is confirmed; going back to read-only takes access away, and nothing on this page
+  // that takes access away has ever needed a second click.
+  if (!state.allow_writes) {
+    confirm(allowWrites())
+    return
+  }
   void run(
-    { type: 'douze:connect:writes', allow: !state.allow_writes },
+    { type: 'douze:connect:writes', allow: false },
     (reason) => `Couldn't change what hosted assistants may do. Nothing changed. ${reason}`,
   )
 })
@@ -232,6 +285,13 @@ for (const trust of ['local', 'remote'] as const) {
   byId(`expose-${trust}`).addEventListener('click', () => {
     const tool = byId<HTMLSelectElement>('expose-tool').value
     if (!tool) return
+    // Only the remote grant: an app on this computer is one the user paired by hand, and this
+    // sends nothing anywhere new. The hosted one hands the value to a relay operator and a model
+    // provider, and that cannot be undone by clicking "Stop allowing" afterwards.
+    if (trust === 'remote') {
+      confirm(allowRemoteResults(tool))
+      return
+    }
     void run({ type: 'douze:connect:expose', trust, tool, allow: true }, (reason) => `Couldn't allow it. ${reason}`)
   })
 }
@@ -245,28 +305,39 @@ byId('pair').addEventListener('click', () => {
   return undefined
 })
 
-const confirm = (action: Action): void => {
-  pending = action
-  byId('confirm-copy').textContent = CONFIRM[action].copy
-  byId('confirm-yes').textContent = CONFIRM[action].yes
-  byId('confirm').hidden = false
+/**
+ * A `<dialog>` rather than a section that hides itself, because the confirm now guards a control
+ * outside the link section too: the secret-gate grant lives under "Results that look like
+ * passwords", which is on screen before anything is connected at all, and a panel nested in the
+ * hidden half of the page would have swallowed that click silently. `showModal` also brings Esc,
+ * a focus trap and the top layer for nothing.
+ */
+const dialog = byId<HTMLDialogElement>('confirm')
+
+const confirm = (spec: ConfirmSpec): void => {
+  pending = spec
+  byId('confirm-copy').textContent = spec.copy
+  byId('confirm-yes').textContent = spec.yes
+  dialog.showModal()
   byId('confirm-yes').focus()
 }
 
 for (const action of ['rotate', 'stop', 'unpair'] as const) {
-  byId(action).addEventListener('click', () => confirm(action))
+  byId(action).addEventListener('click', () => confirm(CONFIRM[action]))
 }
-byId('confirm-no').addEventListener('click', () => {
+byId('confirm-no').addEventListener('click', () => dialog.close())
+
+// Esc and the backdrop close it too, and neither runs the button's handler — so what is pending is
+// dropped here, where every close arrives, rather than in the one that cancels on purpose.
+dialog.addEventListener('close', () => {
   pending = null
-  byId('confirm').hidden = true
 })
 
 byId('confirm-yes').addEventListener('click', () => {
-  const action = pending
-  byId('confirm').hidden = true
-  pending = null
-  if (!action) return
-  void run(CONFIRM[action].command, (reason) => `${CONFIRM[action].failed} ${reason}`)
+  const spec = pending
+  dialog.close()
+  if (!spec) return
+  void run(spec.command, (reason) => `${spec.failed} ${reason}`)
 })
 
 // The page opens on whatever the worker already knows.

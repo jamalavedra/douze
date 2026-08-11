@@ -4,11 +4,13 @@
  * the extension supplies extension storage (WO-015 T-015.2). Nothing here touches `node:*`.
  */
 import { RECIPE_VERSION, Recipe, type Exchange, type Tool } from '@douze/shared'
+import { describeSync, descriptionInput } from './descriptions/writer.js'
 import { assertFixtureSafe, fixtureReference, toFixture, type Fixture } from './fixtures.js'
 import { infer, type InferenceInput } from './inference/engine.js'
 import { PATH_CREDENTIAL_PARAM } from './inference/templating.js'
 import { mergeRecipe, setField, MERGEABLE_FIELDS, type MergeReport } from './merge.js'
-import type { Candidate } from './types.js'
+import { injectConfirm } from './promotion.js'
+import type { Candidate, JsonSchema } from './types.js'
 
 export interface RecipeConfig {
   /** Recipe file name, kebab-case (`Recipe` validates it). */
@@ -86,11 +88,59 @@ export function candidateViews(candidates: Candidate[]): CandidateView[] {
 /** AC-REC-002.2 — an inline edit sets the field and marks it `user_edited`. */
 export function editCandidate(candidate: Candidate, field: EditableField, value: unknown): Candidate {
   if (!MERGEABLE_FIELDS.includes(field)) throw new Error(`field "${field}" is not editable`)
+  if (field === 'side_effect') return reclassify(candidate, value)
   setField(candidate.tool, field, value)
-  const edited = new Set(candidate.tool.flags.user_edited)
-  edited.add(field)
-  candidate.tool.flags.user_edited = [...edited].sort()
+  markEdited(candidate, field)
   return candidate
+}
+
+function markEdited(candidate: Candidate, ...fields: EditableField[]): void {
+  const edited = new Set(candidate.tool.flags.user_edited)
+  for (const field of fields) edited.add(field)
+  candidate.tool.flags.user_edited = [...edited].sort()
+}
+
+/**
+ * WO-016 — the human backstop for `classify`, which is a heuristic over *names* and will always be
+ * incomplete. `suspendAccount` sitting under "Make changes" is a judgement no regex settles, and
+ * `POST /transfers/search` under "Remove things" is a read that no hosted assistant can reach for
+ * no reason at all. Both are corrections a reviewer can now make, through the same edit plumbing
+ * that carries a name and a description.
+ *
+ * `read` is deliberately not a target. Both `write` and `destructive` are strictly LESS reachable
+ * than `read`, so every move offered here narrows what an assistant may do; a hand-set `read`
+ * would be the one move that widens it — turning a POST into something a hosted assistant may call
+ * with no write opt-in at all — which is exactly the mistake this control exists to catch.
+ *
+ * Two things travel with the label, because neither is optional:
+ *  - the `confirm` parameter, which `Recipe` demands of every approved destructive tool and
+ *    refuses to serialize without (`prepareSave` re-asserts it; this is what the reader sees);
+ *  - the description, rewritten from the new class. It carries "this cannot be undone" and "pass
+ *    confirm", and a description still phrased as a write while the policy demands a confirm is
+ *    worse than either on its own.
+ *
+ * Both fields are marked `user_edited`, so a re-record offers inference's guess in
+ * `flags.suggestions` (AC-REC-003.1) instead of quietly reverting the correction.
+ */
+function reclassify(candidate: Candidate, value: unknown): Candidate {
+  if (value !== 'write' && value !== 'destructive') {
+    throw new Error(`side_effect "${String(value)}" cannot be set by hand — choose "write" or "destructive"`)
+  }
+  const tool = candidate.tool
+  tool.side_effect = value
+  tool.request.input_schema =
+    value === 'destructive' ? injectConfirm(tool.request.input_schema) : withoutConfirm(tool.request.input_schema)
+  tool.description = describeSync(descriptionInput(tool, candidate.evidence.provenance?.accessible_name))
+  markEdited(candidate, 'side_effect', 'description')
+  return candidate
+}
+
+/** The other half of AC-REC-002.4: a demoted tool stops demanding a word it no longer means. */
+function withoutConfirm(schema: JsonSchema): JsonSchema {
+  const properties = { ...(schema['properties'] as Record<string, unknown> | undefined) }
+  delete properties['confirm']
+  const required = ((schema['required'] as string[] | undefined) ?? []).filter((key) => key !== 'confirm')
+  return { ...schema, properties, required }
 }
 
 export interface PreparedSave extends MergeReport {
@@ -143,8 +193,24 @@ export function prepareSave(
    * page-supplied credential derives nothing and leaves whatever is there — including a
    * hand-written block — alone.
    */
-  const recipe = config.auth ? { ...report.recipe, auth: { ...report.recipe.auth, ...config.auth } } : report.recipe
+  const merged = { ...report.recipe, tools: report.recipe.tools.map(withConfirmIfDestructive) }
+  const recipe = config.auth ? { ...merged, auth: { ...merged.auth, ...config.auth } } : merged
   return { ...report, recipe: Recipe.parse(recipe), fixtures }
+}
+
+/**
+ * AC-REC-002.4, asserted where every path meets rather than where each one starts.
+ *
+ * `approve` injects the confirm when a destructive tool is ticked, but ticking is not the only way
+ * one arrives here. `mergeRecipe` rebuilds `request.input_schema` from the fresh inference on every
+ * re-record, and inference has no reason to write a confirm — so an approved destructive tool that
+ * survived a re-record reached `Recipe.parse` without one and the save failed with a message the
+ * user could do nothing about. A hand-promoted tool (`reclassify`) would have hit the same wall.
+ * Idempotent, so the tools that already carry one are unchanged.
+ */
+function withConfirmIfDestructive(tool: Tool): Tool {
+  if (!tool.approved || tool.side_effect !== 'destructive') return tool
+  return { ...tool, request: { ...tool.request, input_schema: injectConfirm(tool.request.input_schema) } }
 }
 
 function buildRecipe(config: RecipeConfig, tools: Tool[]): Recipe {

@@ -257,6 +257,26 @@ describe('the review page', () => {
     expect(review).not.toContain('for (const candidate of state.candidates) chosen.add')
   })
 
+  /**
+   * WO-016 — which group a skill lands in is decided by matching words in its name, and the reader
+   * looking at the list is the only one who can see when that is wrong. The control goes through
+   * the same `douze:review:edit` route the name and the description already use.
+   */
+  it('lets the reader move a skill between the two groups that change things', () => {
+    expect(review).toContain("field: 'side_effect'")
+    expect(review).toContain("['write', 'Makes changes to your account']")
+    expect(review).toContain('[\'destructive\', "Removes things')
+    // Never back to "Look things up": read is the one class a hosted assistant reaches with
+    // nothing turned on, so offering it would be the single move that widens what it may do.
+    const choices = review.match(/const CONSEQUENCES = \[([\s\S]*?)\] as const/)?.[1] ?? ''
+    expect(choices).toContain("'write'")
+    expect(choices).toContain("'destructive'")
+    expect(choices).not.toContain("'read'")
+    expect(review).toContain("candidate.side_effect === 'read' ? [] : [consequencePicker(candidate)]")
+    // The list is redrawn from the worker's answer, so the skill visibly moves group.
+    expect(review).toContain('select.value = candidate.side_effect')
+  })
+
   it('puts every user-supplied string through textContent, never innerHTML', () => {
     expect(review).not.toContain('innerHTML')
     expect(review).not.toContain('insertAdjacentHTML')
@@ -297,7 +317,57 @@ describe('the connect page', () => {
   it('confirms before it breaks a link someone is already using', () => {
     expect(connect).toContain('The link you have now stops working straight away')
     expect(connect).toContain('Every hosted assistant loses access immediately.')
-    expect(html).toContain('<section class="confirm" id="confirm" hidden>')
+    expect(html).toContain('<dialog class="confirm" id="confirm">')
+  })
+
+  /**
+   * WO-016 — it was exactly backwards: rotate and stop, both undoable in one click, went through
+   * the dialog, while the two grants nobody can take back afterwards fired on the first click.
+   *
+   * Each grant is reachable ONLY as the `command` of a spec the dialog runs, so declining — or
+   * pressing Esc — sends nothing. Withdrawing either one stays a single click.
+   */
+  it('confirms the two grants that cannot be taken back, and only those', () => {
+    expect(connect).toContain('confirm(allowWrites())')
+    expect(connect).toContain("command: { type: 'douze:connect:writes', allow: true }")
+    expect(connect).toContain('confirm(allowRemoteResults(tool))')
+    expect(connect).toContain("command: { type: 'douze:connect:expose', trust: 'remote', tool, allow: true }")
+    // The old handler sent the grant straight from the click, whichever way it was going.
+    expect(connect).not.toContain('allow: !state.allow_writes')
+    // Only the pending spec's command is ever run from the dialog.
+    expect(connect).toContain('void run(spec.command,')
+    // Taking access away is still one click, and so is the local exemption: it hands a value to an
+    // app the user paired by hand, not to a relay operator and a model provider.
+    expect(connect).toContain("{ type: 'douze:connect:writes', allow: false }")
+    expect(connect).toContain("void run({ type: 'douze:connect:expose', trust, tool, allow: true }")
+  })
+
+  /**
+   * The words in the dialog are the page's own disclosure, not a second account of the same thing
+   * written to sound serious. Both halves of the scope line are shared with `render`.
+   */
+  it('grants in the same words the page discloses in', () => {
+    expect(connect).toContain('`Allow changes too? ${WRITES_STATE.on} ${SCOPE.on}')
+    expect(connect).toContain('byId(\'scope\').textContent = state.allow_writes ? SCOPE.on : SCOPE.off')
+    for (const line of [
+      'something shaped like a password, key or token',
+      'read and inject every message that crosses it',
+      'under its retention policy rather than yours',
+    ]) {
+      expect(connect).toContain(line)
+    }
+    expect(html).toContain('shaped like a password, key or token')
+  })
+
+  /**
+   * The dialog guards a control outside the link section — the secret-gate grant is on screen
+   * before anything is connected — so it cannot live inside the half of the page that hides itself.
+   */
+  it('puts the dialog where every control that opens it can be seen', () => {
+    expect(html.indexOf('<dialog class="confirm"')).toBeGreaterThan(html.indexOf('id="exposed"'))
+    expect(connect).toContain('dialog.showModal()')
+    // Esc and the backdrop close it without running the button, so pending is dropped on close.
+    expect(connect).toContain("dialog.addEventListener('close'")
   })
 
   /**
