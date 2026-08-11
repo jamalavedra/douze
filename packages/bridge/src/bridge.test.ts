@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { WebSocket } from 'ws'
+import { codeKey, mintNonce, proof, secretHashKey, sha256Hex } from '@douze/shared'
 import type { AttachedTool, HostFrame } from '@douze/mcp-host'
 import { startBridge, type Bridge, type BridgeOptions } from './bridge.js'
 import { credentialFile } from './pairing.js'
@@ -97,8 +98,34 @@ interface Extension {
   calls: ToolCall[]
   /** The secret the bridge minted on a first pairing, read off the raw welcome frame. */
   secret: string | null
+  /** This attachment's half of the handshake, kept so a test can try to replay it. */
+  transcript: { extensionNonce: string; bridgeNonce: string; proof: string }
   push: (tools: AttachedTool[]) => Promise<void>
   answer: (id: string, result: unknown) => void
+}
+
+/** What the extension's own credential is, and therefore which key its proof is computed with. */
+interface Credential {
+  code?: string
+  secret?: string
+}
+
+/** Everything a socket can do differently from the real extension. */
+interface Impostor {
+  /** Answer the challenge with this instead of a proof of the credential. */
+  proof?: string
+  /** Present a recorded transcript rather than a fresh one. */
+  replay?: { extensionNonce: string; proof: string }
+  /** `null` sends no Origin header at all, which is what any non-extension client does. */
+  origin?: string | null
+}
+
+/** What Chrome puts on an upgrade from an MV3 service worker; the bridge accepts nothing else. */
+const EXTENSION_ORIGIN = 'chrome-extension://ophjlpahpchlmihnnnihgmmeilfjmjjc'
+
+const keyFor = async (credential: Credential): Promise<CryptoKey | null> => {
+  if (credential.secret !== undefined) return secretHashKey(await sha256Hex(credential.secret))
+  return credential.code === undefined ? null : codeKey(credential.code)
 }
 
 const tool = (name: string, sideEffect: AttachedTool['side_effect'] = 'read'): AttachedTool => ({
@@ -108,17 +135,48 @@ const tool = (name: string, sideEffect: AttachedTool['side_effect'] = 'read'): A
   side_effect: sideEffect,
 })
 
-/** The extension side: dials in, presents a credential, pushes a surface, answers calls. */
-const attach = async (bridge: Bridge, credential: Record<string, string>): Promise<Extension | null> => {
-  const socket = new WebSocket(`ws://127.0.0.1:${bridge.port}/ws`)
+/**
+ * The extension side: dials in, runs the handshake, pushes a surface, answers calls.
+ *
+ * No credential is ever sent — `hello` carries only a nonce, and the bridge has to prove it holds
+ * the credential before this side proves anything back. `tricks` is how the tests below play the
+ * part of something that does not hold it.
+ */
+const attach = async (bridge: Bridge, credential: Credential, tricks: Impostor = {}): Promise<Extension | null> => {
+  const socket = new WebSocket(
+    `ws://127.0.0.1:${bridge.port}/ws`,
+    tricks.origin === null ? {} : { origin: tricks.origin ?? EXTENSION_ORIGIN },
+  )
   sockets.push(socket)
   const frames: HostFrame[] = []
   const calls: ToolCall[] = []
   let secret: string | null = null
+  const extensionNonce = tricks.replay?.extensionNonce ?? mintNonce()
+  const transcript = { extensionNonce, bridgeNonce: '', proof: '' }
+
+  const answerChallenge = async (challenge: { nonce: string; proof: string }): Promise<void> => {
+    transcript.bridgeNonce = challenge.nonce
+    const key = await keyFor(credential)
+    const mine =
+      tricks.replay?.proof ??
+      tricks.proof ??
+      (key === null
+        ? 'f'.repeat(64)
+        : await proof(key, { role: 'extension', port: bridge.port, extensionNonce, bridgeNonce: challenge.nonce }))
+    transcript.proof = mine
+    socket.send(JSON.stringify({ type: 'bridge.proof', proof: mine }))
+  }
 
   const welcomed = new Promise<boolean>((resolve) => {
     socket.on('message', (data) => {
-      const frame = JSON.parse(String(data)) as HostFrame & { secret?: string }
+      // The handshake is the transport's and is deliberately not in the `HostFrame` union, so it
+      // is read off the raw payload here exactly as the extension reads it.
+      const raw = JSON.parse(String(data)) as Record<string, string>
+      if (raw['type'] === 'bridge.challenge') {
+        void answerChallenge({ nonce: raw['nonce'] ?? '', proof: raw['proof'] ?? '' })
+        return
+      }
+      const frame = raw as unknown as HostFrame & { secret?: string }
       frames.push(frame)
       if (frame.type === 'ping') socket.send(JSON.stringify({ type: 'pong' }))
       if (frame.type === 'tool.call') calls.push(frame)
@@ -129,7 +187,7 @@ const attach = async (bridge: Bridge, credential: Record<string, string>): Promi
     socket.on('close', () => resolve(false))
     socket.on('error', () => resolve(false))
     socket.on('open', () =>
-      socket.send(JSON.stringify({ type: 'hello', extension_version: '0.1.0', ...credential })),
+      socket.send(JSON.stringify({ type: 'hello', extension_version: '0.1.0', nonce: extensionNonce })),
     )
   })
 
@@ -139,6 +197,7 @@ const attach = async (bridge: Bridge, credential: Record<string, string>): Promi
     frames,
     calls,
     secret,
+    transcript,
     push: async (tools) => {
       socket.send(JSON.stringify({ type: 'surface.push', tools }))
       // The push is one-way, so settle it before asserting on what the host now knows.
@@ -236,19 +295,84 @@ describe('pairing', () => {
     expect(answered.error?.data?.error).toBe('extension_disconnected')
   })
 
-  it('refuses a socket presenting no credential at all', async () => {
+  it('refuses a socket that cannot answer the challenge at all', async () => {
     const mcp = await client()
 
     expect(await attach(mcp.bridge, {})).toBeNull()
   })
 
-  it('attaches the one that presents the code, and mints a credential for next time', async () => {
-    const [, extension] = await paired()
+  /**
+   * The direction that matters most, because the extension is the side with something to lose: it
+   * hands `local` trust — destructive tools included — to whatever answers on this port, so what it
+   * gets back has to be unforgeable by anything that does not hold the code.
+   */
+  it('proves it holds the code before it is told anything, over both nonces and this port', async () => {
+    const mcp = await client()
+    const code = mcp.bridge.code as string
+    const extensionNonce = mintNonce()
+    const socket = new WebSocket(`ws://127.0.0.1:${mcp.bridge.port}/ws`, { origin: EXTENSION_ORIGIN })
+    sockets.push(socket)
+
+    const challenge = await new Promise<{ type: string; nonce: string; proof: string }>((resolve) => {
+      socket.on('message', (data) => resolve(JSON.parse(String(data)) as never))
+      socket.on('open', () => socket.send(JSON.stringify({ type: 'hello', extension_version: '0.1.0', nonce: extensionNonce })))
+    })
+
+    const key = await codeKey(code)
+    const transcript = { port: mcp.bridge.port, extensionNonce, bridgeNonce: challenge.nonce }
+    expect(challenge.type).toBe('bridge.challenge')
+    expect(challenge.proof).toBe(await proof(key, { role: 'bridge', ...transcript }))
+    // Bound to the role and to the port: a rogue cannot reflect this back as the extension's own
+    // proof, nor forward a challenge it got from a real bridge on a different port.
+    expect(challenge.proof).not.toBe(await proof(key, { role: 'extension', ...transcript }))
+    expect(challenge.proof).not.toBe(await proof(key, { role: 'bridge', ...transcript, port: transcript.port + 1 }))
+    // And a wrong code produces a proof the extension would reject.
+    expect(challenge.proof).not.toBe(await proof(await codeKey('AAAA-AAAA'), { role: 'bridge', ...transcript }))
+  })
+
+  it('refuses a replayed transcript, because the nonce it was signed against is spent', async () => {
+    const [mcp, extension] = await paired()
+    // Recorded from a real attach on the credential this bridge is running on now, so the only
+    // thing wrong with it is that its nonces are yesterday's.
+    const recorded = (await reattach(mcp.bridge, extension)).transcript
+
+    const replayed = await attach(
+      mcp.bridge,
+      { secret: extension.secret ?? '' },
+      { replay: { extensionNonce: recorded.extensionNonce, proof: recorded.proof } },
+    )
+
+    expect(replayed).toBeNull()
+  })
+
+  /**
+   * WebSocket upgrades are exempt from CORS, so without this any page the user visits can reach
+   * 127.0.0.1:8912, learn that Douze is running and burn the attempt cap until the bridge refuses
+   * its own extension. Rejected at the upgrade, so it never counts as an attempt either.
+   */
+  it('rejects an upgrade from anything but an extension, and counts no attempt for it', async () => {
+    const mcp = await client()
+
+    for (let attempt = 0; attempt < 15; attempt += 1) {
+      expect(await attach(mcp.bridge, { code: mcp.bridge.code ?? '' }, { origin: 'https://evil.test' })).toBeNull()
+    }
+    expect(await attach(mcp.bridge, { code: mcp.bridge.code ?? '' }, { origin: null })).toBeNull()
+
+    // The real extension still pairs: nothing a page did was ever counted against it.
+    expect(await attach(mcp.bridge, { code: mcp.bridge.code ?? '' })).not.toBeNull()
+  })
+
+  it('attaches the one that proves the code, and mints a credential for next time', async () => {
+    const [mcp, extension] = await paired()
 
     expect(extension.secret).toMatch(/^[\w-]{43}$/)
     expect(statSync(credentialFile()).mode & 0o777).toBe(0o600)
     // The secret itself is never written down on the bridge's side.
-    expect(JSON.stringify(statSync(credentialFile()))).not.toContain(extension.secret)
+    expect(readFileSync(credentialFile(), 'utf8')).not.toContain(extension.secret)
+    // And it goes on the wire exactly once, on the pairing that minted it: every later attach
+    // proves knowledge of sha256(secret) instead of presenting anything.
+    const returned = await reattach(mcp.bridge, extension)
+    expect(returned.frames.map((frame) => JSON.stringify(frame)).join()).not.toContain(extension.secret)
   })
 
   it('survives a restart: the credential attaches and no new code is printed', async () => {

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { Recipe } from '@douze/shared'
+import { Recipe, codeKey, mintNonce, proof, secretHashKey, sha256Hex } from '@douze/shared'
 import type { RelayPairing } from './attach.js'
 import type { ConnectState, PageEvent } from './messages.js'
 import { RecipeStore } from './recipes.js'
@@ -804,13 +804,60 @@ async function approveShop(): Promise<void> {
 const pushedNames = (socket: FakeSocket): string[][] =>
   socket.frames('surface.push').map((frame) => (frame['tools'] as { name: string }[]).map((tool) => tool.name))
 
-/** Boots a worker with a stored pairing and takes the socket it dialled through the handshake. */
-async function attach(seed: Record<string, unknown>, match: string): Promise<FakeSocket> {
+/**
+ * The bridge's half of the loopback handshake (T-015.12), computed the way a real bridge computes
+ * it — over the extension's own nonce, the bridge's, and the port that was dialled.
+ *
+ * A test that wants to be a rogue passes `tricks.proof`: something that answered the port without
+ * holding the credential can put any bytes it likes here, and that is exactly the case the
+ * extension has to survive.
+ */
+const challenge = async (
+  socket: FakeSocket,
+  credential: { code?: string; secret?: string },
+  tricks: { proof?: string; nonce?: string } = {},
+): Promise<{ nonce: string; proof: string }> => {
+  const hello = socket.frames('hello')[0] ?? {}
+  const extensionNonce = String(hello['nonce'] ?? '')
+  const bridgeNonce = tricks.nonce ?? mintNonce()
+  const port = Number(new URL(socket.url).port)
+  const key =
+    credential.secret === undefined
+      ? await codeKey(credential.code ?? '')
+      : await secretHashKey(await sha256Hex(credential.secret))
+  const frame = {
+    type: 'bridge.challenge',
+    nonce: bridgeNonce,
+    proof: tricks.proof ?? (await proof(key, { role: 'bridge', port, extensionNonce, bridgeNonce })),
+  }
+  socket.deliver(frame)
+  // The proof is Web Crypto, so the worker answers a macrotask or several later, not synchronously.
+  await until(() => socket.frames('bridge.proof').length > 0)
+  return { nonce: bridgeNonce, proof: frame.proof }
+}
+
+/** Waits for something the worker does asynchronously, or gives up and lets the assertion fail. */
+const until = async (predicate: () => boolean, ms = 2000): Promise<void> => {
+  const deadline = Date.now() + ms
+  while (!predicate() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5))
+}
+
+/**
+ * Boots a worker with a stored pairing and takes the socket it dialled through the handshake.
+ * `bridge` is the credential the far side is to prove it holds; without it nothing is proved, which
+ * is what a rogue on the port amounts to.
+ */
+async function attach(
+  seed: Record<string, unknown>,
+  match: string,
+  bridge?: { code?: string; secret?: string },
+): Promise<FakeSocket> {
   await bootWorker(seed)
   const socket = dialled(match)
   if (!socket) throw new Error(`nothing dialled ${match}; saw ${FakeSocket.opened.map((s) => s.url).join(', ')}`)
   socket.accept()
   await settle()
+  if (bridge) await challenge(socket, bridge)
   socket.deliver({ type: 'welcome', heartbeat_ms: 20_000 })
   await settle()
   return socket
@@ -902,15 +949,20 @@ describe('the trust table, enforced in the extension (T-015.9)', () => {
     expect(resultFor(allowed, 'w2')?.['error']).toBeUndefined()
   })
 
-  it('gives a paired local bridge everything, and asks a destructive tool for confirm', async () => {
-    const socket = await attach({ 'attach:bridge': { secret: 'pinned-secret' } }, '127.0.0.1')
+  it('gives a proved local bridge everything, and asks a destructive tool for confirm', async () => {
+    const socket = await attach({ 'attach:bridge': { secret: 'pinned-secret' } }, '127.0.0.1', {
+      secret: 'pinned-secret',
+    })
     await approveShop()
     expect(pushedNames(socket).at(-1)).toEqual(['shop_list_orders', 'shop_create_order', 'shop_delete_order'])
+    // The credential is not on the wire: hello carries this dial's nonce and nothing else, and the
+    // answer to the challenge is an HMAC over it.
     expect(socket.frames('hello')[0]).toEqual({
       type: 'hello',
       extension_version: '0.1.0',
-      secret: 'pinned-secret',
+      nonce: expect.stringMatching(/^[\w-]{43}$/) as unknown as string,
     })
+    expect(JSON.stringify(socket.sent)).not.toContain('pinned-secret')
 
     socket.deliver(callFrame('d1', 'shop_delete_order', { id: '7' }, 'remote'))
     socket.deliver(callFrame('d2', 'shop_delete_order', { id: '7', confirm: true }, 'remote'))
@@ -1034,9 +1086,12 @@ describe('a host that refuses the pairing (T-015.8/12)', () => {
     socket.drop(1008)
     await settle()
 
-    expect(fake.notifications.at(-1)?.title).toBe('Douze lost its link')
+    // Judged on the next tick, not at the close: a rotate the user just performed closes the old
+    // socket exactly like this, and the two are only distinguishable once storage has settled.
+    expect(fake.notifications.at(-1)?.title).not.toBe('Douze lost its link')
     fake.onAlarm.emit({ name: 'douze-attach' })
     await settle()
+    expect(fake.notifications.at(-1)?.title).toBe('Douze lost its link')
     expect(FakeSocket.opened.length).toBe(before)
 
     // A token written by the connect page is a different one, so dialling resumes on its own.
@@ -1050,6 +1105,28 @@ describe('a host that refuses the pairing (T-015.8/12)', () => {
     expect(retried.frames('hello')[0]).toMatchObject({ token: 'a-new-token' })
   })
 
+  /**
+   * The relay kills the old token the moment it answers `POST /rotate`, so the extension's socket
+   * is closed 1008 by something the user just asked for. Telling them their link died and then
+   * silently re-dialling 30 seconds later is how a working feature looks broken.
+   */
+  it('says nothing when the 1008 was the rotate the user just performed', async () => {
+    const socket = await attach({ 'attach:relay': RELAY }, 'relay.test')
+    const quiet = fake.notifications.length
+
+    socket.drop(1008)
+    await chrome.storage.local.set({ 'attach:relay': { ...RELAY, token: 'rotated-token' } })
+    fake.onAlarm.emit({ name: 'douze-attach' })
+    await settle()
+
+    expect(fake.notifications).toHaveLength(quiet)
+    const retried = dialled('relay.test') as FakeSocket
+    expect(retried).not.toBe(socket)
+    retried.accept()
+    await settle()
+    expect(retried.frames('hello')[0]).toMatchObject({ token: 'rotated-token' })
+  })
+
   it('takes a fresh pairing code from the connect page and pins the secret it earns', async () => {
     await attach({ 'attach:bridge': { secret: 'stale' } }, '127.0.0.1')
     ;(dialled('127.0.0.1') as FakeSocket).drop(1008)
@@ -1060,13 +1137,89 @@ describe('a host that refuses the pairing (T-015.8/12)', () => {
     const retried = dialled('127.0.0.1') as FakeSocket
     retried.accept()
     await settle()
-    expect(retried.frames('hello')[0]).toMatchObject({ code: 'four-word-code' })
+    await challenge(retried, { code: 'four-word-code' })
 
     // The bridge mints the credential on a first pairing and hands it back BESIDE `welcome`; the
     // protocol schema strips it, so it is read off the raw frame and pinned for every later dial.
     retried.deliver({ type: 'welcome', heartbeat_ms: 20_000 }, { secret: 'minted-secret' })
     await settle()
     expect(fake.local.get('attach:bridge')).toEqual({ secret: 'minted-secret' })
+    // Not even on a FIRST pairing does the code travel: a rogue that owned this port would have
+    // learned the code and every credential it buys from that one frame.
+    expect(JSON.stringify(retried.sent)).not.toContain('four-word-code')
+    expect(JSON.stringify(retried.sent)).not.toContain('minted-secret')
+  })
+})
+
+/**
+ * T-015.12 — **the rogue on the port.** Binding a loopback port is not privileged, so any process
+ * running as the user can take one of 8912–8916 and wait for the extension's next 30-second alarm.
+ * Everything this describes is a peer that answered the dial without holding the credential, and
+ * the assertion is always the same: it is told nothing and can do nothing.
+ */
+describe('a bridge that cannot prove it holds the credential (T-015.12)', () => {
+  const BRIDGE = { 'attach:bridge': { secret: 'pinned-secret' } }
+  /** A proof of the right shape and the wrong value, which is all a rogue can produce. */
+  const FORGED = 'a'.repeat(64)
+
+  it('is refused local trust, told no surface, and cannot run a destructive tool', async () => {
+    await bootWorker(BRIDGE)
+    await approveShop()
+    const socket = dialled('127.0.0.1') as FakeSocket
+    socket.accept()
+    await settle()
+
+    // The whole attack in three frames: answer the dial, forge a welcome, ask for the tool that
+    // only `local` trust reaches.
+    socket.deliver({ type: 'bridge.challenge', nonce: mintNonce(), proof: FORGED })
+    socket.deliver({ type: 'welcome', heartbeat_ms: 20_000 }, { secret: 'rogue-secret' })
+    socket.deliver(callFrame('x1', 'shop_delete_order', { id: '7', confirm: true }, 'local'))
+    await settle()
+    await settle()
+
+    expect(socket.frames('bridge.proof')).toEqual([])
+    expect(socket.frames('surface.push')).toEqual([])
+    expect(socket.frames('tool.result')).toEqual([])
+    // And it could not swap the pinned credential for one of its own on the way past.
+    expect(fake.local.get('attach:bridge')).toEqual({ secret: 'pinned-secret' })
+  })
+
+  it('cannot replay a real bridge’s challenge at the next dial, because the nonces are spent', async () => {
+    await bootWorker(BRIDGE)
+    const first = dialled('127.0.0.1') as FakeSocket
+    first.accept()
+    await settle()
+    // What a real bridge said on a real attach, recorded off the wire the way a rogue would.
+    const recorded = await challenge(first, { secret: 'pinned-secret' })
+    first.deliver({ type: 'welcome', heartbeat_ms: 20_000 })
+    await settle()
+    expect(first.frames('bridge.proof')).toHaveLength(1)
+
+    first.drop()
+    fake.onAlarm.emit({ name: 'douze-attach' })
+    await settle()
+    const second = dialled('127.0.0.1') as FakeSocket
+    second.accept()
+    await settle()
+    second.deliver({ type: 'bridge.challenge', nonce: recorded.nonce, proof: recorded.proof })
+    second.deliver({ type: 'welcome', heartbeat_ms: 20_000 })
+    await settle()
+    await settle()
+
+    expect(second.frames('bridge.proof')).toEqual([])
+    expect(second.frames('surface.push')).toEqual([])
+  })
+
+  it('answers nothing to a peer that skips the handshake and just says welcome', async () => {
+    const socket = await attach(BRIDGE, '127.0.0.1')
+    await approveShop()
+    socket.deliver({ type: 'ping' })
+    socket.deliver(callFrame('x2', 'shop_list_orders', {}, 'local'))
+    await settle()
+
+    expect(socket.frames('pong')).toEqual([])
+    expect(socket.frames('surface.push')).toEqual([])
+    expect(socket.frames('tool.result')).toEqual([])
   })
 })
 
@@ -1281,6 +1434,9 @@ describe('sharing Douze with a hosted assistant (T-015.10)', () => {
     const socket = dialled('127.0.0.1') as FakeSocket
     socket.accept()
     await settle()
+    // Still `trying` until the far side proves it holds the code: a welcome alone is something any
+    // process that took the port can say.
+    await challenge(socket, { code: 'four-word-code' })
     socket.deliver({ type: 'welcome', heartbeat_ms: 20_000 }, { secret: 'minted-secret' })
     await settle()
     expect((await connect({ type: 'douze:connect:status' })).bridge).toBe('paired')
