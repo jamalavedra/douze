@@ -294,6 +294,38 @@ describe('URL fragment and userinfo (REQ-CAP-005)', () => {
   })
 })
 
+/**
+ * A key is as readable off disk as a value, and `{"<token>": {...}}` is an ordinary shape for a
+ * map keyed by session or API key. Both redactors walked values only, so such a secret passed
+ * through redaction AND the write gate untouched — the one thing the gate exists to prevent.
+ */
+describe('secrets in key position (REQ-CAP-005, TR-6)', () => {
+  const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r-wW1gFWFOEjXk'
+
+  it('flags a credential-shaped object key', () => {
+    expect(findSurvivingSecrets({ [jwt]: { id: 1 } })).toEqual([`$.${jwt} (key)`])
+  })
+
+  it('redacts a credential-shaped object key while keeping the shape', () => {
+    const redacted = redactBody({ [jwt]: { id: 1 } }) as Record<string, unknown>
+    expect(Object.keys(redacted)).toEqual([`«redacted:string:${jwt.length}»`])
+    expect(redacted[`«redacted:string:${jwt.length}»`]).toEqual({ id: 1 })
+    expect(findSurvivingSecrets(redacted)).toEqual([])
+  })
+
+  it('redacts a credential-shaped header name', () => {
+    const redacted = redactHeaders({ [jwt]: 'x' })
+    expect(Object.keys(redacted)).toEqual([`«redacted:string:${jwt.length}»`])
+    expect(findSurvivingSecrets(redacted)).toEqual([])
+  })
+
+  it('leaves ordinary keys alone', () => {
+    const body = { order_id: 10_482, customer_name: 'Ada' }
+    expect(redactBody(body)).toEqual(body)
+    expect(findSurvivingSecrets(body)).toEqual([])
+  })
+})
+
 describe('redaction idempotence', () => {
   it('does not re-redact an already-redacted value, preserving the original length', () => {
     const once = redactBody({ password: 'hunter2' }) as Record<string, string>

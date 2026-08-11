@@ -85,7 +85,10 @@ export function redactHeaders(
   const out: Record<string, string> = {}
   for (const [name, value] of Object.entries(headers)) {
     const secret = matches(name, config.headers) || looksLikeCredential(value)
-    out[name] = secret && !isPlaceholder(value) ? placeholder(value) : value
+    // A credential-shaped header NAME is redacted in place: the name is as persistent as the
+    // value, and the gate refuses the exchange over it either way.
+    const key = looksLikeCredential(name) ? placeholder(name) : name
+    out[key] = secret && !isPlaceholder(value) ? placeholder(value) : value
   }
   return out
 }
@@ -135,7 +138,10 @@ export function redactBody(body: unknown, config: RedactionConfig = defaultRedac
   if (body !== null && typeof body === 'object') {
     const out: Record<string, unknown> = {}
     for (const [key, value] of Object.entries(body)) {
-      out[key] =
+      // The key is redacted for the same reason the value is: `{"<jwt>": {...}}` persists the
+      // token just as readably as `{"token": "<jwt>"}`, and the shape survives the replacement.
+      const name = looksLikeCredential(key) ? placeholder(key) : key
+      out[name] =
         matches(key, config.fields) && !isPlaceholder(value) ? placeholder(value) : redactBody(value, config)
     }
     return out
@@ -226,7 +232,13 @@ export function findSurvivingSecrets(value: unknown, path = '$'): string[] {
   if (typeof value === 'string') return looksLikeCredential(value) ? [path] : []
   if (Array.isArray(value)) return value.flatMap((v, i) => findSurvivingSecrets(v, `${path}[${i}]`))
   if (value !== null && typeof value === 'object') {
-    return Object.entries(value).flatMap(([k, v]) => findSurvivingSecrets(v, `${path}.${k}`))
+    return Object.entries(value).flatMap(([k, v]) => [
+      // A key is as readable off disk as a value. `{"<jwt>": {...}}` is an ordinary shape for a
+      // map keyed by session or token, and walking values alone let one through both this gate
+      // and the redactors, which is the one thing this function exists to make impossible.
+      ...(looksLikeCredential(k) ? [`${path}.${k} (key)`] : []),
+      ...findSurvivingSecrets(v, `${path}.${k}`),
+    ])
   }
   return []
 }
