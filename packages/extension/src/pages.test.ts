@@ -183,11 +183,71 @@ describe('the connect page', () => {
     expect(connect).toContain('The link is selected — press Ctrl-C, or Cmd-C on a Mac, to copy it.')
   })
 
-  it('is stubbed until T-015.10, and says so rather than half-doing it', () => {
-    expect(background).toContain('NOT_CONNECTED_YET')
-    expect(background).toContain("command.type === 'douze:connect:status'")
-    for (const action of ['start', 'rotate', 'stop']) {
+  /**
+   * WO-015 T-015.10 — the no-terminal path, end to end on one page: every control the CLI's
+   * `douze connect` had is here, and nothing is left saying "not wired up yet".
+   */
+  it('mints, rotates and retires the link from the page itself', () => {
+    for (const action of ['start', 'rotate', 'stop', 'writes', 'pair', 'expose', 'status']) {
       expect(connect).toContain(`douze:connect:${action}`)
     }
+    expect(background).not.toContain('NOT_CONNECTED_YET')
+    expect(background).toContain("command.type === 'douze:connect:start'")
+    expect(background).toContain("relayFetch(base, '/register', {")
+    expect(background).toContain("relayFetch(relay.url, '/rotate', { method: 'POST', token: relay.token })")
+    expect(background).toContain("relayFetch(relay.url, '/register', { method: 'DELETE', token: relay.token })")
+    // The page asks Chrome for the relay's origin itself: a worker `fetch` has no gesture to spend.
+    expect(connect).toContain('chrome.permissions.request({ origins: [`${origin}/*`] })')
+  })
+
+  /** The page never opens a socket or writes storage: the worker owns both, as with review. */
+  it('talks to the worker rather than to a relay', () => {
+    expect(connect).not.toContain('fetch(')
+    expect(connect).not.toContain('WebSocket')
+    expect(connect).not.toContain('chrome.storage')
+    expect(connect).toContain('chrome.runtime.sendMessage(command)')
+  })
+
+  it('renders every state it is told about, and says so when it is not told', () => {
+    // Connected, and the honest version of not-connected: the link outlives the socket.
+    expect(connect).toContain('Shared, and Douze has a live connection right now.')
+    expect(connect).toContain('Shared, but Douze has no connection at the moment.')
+    expect(connect).toContain('Not shared with anything yet.')
+    // The write opt-in reads out what it currently means, not just what the button would do.
+    expect(connect).toContain('Nothing a hosted assistant sends can change anything.')
+    expect(connect).toContain('Go back to read-only')
+    // Four bridge states, including the two that are neither paired nor unpaired.
+    expect(connect).toContain("trying: 'Douze has your code and is trying to pair.")
+    expect(connect).toContain("refused: 'The last code was refused.")
+    // An empty surface is said out loud rather than drawn as a box that does nothing.
+    expect(connect).toContain("byId('expose-empty').hidden = !none")
+    expect(html).toContain('Douze has no tools set up yet, so there is nothing to allow.')
+  })
+
+  it('keeps the two trust levels apart in the exemption control', () => {
+    expect(html).toContain('<ul class="steps" id="exposed-local"></ul>')
+    expect(html).toContain('<ul class="steps" id="exposed-remote"></ul>')
+    expect(html).toContain('<button type="button" class="quiet" id="expose-local">')
+    expect(html).toContain('<button type="button" class="quiet" id="expose-remote">')
+    expect(html).toContain(
+      'not start sending that value to whoever runs the relay',
+    )
+    // One list per level, drawn from that level's own array — never a merged one.
+    expect(connect).toContain('const tools = state.exposed[trust]')
+    expect(connect).not.toContain('...state.exposed.local')
+  })
+
+  it('explains why a local app has to be paired at all', () => {
+    expect(html).toContain('typing it in is you saying yes')
+    expect(html).toContain('<input class="field" id="pair-code"')
+    expect(connect).toContain("{ type: 'douze:connect:pair', code }")
+  })
+
+  it('puts every user-supplied string through textContent, never innerHTML', () => {
+    expect(connect).not.toContain('innerHTML')
+    expect(connect).not.toContain('insertAdjacentHTML')
+    expect(connect).toContain("remove.textContent = 'Stop allowing'")
+    expect(html).not.toContain('<div role="button"')
+    expect(html).not.toContain('<a href="#"')
   })
 })

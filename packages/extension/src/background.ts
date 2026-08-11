@@ -13,7 +13,16 @@ import type {
   ReviewState,
   SiteTool,
 } from './messages.js'
-import { RELAY_KEY, recentCalls, startAttachments, type RelayPairing } from './attach.js'
+import {
+  BRIDGE_KEY,
+  EXPOSE_KEY,
+  RELAY_KEY,
+  recentCalls,
+  startAttachments,
+  type BridgePairing,
+  type ExposeLists,
+  type RelayPairing,
+} from './attach.js'
 import { DebuggerCapture } from './debugger-capture.js'
 import { installOracle } from './oracle.js'
 import { RECONCILE_GRACE_MS, Reconciler, admits, decodeBody, finalize, type ExchangeDraft } from './pipeline.js'
@@ -494,38 +503,212 @@ async function onReviewCommand(command: ReviewCommand): Promise<ReviewState | Re
 // --- connect --------------------------------------------------------------
 
 /**
- * T-015.10 owns registering with a relay: `start`, `rotate` and `stop` all mint or retire an
- * endpoint, and none of them is wired yet, so each is refused by name rather than half-done.
+ * WO-015 T-015.10 — **the no-terminal path.** `douze connect <url>` needed a terminal that the
+ * people this product is for do not have, so minting, rotating and retiring a relay endpoint
+ * happens here, driven by the connect page.
  *
- * What T-015.8 does own is answering honestly about the pairing that IS stored and whether the
- * socket is up right now, and taking the bridge's pairing code (T-015.12) — both of which the page
- * would otherwise have to guess at.
+ * Everything written by these commands goes to `attach:relay` and nowhere else. The attachment
+ * client re-reads that key on its own alarm and re-dials within 30 seconds, because its attachment
+ * key carries the token and the write opt-in; nothing here touches a socket. Two writers to one
+ * connection is a race, and one storage key both halves already agree on is not.
  */
-const NOT_CONNECTED_YET = 'Connecting to a hosted assistant is not wired up yet.'
+const DEFAULT_RELAY_URL = 'https://douze.jamalavedra.com'
 
-async function connectState(): Promise<ConnectState> {
-  const stored = await chrome.storage.local.get(RELAY_KEY)
+/**
+ * Well under the 30 seconds a worker-issued fetch may take before Chrome kills the worker
+ * mid-registration — which would leave a live endpoint on the relay that nothing here has the
+ * token for.
+ */
+const RELAY_TIMEOUT_MS = 15_000
+
+/** What `POST /register` and `POST /rotate` answer with (packages/relay/README.md). */
+interface Registration {
+  token: string
+  mcp_path: string
+}
+
+async function connectState(extra: Partial<ConnectState> = {}): Promise<ConnectState> {
+  const stored = await chrome.storage.local.get([RELAY_KEY, BRIDGE_KEY, EXPOSE_KEY])
   const relay = stored[RELAY_KEY] as RelayPairing | undefined
+  const bridge = (stored[BRIDGE_KEY] as BridgePairing | undefined) ?? {}
+  const expose = stored[EXPOSE_KEY] as Partial<ExposeLists> | undefined
   return {
     configured: relay !== undefined,
-    url: relay?.url ?? '',
+    url: relay?.url ?? DEFAULT_RELAY_URL,
     mcp_url: relay === undefined ? '' : `${relay.url}${relay.mcp_path}`,
     allow_writes: relay?.allow_writes ?? false,
     connected: attachments.connected(),
+    tools: liveSurface.map((entry) => entry.qualified_name),
+    exposed: { local: expose?.local ?? [], remote: expose?.remote ?? [] },
+    bridge: bridgeState(bridge),
+    ...extra,
   }
 }
 
+const bridgeState = (bridge: BridgePairing): ConnectState['bridge'] => {
+  if (bridge.secret) return 'paired'
+  if (bridge.blocked) return 'refused'
+  return bridge.code ? 'trying' : 'unpaired'
+}
+
+/** The stored pairing, or the reason there is nothing to rotate, stop or change. */
+async function storedRelay(): Promise<RelayPairing> {
+  const stored = await chrome.storage.local.get(RELAY_KEY)
+  const relay = stored[RELAY_KEY] as RelayPairing | undefined
+  if (!relay) throw new Error('Douze is not sharing with a hosted assistant, so there is nothing to change.')
+  return relay
+}
+
+/**
+ * A relay address Douze is willing to hand its link to. Plain http is refused off the loopback
+ * interface because the link IS the password, and an address the user mistyped must fail here
+ * rather than as a network error nobody can act on.
+ */
+function relayBase(url: string): string {
+  const trimmed = url.trim().replace(/\/+$/, '')
+  let parsed: URL
+  try {
+    parsed = new URL(trimmed)
+  } catch {
+    throw new Error(`"${url}" is not a web address. It should look like ${DEFAULT_RELAY_URL}.`)
+  }
+  const loopback = parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost'
+  if (parsed.protocol === 'https:' || (parsed.protocol === 'http:' && loopback)) return trimmed
+  throw new Error(
+    `A relay address has to start with https:// — the link is the password, and plain http would ` +
+      `send it across the internet in the clear.`,
+  )
+}
+
+/**
+ * One call to the relay's own HTTP API, in the user's language when it fails.
+ *
+ * The host permission is checked first and named: a worker's `fetch` to a relay Chrome has not
+ * granted fails as an opaque network error, and "check you are online" would send someone looking
+ * at their wifi for a permission they can grant in one click.
+ */
+async function relayFetch(
+  base: string,
+  path: string,
+  init: { method: string; token?: string; body?: unknown },
+): Promise<Registration | null> {
+  const origin = new URL(base).origin
+  if (!(await chrome.permissions.contains({ origins: [`${origin}/*`] }))) {
+    throw new Error(`Chrome has not given Douze permission to reach ${origin}. Try again and choose Allow.`)
+  }
+  let response: Response
+  try {
+    response = await fetch(`${base}${path}`, {
+      method: init.method,
+      headers: {
+        ...(init.body === undefined ? {} : { 'content-type': 'application/json' }),
+        ...(init.token === undefined ? {} : { 'x-douze-relay-token': init.token }),
+      },
+      ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
+      signal: AbortSignal.timeout(RELAY_TIMEOUT_MS),
+    })
+  } catch {
+    throw new Error(`Douze could not reach ${origin}. Check that you are online and that the address is right.`)
+  }
+  if (response.status === 401) {
+    throw new Error(`${origin} does not recognise this link any more. Stop sharing, then connect again.`)
+  }
+  if (response.status === 429) {
+    throw new Error(`${origin} is not handing out new links at the moment. Try again in an hour.`)
+  }
+  if (!response.ok) throw new Error(`${origin} answered with an error (${response.status}). Nothing changed.`)
+  if (response.status === 204) return null
+  const body = (await response.json().catch(() => null)) as Registration | null
+  if (typeof body?.token !== 'string' || typeof body.mcp_path !== 'string') {
+    throw new Error(`${origin} answered with something Douze did not understand. It may not be a Douze relay.`)
+  }
+  return body
+}
+
+/** `POST /register`, then the pairing the attachment client will find on its next alarm. */
+async function startLink(url: string | undefined): Promise<ConnectState> {
+  const base = relayBase(url ?? DEFAULT_RELAY_URL)
+  const registered = await relayFetch(base, '/register', {
+    method: 'POST',
+    body: { daemon_version: chrome.runtime.getManifest().version },
+  })
+  if (!registered) throw new Error(`${base} did not hand back a link. Nothing is being shared.`)
+  await chrome.storage.local.set({
+    [RELAY_KEY]: {
+      url: base,
+      token: registered.token,
+      mcp_path: registered.mcp_path,
+      allow_writes: false,
+    } satisfies RelayPairing,
+  })
+  return connectState()
+}
+
+/**
+ * `POST /rotate`. The relay kills the old token and URL the moment it answers, so the pairing is
+ * REPLACED here — a second stored pairing would leave the extension dialling with a token the
+ * relay has already forgotten, and the user believing an address that is dead.
+ */
+async function rotateLink(): Promise<ConnectState> {
+  const relay = await storedRelay()
+  const rotated = await relayFetch(relay.url, '/rotate', { method: 'POST', token: relay.token })
+  if (!rotated) throw new Error(`${relay.url} did not hand back a new link. The one you have still works.`)
+  await chrome.storage.local.set({
+    [RELAY_KEY]: { ...relay, token: rotated.token, mcp_path: rotated.mcp_path } satisfies RelayPairing,
+  })
+  return connectState()
+}
+
+/**
+ * `DELETE /register`, best effort. Someone who wants to stop sharing must always be able to, so a
+ * relay that cannot be reached does not block it: the pairing goes either way and the page is told
+ * plainly that the relay was not informed.
+ */
+async function stopLink(): Promise<ConnectState> {
+  const relay = await storedRelay()
+  let warning: string | undefined
+  try {
+    await relayFetch(relay.url, '/register', { method: 'DELETE', token: relay.token })
+  } catch (error) {
+    warning =
+      `Douze stopped sharing and the link no longer works from this computer, but it could not tell ` +
+      `${relay.url} to drop it: ${String((error as Error)?.message ?? error)}`
+  }
+  await chrome.storage.local.remove(RELAY_KEY)
+  return connectState(warning === undefined ? {} : { warning })
+}
+
+/**
+ * T-015.9 — the write opt-in, stored on the pairing. The attachment key includes it, so the client
+ * closes the read-only socket and dials a new one within 30 seconds, pushing the surface that opt-in
+ * implies. Destructive tools are not on either surface and this does not put them there.
+ */
+async function setWrites(allow: boolean): Promise<ConnectState> {
+  const relay = await storedRelay()
+  await chrome.storage.local.set({ [RELAY_KEY]: { ...relay, allow_writes: allow } satisfies RelayPairing })
+  return connectState()
+}
+
 async function onConnectCommand(command: ConnectCommand): Promise<ConnectState> {
-  if (command.type === 'douze:connect:pair') {
-    await attachments.pair(command.code)
-    return connectState()
+  try {
+    if (command.type === 'douze:connect:pair') {
+      await attachments.pair(command.code)
+      return await connectState()
+    }
+    if (command.type === 'douze:connect:expose') {
+      await attachments.setExposed(command.trust, command.tool, command.allow)
+      return await connectState()
+    }
+    if (command.type === 'douze:connect:start') return await startLink(command.url)
+    if (command.type === 'douze:connect:rotate') return await rotateLink()
+    if (command.type === 'douze:connect:stop') return await stopLink()
+    if (command.type === 'douze:connect:writes') return await setWrites(command.allow)
+    return await connectState()
+  } catch (error) {
+    // The page renders `error` and changes nothing on screen, so what it says has to be what the
+    // reader can do about it — every throw above is written for them.
+    return connectState({ error: String((error as Error)?.message ?? error) })
   }
-  if (command.type === 'douze:connect:expose') {
-    await attachments.setExposed(command.trust, command.tool, command.allow)
-    return connectState()
-  }
-  const state = await connectState()
-  return command.type === 'douze:connect:status' ? state : { ...state, error: NOT_CONNECTED_YET }
 }
 
 const status = (): PopupStatus => ({
