@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "description": "Let your AI assistant use the websites you're signed into. Douze watches a site while you use it, then your assistant can do those things for you. Nothing leaves your computer.",
   "minimum_chrome_version": "116",
-  "permissions": ["scripting", "storage", "alarms", "tabs", "webRequest", "notifications"],
+  "permissions": ["scripting", "storage", "unlimitedStorage", "alarms", "tabs", "webRequest", "notifications"],
   "optional_permissions": ["debugger"],
   "optional_host_permissions": ["https://*/*", "http://*/*"],
   "host_permissions": [],
