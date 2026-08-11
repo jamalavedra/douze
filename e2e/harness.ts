@@ -3,13 +3,51 @@ import { mkdtempSync, mkdirSync, rmSync } from 'node:fs'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { WebSocketServer, type WebSocket } from 'ws'
 
 /**
- * WO-015 T-015.13 — what is left of the harness after the daemon went: the browser launcher, the
- * fixture app, a stdio MCP client, and `waitFor`. The `Douzed` class and `spawnMcp` booted
- * processes that no longer exist, so they and every spec that used them are gone; see
- * `e2e/README.md` for what T-015.14 has to put back.
+ * WO-015 T-015.14 — the harness for an extension with no daemon anywhere.
+ *
+ * What survived T-015.13: `launchHelium`, `FixtureApp`, `McpClient` and `waitFor`. What is new is
+ * everything that used to be `Douzed`: the two pipes the extension attaches to (`RelayServer`,
+ * `spawnBridge`), the two clients that drive them (`HttpMcp` for streamable HTTP, `McpClient` for
+ * stdio), a host that speaks the attachment protocol and lies (`FakeHost`), and the few pokes a
+ * spec needs to put state into the extension (`seedRecipe`, `pairRelay`, `redial`).
+ *
+ * Both pipes are spawned as real processes rather than imported: e2e is not a workspace package,
+ * so it cannot resolve `@douze/relay` or `@douze/bridge`, and a spec that imported `startRelay`
+ * would be testing a function rather than the thing a user runs.
  */
+
+declare global {
+  /**
+   * The extension APIs the suite touches inside `evaluate` callbacks. `@types/chrome` belongs to
+   * the extension package, not to the root, so the two or three members used here are declared
+   * rather than depended on.
+   */
+  const chrome: {
+    storage: {
+      local: {
+        set: (items: Record<string, unknown>) => Promise<void>
+        get: (keys?: string[] | null) => Promise<Record<string, unknown>>
+        remove: (keys: string[]) => Promise<void>
+      }
+    }
+    runtime: { sendMessage: (message: unknown) => Promise<unknown> }
+    permissions: { contains: (query: { origins: string[] }) => Promise<boolean> }
+  }
+  /** The extension's own e2e surface (packages/extension/src/background.ts, "e2e surface"). */
+  const __douze: {
+    startSession: (name: string, origins: string[], opts?: { debugger?: boolean; tabId?: number }) => Promise<string>
+    stopSession: () => Promise<{ retained: number }>
+    annotate: (note: string) => Promise<void>
+    badgeCount: () => number
+    recorded: (sessionId: string) => Promise<{ exchanges: unknown[]; annotations: unknown[] }>
+    hasOrigin: (origin: string) => Promise<boolean>
+    attached: () => Promise<boolean>
+    calls: (limit?: number) => Promise<{ tool: string; trust: string; outcome: string }[]>
+  }
+}
 export const REPO = resolve(import.meta.dirname, '..')
 export const HELIUM = '/Applications/Helium.app/Contents/MacOS/Helium'
 export const EXTENSION = join(REPO, 'packages/extension/dist')
@@ -28,10 +66,14 @@ export const TSX = join(REPO, 'node_modules/.bin/tsx')
  */
 export const LIVE_PROFILE = process.env['DOUZE_E2E_PROFILE'] ?? join(tmpdir(), 'douze-live-profile')
 
-export async function launchHelium(
-  extensionPath = EXTENSION,
-  options: { profileDir?: string } = {},
-): Promise<{ context: BrowserContext; serviceWorker: Worker; extensionId: string; dispose: () => Promise<void> }> {
+export interface Browser {
+  context: BrowserContext
+  serviceWorker: Worker
+  extensionId: string
+  dispose: () => Promise<void>
+}
+
+export async function launchHelium(extensionPath = EXTENSION, options: { profileDir?: string } = {}): Promise<Browser> {
   const persistent = options.profileDir !== undefined
   const userDataDir = options.profileDir ?? mkdtempSync(join(tmpdir(), 'douze-helium-'))
   mkdirSync(userDataDir, { recursive: true })
@@ -75,7 +117,7 @@ export interface Notification {
 export class McpClient {
   private buffer = ''
   private nextId = 1
-  private readonly pending = new Map<number, (value: unknown) => void>()
+  private readonly pending = new Map<number, (value: RpcBody) => void>()
   readonly notifications: Notification[] = []
 
   constructor(readonly child: ChildProcess) {
@@ -83,9 +125,9 @@ export class McpClient {
       this.buffer += String(chunk)
       for (const line of this.buffer.split('\n').slice(0, -1)) {
         if (!line.trim()) continue
-        const message = JSON.parse(line) as { id?: number; result?: unknown } & Notification
+        const message = JSON.parse(line) as { id?: number } & RpcBody & Notification
         if (message.method) this.notifications.push(message)
-        else if (message.id !== undefined) this.pending.get(message.id)?.(message.result)
+        else if (message.id !== undefined) this.pending.get(message.id)?.(message)
       }
       this.buffer = this.buffer.slice(this.buffer.lastIndexOf('\n') + 1)
     })
@@ -98,6 +140,14 @@ export class McpClient {
 
   // oxlint-disable-next-line typescript/no-explicit-any -- a JSON-RPC result is whatever the method returns
   request(method: string, params: Record<string, unknown> = {}): Promise<any> {
+    return this.answer(method, params).then((message) => message.result)
+  }
+
+  /**
+   * The whole JSON-RPC answer. A refusal travels in `error`, so a spec asserting that a guard
+   * fired needs this rather than `request`, which would hand it an undefined `result` either way.
+   */
+  answer(method: string, params: Record<string, unknown> = {}): Promise<RpcBody> {
     const id = this.nextId++
     return new Promise((resolve) => {
       this.pending.set(id, resolve)
@@ -129,11 +179,17 @@ export class McpClient {
   }
 }
 
+/**
+ * The origin the fixture app serves and the one `global-setup.ts` bakes into `host_permissions`.
+ * One constant for both: a build that granted an origin the app is not on grants nothing at all.
+ */
+export const FIXTURE_ORIGIN = process.env['DOUZE_FIXTURE_ORIGIN'] ?? 'http://127.0.0.1:4180'
+
 /** The fixture target app. Every spec asserts against what this server actually received. */
 export class FixtureApp {
   private process?: ChildProcess
 
-  constructor(readonly port = 4180) {}
+  constructor(readonly port = Number(new URL(FIXTURE_ORIGIN).port)) {}
 
   get origin(): string {
     return `http://127.0.0.1:${this.port}`
@@ -184,6 +240,393 @@ export class FixtureApp {
     await exited
     this.process = undefined as never
   }
+}
+
+// --- the two pipes ---------------------------------------------------------
+
+/**
+ * The cloud pipe, as the process an operator runs (`packages/relay/src/bin.ts`). The extension
+ * dials `ws://127.0.0.1:<port>/ws`; a hosted connector POSTs JSON-RPC to `/m/<secret>`.
+ */
+export class RelayServer {
+  private process?: ChildProcess
+
+  /** 4190 is on both `fetch`'s and Chrome's blocked-port lists (ManageSieve), so: not that one. */
+  constructor(readonly port = 4290) {}
+
+  get origin(): string {
+    return `http://127.0.0.1:${this.port}`
+  }
+
+  async start(): Promise<void> {
+    await waitFor(async () => !(await this.responding()), `relay port ${this.port} to be free`)
+    this.process = spawn(TSX, [join(REPO, 'packages/relay/src/bin.ts')], {
+      env: { ...process.env, RELAY_PORT: String(this.port) },
+      stdio: ['ignore', 'ignore', 'pipe'],
+    })
+    this.process.stderr!.on('data', (chunk) => (this.events += String(chunk)))
+    await waitFor(() => this.responding(), `relay on ${this.port}`)
+  }
+
+  private events = ''
+
+  /**
+   * The relay's own event log. It carries no payload and no tool name (see `log` in
+   * packages/relay/src/server.ts), but it does say when an extension detached and when a call was
+   * parked waiting for one — which is how a spec proves it exercised the wake grace rather than
+   * racing a socket that never went away.
+   */
+  log(): string {
+    return this.events
+  }
+
+  /**
+   * Mints an endpoint. This is the half of T-015.10 the connect page's "share with a hosted
+   * assistant" button will do before it writes the pairing into extension storage; the button is
+   * not wired yet, so the suite calls the relay route it will call and `pairRelay` writes the key.
+   */
+  async register(): Promise<{ token: string; mcp_path: string }> {
+    const response = await fetch(`${this.origin}/register`, {
+      method: 'POST',
+      body: JSON.stringify({ daemon_version: 'e2e' }),
+    })
+    return response.json() as Promise<{ token: string; mcp_path: string }>
+  }
+
+  private async responding(): Promise<boolean> {
+    try {
+      return (await fetch(`${this.origin}/health`)).ok
+    } catch {
+      return false
+    }
+  }
+
+  async stop(): Promise<void> {
+    if (!this.process) return
+    const exited = new Promise<void>((resolve) => this.process!.once('exit', () => resolve()))
+    this.process.kill()
+    await exited
+    this.process = undefined as never
+  }
+}
+
+/**
+ * The local pipe, spawned exactly as an MCP client spawns it. `DOUZE_HOME` redirects the pairing
+ * credential (packages/bridge/src/pairing.ts) so a run never reads or writes the user's own.
+ */
+export function spawnBridge(home: string): { child: ChildProcess; log: () => string } {
+  const child = spawn(TSX, [join(REPO, 'packages/bridge/src/bin.ts')], {
+    env: { ...process.env, DOUZE_HOME: home },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  })
+  let log = ''
+  child.stderr!.on('data', (chunk) => (log += String(chunk)))
+  return { child, log: () => log }
+}
+
+/** The code the bridge printed to stderr for a human to type into the extension. */
+export const pairingCode = (log: string): string | null => /Pairing code: ([\dA-Z-]+)/.exec(log)?.[1] ?? null
+
+// --- the clients -----------------------------------------------------------
+
+/**
+ * A hosted connector: plain streamable-HTTP MCP over `fetch`, which is the entire compatibility
+ * contract ChatGPT, claude.ai and Dust hold Douze to. Deliberately not the MCP SDK — an SDK that
+ * papers over a missing header would hide the thing this is here to prove.
+ */
+export class HttpMcp {
+  private session = ''
+  private nextId = 1
+
+  constructor(readonly url: string) {}
+
+  async rpc(method: string, params: Record<string, unknown> = {}): Promise<{ status: number; body: RpcBody }> {
+    const response = await fetch(this.url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...(this.session === '' ? {} : { 'mcp-session-id': this.session }),
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: this.nextId++, method, params }),
+    })
+    const assigned = response.headers.get('mcp-session-id')
+    if (assigned) this.session = assigned
+    return { status: response.status, body: (await response.json()) as RpcBody }
+  }
+
+  async initialize(): Promise<RpcBody> {
+    const { body } = await this.rpc('initialize', {
+      protocolVersion: '2025-06-18',
+      capabilities: { tools: { listChanged: true } },
+      clientInfo: { name: 'e2e-hosted-connector', version: '1.0.0' },
+    })
+    return body
+  }
+
+  async tools(): Promise<string[]> {
+    const { body } = await this.rpc('tools/list')
+    return ((body.result?.['tools'] as { name: string }[] | undefined) ?? []).map((tool) => tool.name)
+  }
+
+  call(name: string, args: Record<string, unknown> = {}): Promise<{ status: number; body: RpcBody }> {
+    return this.rpc('tools/call', { name, arguments: args })
+  }
+}
+
+export interface RpcBody {
+  result?: Record<string, unknown>
+  error?: { code: number; message: string; data?: { error?: string; retryable?: boolean } }
+}
+
+/** The text an MCP tool result carries, parsed. `null` when the call failed. */
+export const resultText = (body: RpcBody): string =>
+  ((body.result?.['content'] as { text?: string }[] | undefined) ?? []).map((part) => part.text ?? '').join('')
+
+// --- a host that lies ------------------------------------------------------
+
+export interface AttachedTool {
+  name: string
+  description: string
+  input_schema: Record<string, unknown>
+  side_effect: 'read' | 'write' | 'destructive'
+}
+
+export interface ToolOutcome {
+  result?: { content?: { text?: string }[] }
+  error?: { code: string; message: string; retryable: boolean }
+}
+
+/**
+ * A host speaking the attachment protocol — including the frames an honest one never sends.
+ *
+ * `@douze/mcp-host` refuses a `tools/call` for a tool it never listed, so neither the relay nor
+ * the bridge can be used to prove that the EXTENSION refuses it as well. That second half of the
+ * trust table is exactly what `checkPolicy` exists for ("a host that lies about what it was sent
+ * must not get through", packages/extension/src/guards.ts), and this is the liar that tests it.
+ */
+export class FakeHost {
+  private server?: WebSocketServer
+  private socket: WebSocket | null = null
+  private heartbeat?: ReturnType<typeof setInterval>
+  private nextId = 1
+  private readonly pending = new Map<string, (outcome: ToolOutcome) => void>()
+  /** Every `surface.push` seen, in order: the offer-time filter is asserted against these. */
+  readonly surfaces: AttachedTool[][] = []
+
+  constructor(readonly port = 4191) {}
+
+  /** What goes in `attach:relay`; the extension turns it into `ws://…/ws`. */
+  get url(): string {
+    return `http://127.0.0.1:${this.port}`
+  }
+
+  get attached(): boolean {
+    return this.socket?.readyState === 1
+  }
+
+  /** The tools this host was last offered. */
+  get tools(): AttachedTool[] {
+    return this.surfaces.at(-1) ?? []
+  }
+
+  async start(): Promise<void> {
+    const server = new WebSocketServer({ port: this.port, host: '127.0.0.1', path: '/ws' })
+    await new Promise<void>((resolve) => server.once('listening', () => resolve()))
+    server.on('connection', (socket) => {
+      socket.on('error', () => socket.terminate())
+      socket.on('close', () => {
+        if (this.socket === socket) this.socket = null
+      })
+      socket.on('message', (raw) => this.onFrame(socket, String(raw)))
+    })
+    // The extension closes a socket that has been silent for 2.5 heartbeats; a spec that spends a
+    // minute between calls would otherwise watch it drop for reasons that are not the test's.
+    this.heartbeat = setInterval(() => this.socket?.send(JSON.stringify({ type: 'ping' })), 10_000)
+    this.heartbeat.unref()
+    this.server = server
+  }
+
+  private onFrame(socket: WebSocket, raw: string): void {
+    const frame = JSON.parse(raw) as { type: string; tools?: AttachedTool[]; id?: string } & ToolOutcome
+    if (frame.type === 'hello') {
+      this.socket = socket
+      socket.send(JSON.stringify({ type: 'welcome', heartbeat_ms: 20_000 }))
+      return
+    }
+    if (frame.type === 'surface.push') {
+      this.surfaces.push(frame.tools ?? [])
+      return
+    }
+    if (frame.type !== 'tool.result' || frame.id === undefined) return
+    const waiter = this.pending.get(frame.id)
+    this.pending.delete(frame.id)
+    waiter?.({ ...(frame.result === undefined ? {} : { result: frame.result }), ...(frame.error === undefined ? {} : { error: frame.error }) })
+  }
+
+  /** One `tool.call`, whether or not the extension ever offered this host that tool. */
+  call(name: string, args: Record<string, unknown> = {}): Promise<ToolOutcome> {
+    const id = `fake-${this.nextId++}`
+    return new Promise((resolve) => {
+      this.pending.set(id, resolve)
+      this.socket?.send(JSON.stringify({ type: 'tool.call', id, name, args, trust: 'remote' }))
+    })
+  }
+
+  async close(): Promise<void> {
+    clearInterval(this.heartbeat)
+    for (const client of this.server?.clients ?? []) client.terminate()
+    await new Promise<void>((resolve) => this.server?.close(() => resolve()))
+  }
+}
+
+// --- putting state into the extension --------------------------------------
+
+export interface RelayPairing {
+  url: string
+  token: string
+  mcp_path: string
+  allow_writes: boolean
+}
+
+/**
+ * Waits for the worker to have finished booting, which is a barrier a spec writing into extension
+ * storage has to hold: `RecipeStore.open()` reads storage and only *then* installs the
+ * `storage.onChanged` listener, so a write that lands in between is read by neither and the
+ * surface stays empty until something else changes it. `__douze.attached()` awaits the worker's
+ * own `dialled`, which resolves after the store is open — so it is exactly that barrier.
+ *
+ * A user never hits this: their first recipe is written by the review page, minutes after boot.
+ */
+export const ready = (browser: Browser): Promise<void> =>
+  waitFor(
+    () => browser.serviceWorker.evaluate(() => __douze.attached().then(() => true)),
+    'the service worker to finish booting',
+  )
+
+/**
+ * Recipes as they exist after a review: `recipe:<name>` YAML plus a `fixture:` key per approved
+ * tool, which is where `RecipeStore` reads them from (packages/extension/src/recipes.ts). The
+ * journey spec earns its recipe the long way; every other spec seeds one, because re-recording
+ * per assertion buys nothing and costs a minute.
+ */
+export async function seedRecipe(browser: Browser, name: string, yaml: string, tools: string[]): Promise<void> {
+  await ready(browser)
+  await browser.serviceWorker.evaluate(
+    (seed) => {
+      const items: Record<string, unknown> = { [`recipe:${seed.name}`]: seed.yaml }
+      for (const tool of seed.tools) {
+        items[`fixture:${seed.name}/${tool}.json`] = { tool, response: { status: 200, body: {} } }
+      }
+      return chrome.storage.local.set(items)
+    },
+    { name, yaml, tools },
+  )
+}
+
+/** The fixture app as one recipe: one read, one write, one destructive. */
+export const ordersRecipe = (origin: string): string => `version: 1
+name: orders
+target:
+  base_url: ${origin}
+tools:
+  - name: list_orders
+    description: List the open orders.
+    side_effect: read
+    confidence: 0.9
+    observations: 3
+    approved: true
+    request:
+      method: GET
+      path: /api/orders
+    response:
+      primary_payload_path: $.data.orders
+    fixtures: [orders/list_orders.json]
+  - name: create_order
+    description: Create an order.
+    side_effect: write
+    confidence: 0.9
+    observations: 2
+    approved: true
+    request:
+      method: POST
+      path: /api/orders
+      input_schema:
+        type: object
+        properties:
+          item: { type: string }
+          qty: { type: number }
+          note: { type: string }
+    response:
+      primary_payload_path: $.data.order
+    fixtures: [orders/create_order.json]
+  - name: delete_order
+    description: Delete an order for good.
+    side_effect: destructive
+    confidence: 0.9
+    observations: 1
+    approved: true
+    request:
+      method: DELETE
+      path: /api/orders/{id}
+      input_schema:
+        type: object
+        properties:
+          id: { type: number }
+          confirm: { type: boolean }
+        required: [confirm]
+    fixtures: [orders/delete_order.json]
+`
+
+/** Writes the pairing the connect page will write, then makes the worker dial it. */
+export async function pairRelay(browser: Browser, pairing: RelayPairing): Promise<void> {
+  await browser.serviceWorker.evaluate((value) => chrome.storage.local.set({ 'attach:relay': value }), pairing)
+  await redial(browser)
+}
+
+/**
+ * Makes the attachment manager re-read its pairings and dial **now**.
+ *
+ * Its own trigger is a `chrome.alarms` tick with a 30-second floor, which every spec would
+ * otherwise pay per attachment. `douze:connect:pair` is the one command that ticks it on demand
+ * (packages/extension/src/attach.ts, `Manager.pair`), and an empty code means "no bridge to dial"
+ * — so passing one is a tick, and passing a real code is the pairing itself.
+ */
+export async function redial(browser: Browser, code = ''): Promise<void> {
+  const page = await browser.context.newPage()
+  await page.goto(`chrome-extension://${browser.extensionId}/connect.html`)
+  await page.evaluate((value) => chrome.runtime.sendMessage({ type: 'douze:connect:pair', code: value }), code)
+  await page.close()
+}
+
+/** T-015.9 — exempt one tool's results from the secret gate, or put them back under it. */
+export async function expose(
+  browser: Browser,
+  trust: 'local' | 'remote',
+  tool: string,
+  allow: boolean,
+): Promise<void> {
+  const page = await browser.context.newPage()
+  await page.goto(`chrome-extension://${browser.extensionId}/connect.html`)
+  await page.evaluate(
+    (value) => chrome.runtime.sendMessage({ type: 'douze:connect:expose', ...value }),
+    { trust, tool, allow },
+  )
+  await page.close()
+}
+
+/** Signs the browser into the fixture app, so an executed call carries a real session cookie. */
+export async function signIn(browser: Browser, app: FixtureApp): Promise<void> {
+  const page = await browser.context.newPage()
+  await page.goto(app.origin)
+  await page.evaluate(() => fetch('/login', { method: 'POST' }).then((response) => response.json()))
+  // The app issues a session cookie, which Chrome drops on exit. relay.spec.ts closes the browser
+  // mid-run and the same session has to be there when it comes back, so the value the server just
+  // issued is re-set with a lifetime — same name, same path, same value.
+  await page.evaluate(() => {
+    const value = /fixture_session=([^;]+)/.exec(document.cookie)?.[1] ?? ''
+    document.cookie = `fixture_session=${value}; path=/; max-age=3600`
+  })
+  await page.close()
 }
 
 export async function waitFor(check: () => Promise<boolean>, what: string, timeoutMs = 45_000): Promise<void> {

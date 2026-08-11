@@ -1,85 +1,85 @@
 # e2e
 
-`@douze/douzed` and `@douze/cli` were deleted in WO-015 T-015.13. Every Playwright spec in this
-directory booted one of them through `Harness.Douzed` or `spawnMcp`, so every one of them was
-deleted with the daemon rather than left failing. **Writing the replacement is T-015.14.** This
-file is the requirements it inherits, so the next agent restores coverage rather than guessing at
-what was lost.
+Five specs driving the real product in a real browser: the unpacked extension in Helium, the
+fixture app as the signed-in dashboard, and both pipes as the processes a user actually runs.
+No daemon is started anywhere, because there is none — `@douze/douzed` and `@douze/cli` were
+deleted in T-015.13 and the 24 specs that booted them went with them (T-015.14 wrote these).
 
-## What is still here
-
-| Path | Why it survived |
-|---|---|
-| `harness.ts` | `launchHelium`, `FixtureApp`, `McpClient` and `waitFor` are all daemon-free. Only `Douzed` and `spawnMcp` were cut. |
-| `global-setup.ts` | Builds the extension with the fixture origin baked into `host_permissions`. Still exactly right — `chrome.permissions.request` needs a user gesture Playwright cannot supply. |
-| `eval/agent-selection.mjs` | Scores real agent tool-selection against `packages/studio/src/eval/`. Never touched a daemon. |
-| `../fixtures/` | The target app. Unchanged, and the target for the new harness. |
-
-## What was deleted
-
-All of `capture/`, `connector/`, `daemon/`, `drift/`, `eject/`, `relay/`, `remote/`, `runtime/`,
-`studio/` and `verification/` — 24 spec files. Also `live/openfort.mjs` (spawned
-`packages/douzed/src/bin.ts` and `packages/cli/src/bin.ts`) and `metrics.mjs`.
-
-`remote/connector.spec.ts` was doubly dead: it spoke the WO-014 `RemoteDaemonMessage` /
-`RemoteRelayMessage` frames, which T-015.13 also deleted from `@douze/shared`. The attachment
-protocol that replaced them lives in `@douze/mcp-host` and is unit-tested there and in
-`packages/relay/src/relay.test.ts`.
-
-## What the replacement must cover
-
-The old suite is in git history (`git show HEAD~1:e2e/...`); these are the assertions that must
-survive the port, not a wish list.
-
-1. **Capture → review → recipe, with no daemon on the machine** (V-015.1). Record on the fixture
-   app, infer, approve, and read the recipe back out of extension storage. A capture carrying a
-   JWT must be refused by the write gate. Export then re-import must round-trip byte-identically.
-   Replaces `capture/session-capture.spec.ts`, `capture/annotation.spec.ts`,
-   `capture/provenance.spec.ts`, `studio/review.spec.ts`.
-2. **Execution and guards** (V-015.2). A fake connector speaking streamable-HTTP MCP completes
-   list + read against the relay with no daemon anywhere; a write is refused until opted in; a
-   destructive call is refused whatever it sends. Replaces `relay/execution.spec.ts`,
-   `relay/guards.spec.ts`, `remote/connector.spec.ts`.
-3. **The bridge at full trust** (V-015.3). `McpClient` in `harness.ts` is the client for this: a
-   real stdio session lists and calls tools, a destructive tool succeeds with `confirm: true` and
-   is refused without it, and an unpaired bridge is refused outright. Replaces
-   `connector/claude-code.spec.ts`, `connector/desktop.spec.ts`, `connector/cold-start.spec.ts`,
-   `connector/failures.spec.ts`.
-4. **Drift and degradation.** A widened response, a broken response, and an expired session must
-   each produce the documented `RelayErrorCode` and a tool description that announces itself as
-   degraded. `FixtureApp.set()` still flips every control these need (`sessionValid`,
-   `widenResponse`, `breakResponse`, `delayMs`, `pageStateAuth`). Replaces
-   `drift/degradation.spec.ts`, `drift/doctor.spec.ts`, `runtime/surface.spec.ts`.
-5. **HAR import through the redaction gate.** Replaces `daemon/har-import.spec.ts`.
-
-## The secret sweep (was `metrics.mjs`)
-
-V-015.4 requires it and it has no home right now. It walked `DOUZE_HOME` — a filesystem that no
-longer exists — so it must be re-pointed at extension storage (IndexedDB plus
-`chrome.storage.local`), read out through the service worker rather than off disk. Its patterns,
-which are worth keeping verbatim:
-
-```js
-const PATTERNS = [
-  [/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\./, 'JWT'],
-  [/\b(sk|pk|rk)_(test|live|prod)?_?[A-Za-z0-9]{16,}\b/, 'prefixed key'],
-  [/s3ssion-fixture-value/, 'fixture session cookie'],
-  [/page-state-bearer-token-value/, 'fixture page-state token'],
-  [/hunter2/, 'fixture password'],
-]
+```
+pnpm verify:e2e     # the release gate: the five below
+pnpm e2e            # everything, same thing today
 ```
 
-The same script also measured PRD 1.5's relay overhead (target: under 150 ms over a direct
-in-page fetch) and trimmed result size (target: under 2 KB) by calling douzed's `/relay/...`
-route. Both now have to be measured through the relay or the bridge instead.
+macOS only, and Helium must be at `/Applications/Helium.app`: an MV3 service worker does not run
+under old headless, so the suite runs headed, one worker, against a fixed fixture port.
+`DOUZE_FIXTURE_ORIGIN` moves that port (`global-setup.ts` bakes whatever it says into
+`host_permissions`, because `chrome.permissions.request` needs a gesture Playwright cannot supply).
 
-V-015.4 additionally wants a build guard the old suite never had: grep the built worker bundle
-for `new Function`, because a bundler config that forces Node conditions silently swaps ajv back
-in.
+## What each spec holds
 
-## Live targets
+| Spec | Proves | Replaces |
+|---|---|---|
+| `journey.spec.ts` | V-015.1 + V-015.2 end to end: record on a signed-in dashboard, approve in the extension's review page, read the recipe back out of extension storage, and call the tool from a hosted connector. Asserts the daemon packages are absent from the machine. | `verification/full-app.spec.ts`, `capture/*`, `studio/review.spec.ts` |
+| `relay.spec.ts` | The cloud pipe, including the two cases the WO-015 relay exists for: `tools/list` answered while **Chrome is closed**, and a call made in that state parked and then served once the worker re-dials inside the wake grace. Uses a persistent profile and genuinely closes the browser. | `relay/execution.spec.ts`, `remote/connector.spec.ts` |
+| `guards.spec.ts` | Every guard at `remote` trust, through a host that lies: a write refused until opted in, a destructive tool never offered *and* refused when asked for anyway, the result secret gate and its per-trust exemption, and a degraded tool that announces itself and refuses. | `relay/guards.spec.ts`, `runtime/surface.spec.ts`, part of `drift/degradation.spec.ts` |
+| `bridge.spec.ts` | The local pipe at full trust, driven by a real stdio MCP client: an unpaired process refused, a paired one listing the destructive tool, which then succeeds with `confirm: true` and is refused without it. | `connector/claude-code.spec.ts`, `desktop.spec.ts`, `cold-start.spec.ts`, `failures.spec.ts` |
+| `artifacts.spec.ts` | V-015.4: the secret sweep over the extension's own storage (`metrics.mjs` re-pointed, patterns verbatim), and the build guard on the shipped bundle. | `metrics.mjs` |
 
-`live/openfort.mjs` drove a real signed-in dashboard end to end and is gone. `LIVE_PROFILE` in
-`harness.ts` is the seam it used — `DOUZE_E2E_PROFILE` points at a Helium profile signed in once
-by hand, and `launchHelium(EXTENSION, { profileDir: LIVE_PROFILE })` reuses it. Phase 0's C-1
-still needs a script here; it no longer needs a daemon.
+Every refusal is checked against **the fixture app's own request log**, because that is the only
+evidence that a guard ran before dispatch rather than after. The executor tab's page load and the
+SPA's background polling are not the tool's request and are filtered out, not counted.
+
+## The build guard, and why it is not a grep for `new Function`
+
+V-015.4 asks for a grep for `new Function` in the worker bundle. That string is not in the bundle
+even when the code is: esbuild minifies `new Function("")` to `Function("")`, and zod reaches the
+constructor through an alias that minifies the same way. So `artifacts.spec.ts` looks for the
+constructor being **called**, and allows exactly one site — zod's own JIT probe, which is
+try/caught and identified by the `Cloudflare` marker beside it. Anything else fails.
+
+Worth knowing: that probe runs unless the extension sets `z.config({ jitless: true })`, and zod's
+own comment says a strict CSP reports the caught throw as a `securitypolicyviolation`. Harmless
+today, visible to a Web Store reviewer.
+
+## Not covered, and why
+
+- **HAR import through the redaction gate** and **recipe export/import round-tripping** —
+  `har.ts` and `RecipeStore.exportRecipe/importFiles` exist, but neither has a UI or an entry on
+  the extension's `__douze` surface, so nothing outside the extension can start one. Unit-covered
+  in `packages/extension/src/har.test.ts` and `recipes.test.ts`. Add a spec here the moment
+  T-015.5's file picker lands.
+- **A capture carrying a JWT refused by the write gate** (V-015.1) — reachable only through HAR
+  import: capture-time redaction replaces the value first, so the gate never fires on the recorded
+  path. `store.test.ts` covers the gate directly, and `artifacts.spec.ts` proves the redaction it
+  depends on.
+- **Doctor runs and drift classification** — the Doctor Run was deleted with the daemon.
+  `guards.spec.ts` keeps the half that survived: a degraded tool announcing itself in its
+  description and refusing before dispatch. `FixtureApp.set()` still flips `widenResponse`,
+  `breakResponse`, `sessionValid` and `delayMs` for whatever re-implements the rest.
+- **The deployed relay** (V-015.2's second half) — `relay.spec.ts` runs against a local
+  `startRelay`. Pointing it at a deployed one is a `RelayServer` swap and credentials this suite
+  does not hold.
+- **Live targets** — `live/openfort.mjs` is still gone. `LIVE_PROFILE` in `harness.ts` is the seam:
+  `DOUZE_E2E_PROFILE` points at a Helium profile signed in once by hand. Phase 0's C-1 needs a
+  script here; it no longer needs a daemon.
+
+## Pieces
+
+`harness.ts` — `launchHelium` and `FixtureApp` as before, plus: `RelayServer` and `spawnBridge`
+(both pipes as real processes, because e2e is not a workspace package and cannot import them),
+`HttpMcp` and `McpClient` (the two client shapes), `FakeHost` (a host speaking the attachment
+protocol *and* frames an honest one never sends — `@douze/mcp-host` refuses a call for a tool it
+never listed, so nothing else can reach `checkPolicy`), and `seedRecipe` / `pairRelay` / `redial`
+for putting state into the extension.
+
+Two of those are working around things that are not built yet, and should be revisited:
+
+- `pairRelay` writes `attach:relay` straight into extension storage after calling the relay's own
+  `POST /register`. That is what T-015.10's connect-page button will do; the button is not wired
+  (`douze:connect:start` still answers "not wired up yet").
+- `redial` sends `douze:connect:pair` to tick the attachment manager on demand, because its own
+  trigger is a `chrome.alarms` tick with a 30-second floor. An empty code means "no bridge", so it
+  is a tick; a real code is the pairing itself, which is how `bridge.spec.ts` pairs.
+
+`global-setup.ts` builds the extension with the fixture origin baked in. `eval/agent-selection.mjs`
+scores agent tool-selection against `packages/studio/src/eval/` and never touched a daemon.

@@ -13,14 +13,17 @@
     "typecheck": "pnpm -r exec tsc --noEmit",
     "lint": "oxlint packages e2e fixtures",
     "test": "pnpm -r test",
-    "e2e": "playwright test"
+    "e2e": "playwright test",
+    "verify:e2e": "playwright test e2e/journey.spec.ts e2e/relay.spec.ts e2e/guards.spec.ts e2e/bridge.spec.ts e2e/artifacts.spec.ts"
   },
   "devDependencies": {
     "@playwright/test": "1.62.0",
     "@types/node": "26.1.2",
+    "@types/ws": "8.18.1",
     "oxlint": "1.77.0",
     "tsx": "4.23.1",
     "typescript": "7.0.2",
-    "vitest": "4.1.10"
+    "vitest": "4.1.10",
+    "ws": "8.18.3"
   }
 }
