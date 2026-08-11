@@ -1,6 +1,6 @@
 import { chromium, type BrowserContext, type Worker } from '@playwright/test'
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs'
-import { spawn, type ChildProcess } from 'node:child_process'
+import { spawn, type ChildProcess, type StdioOptions } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { WebSocketServer, type WebSocket } from 'ws'
@@ -17,6 +17,10 @@ import { WebSocketServer, type WebSocket } from 'ws'
  * Both pipes are spawned as real processes rather than imported: e2e is not a workspace package,
  * so it cannot resolve `@douze/relay` or `@douze/bridge`, and a spec that imported `startRelay`
  * would be testing a function rather than the thing a user runs.
+ *
+ * Everything started here registers its own teardown (`stopEverything`, which every spec runs from
+ * `afterEach`) rather than relying on a `finally` in the test body, which a Playwright timeout
+ * skips entirely.
  */
 
 declare global {
@@ -66,6 +70,81 @@ export const TSX = join(REPO, 'node_modules/.bin/tsx')
  */
 export const LIVE_PROFILE = process.env['DOUZE_E2E_PROFILE'] ?? join(tmpdir(), 'douze-live-profile')
 
+// --- teardown ---------------------------------------------------------------
+
+/**
+ * Every teardown a spec still owes. Playwright abandons the test body on TIMEOUT, so a `finally`
+ * there never runs: the fixture app, the relay and the bridge outlive the run, and the next run
+ * dies on its "port is free" wait. `afterEach` runs whether the body finished, failed or timed
+ * out — so teardown lives here and a spec registers instead of cleaning up.
+ */
+const outstanding = new Set<() => Promise<void>>()
+
+/** Registers `run`, handing back a wrapper that runs it once whichever side gets there first. */
+function onTeardown(run: () => Promise<void>): () => Promise<void> {
+  const once = async (): Promise<void> => {
+    if (!outstanding.delete(once)) return
+    await run()
+  }
+  outstanding.add(once)
+  return once
+}
+
+/**
+ * Tears down everything still outstanding, newest first. Every spec calls this from `afterEach`.
+ * Best-effort: one teardown that throws must not strand the ones behind it.
+ */
+export async function stopEverything(): Promise<void> {
+  for (const teardown of [...outstanding].reverse()) {
+    try {
+      await teardown()
+    } catch {
+      // A failed teardown is not worth failing a passing test over; the rest still have to run.
+    }
+  }
+}
+
+/** A scratch directory, removed by the same teardown as everything else. */
+export function tempDir(prefix: string): string {
+  const dir = mkdtempSync(join(tmpdir(), prefix))
+  onTeardown(async () => rmSync(dir, { recursive: true, force: true }))
+  return dir
+}
+
+export interface Spawned {
+  child: ChildProcess
+  /** Kills the process GROUP and waits for it to be gone. Idempotent. */
+  stop: () => Promise<void>
+}
+
+/**
+ * Spawns a repo script under `tsx`, in a process GROUP of its own, with its teardown registered.
+ *
+ * `detached` is the load-bearing flag: `tsx` runs the script in a child process of its own, so
+ * `child.kill()` reaps the wrapper and orphans the process actually holding the port. A detached
+ * child leads a group, and `process.kill(-pid)` takes the whole group with it.
+ */
+export function spawnTsx(script: string, env: Record<string, string>, stdio: StdioOptions): Spawned {
+  const child = spawn(TSX, [join(REPO, script)], { env: { ...process.env, ...env }, stdio, detached: true })
+  const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()))
+  const signal = (name: NodeJS.Signals): void => {
+    try {
+      if (child.pid !== undefined) process.kill(-child.pid, name)
+    } catch {
+      // The group is already gone, which is the state this wanted anyway.
+    }
+  }
+  const stop = onTeardown(async () => {
+    if (child.exitCode !== null || child.signalCode !== null) return
+    signal('SIGTERM')
+    // A group that ignores SIGTERM would otherwise hang teardown for the rest of the run.
+    const escalate = setTimeout(() => signal('SIGKILL'), 2_000)
+    await exited
+    clearTimeout(escalate)
+  })
+  return { child, stop }
+}
+
 export interface Browser {
   context: BrowserContext
   serviceWorker: Worker
@@ -96,11 +175,13 @@ export async function launchHelium(extensionPath = EXTENSION, options: { profile
     context,
     serviceWorker,
     extensionId: new URL(serviceWorker.url()).host,
-    dispose: async () => {
+    // Registered, so a spec that closes the browser mid-run (relay.spec.ts) is not closed twice
+    // and one abandoned on a timeout is closed anyway.
+    dispose: onTeardown(async () => {
       await context.close()
       // A persistent profile holds a real signed-in session; never delete it.
       if (!persistent) rmSync(userDataDir, { recursive: true, force: true })
-    },
+    }),
   }
 }
 
@@ -173,10 +254,6 @@ export class McpClient {
     const listed = (await this.request('tools/list')).tools as { name: string; description: string }[]
     return listed.find((t) => t.name === name)?.description
   }
-
-  kill(): void {
-    this.child.kill()
-  }
 }
 
 /**
@@ -187,7 +264,7 @@ export const FIXTURE_ORIGIN = process.env['DOUZE_FIXTURE_ORIGIN'] ?? 'http://127
 
 /** The fixture target app. Every spec asserts against what this server actually received. */
 export class FixtureApp {
-  private process?: ChildProcess
+  private server: Spawned | undefined
 
   constructor(readonly port = Number(new URL(FIXTURE_ORIGIN).port)) {}
 
@@ -203,10 +280,7 @@ export class FixtureApp {
    */
   async start(): Promise<void> {
     await waitFor(async () => !(await this.responding()), `port ${this.port} to be free`)
-    this.process = spawn(TSX, [join(REPO, 'fixtures/server.ts')], {
-      env: { ...process.env, FIXTURE_PORT: String(this.port) },
-      stdio: 'ignore',
-    })
+    this.server = spawnTsx('fixtures/server.ts', { FIXTURE_PORT: String(this.port) }, 'ignore')
     await waitFor(() => this.responding(), 'fixture app')
   }
 
@@ -234,11 +308,8 @@ export class FixtureApp {
 
   /** Awaited, so the next spec's start() cannot race a process still holding the port. */
   async stop(): Promise<void> {
-    if (!this.process) return
-    const exited = new Promise<void>((resolve) => this.process!.once('exit', () => resolve()))
-    this.process.kill()
-    await exited
-    this.process = undefined as never
+    await this.server?.stop()
+    this.server = undefined
   }
 }
 
@@ -249,7 +320,7 @@ export class FixtureApp {
  * dials `ws://127.0.0.1:<port>/ws`; a hosted connector POSTs JSON-RPC to `/m/<secret>`.
  */
 export class RelayServer {
-  private process?: ChildProcess
+  private server: Spawned | undefined
 
   /** 4190 is on both `fetch`'s and Chrome's blocked-port lists (ManageSieve), so: not that one. */
   constructor(readonly port = 4290) {}
@@ -260,11 +331,8 @@ export class RelayServer {
 
   async start(): Promise<void> {
     await waitFor(async () => !(await this.responding()), `relay port ${this.port} to be free`)
-    this.process = spawn(TSX, [join(REPO, 'packages/relay/src/bin.ts')], {
-      env: { ...process.env, RELAY_PORT: String(this.port) },
-      stdio: ['ignore', 'ignore', 'pipe'],
-    })
-    this.process.stderr!.on('data', (chunk) => (this.events += String(chunk)))
+    this.server = spawnTsx('packages/relay/src/bin.ts', { RELAY_PORT: String(this.port) }, ['ignore', 'ignore', 'pipe'])
+    this.server.child.stderr!.on('data', (chunk) => (this.events += String(chunk)))
     await waitFor(() => this.responding(), `relay on ${this.port}`)
   }
 
@@ -303,11 +371,8 @@ export class RelayServer {
   }
 
   async stop(): Promise<void> {
-    if (!this.process) return
-    const exited = new Promise<void>((resolve) => this.process!.once('exit', () => resolve()))
-    this.process.kill()
-    await exited
-    this.process = undefined as never
+    await this.server?.stop()
+    this.server = undefined
   }
 }
 
@@ -316,10 +381,7 @@ export class RelayServer {
  * credential (packages/bridge/src/pairing.ts) so a run never reads or writes the user's own.
  */
 export function spawnBridge(home: string): { child: ChildProcess; log: () => string } {
-  const child = spawn(TSX, [join(REPO, 'packages/bridge/src/bin.ts')], {
-    env: { ...process.env, DOUZE_HOME: home },
-    stdio: ['pipe', 'pipe', 'pipe'],
-  })
+  const { child } = spawnTsx('packages/bridge/src/bin.ts', { DOUZE_HOME: home }, ['pipe', 'pipe', 'pipe'])
   let log = ''
   child.stderr!.on('data', (chunk) => (log += String(chunk)))
   return { child, log: () => log }
@@ -432,7 +494,14 @@ export class FakeHost {
 
   async start(): Promise<void> {
     const server = new WebSocketServer({ port: this.port, host: '127.0.0.1', path: '/ws' })
-    await new Promise<void>((resolve) => server.once('listening', () => resolve()))
+    await new Promise<void>((resolve, reject) => {
+      server.once('listening', () => resolve())
+      // Without this the bind failure surfaces as an unhandled 'error' event and the spec dies on
+      // an unrelated timeout instead. A busy 4191 means a previous run's host is still holding it.
+      server.once('error', (cause) =>
+        reject(new Error(`FakeHost could not bind 127.0.0.1:${this.port} — is a previous run still holding it?`, { cause })),
+      )
+    })
     server.on('connection', (socket) => {
       socket.on('error', () => socket.terminate())
       socket.on('close', () => {
@@ -445,6 +514,7 @@ export class FakeHost {
     this.heartbeat = setInterval(() => this.socket?.send(JSON.stringify({ type: 'ping' })), 10_000)
     this.heartbeat.unref()
     this.server = server
+    this.teardown = onTeardown(() => this.shutdown())
   }
 
   private onFrame(socket: WebSocket, raw: string): void {
@@ -464,16 +534,40 @@ export class FakeHost {
     waiter?.({ ...(frame.result === undefined ? {} : { result: frame.result }), ...(frame.error === undefined ? {} : { error: frame.error }) })
   }
 
-  /** One `tool.call`, whether or not the extension ever offered this host that tool. */
-  call(name: string, args: Record<string, unknown> = {}): Promise<ToolOutcome> {
+  /**
+   * One `tool.call`, whether or not the extension ever offered this host that tool.
+   *
+   * Bounded, because the two ways this goes wrong are silent: nothing attached, so the frame goes
+   * nowhere, or the extension dropping the call — either of which used to hang until Playwright's
+   * own timeout killed the spec with no idea which call it was on.
+   */
+  call(name: string, args: Record<string, unknown> = {}, timeoutMs = 30_000): Promise<ToolOutcome> {
     const id = `fake-${this.nextId++}`
-    return new Promise((resolve) => {
-      this.pending.set(id, resolve)
-      this.socket?.send(JSON.stringify({ type: 'tool.call', id, name, args, trust: 'remote' }))
+    return new Promise((resolve, reject) => {
+      if (this.socket === null) {
+        reject(new Error(`FakeHost.call(${name}): nothing is attached to this host`))
+        return
+      }
+      const expired = setTimeout(() => {
+        this.pending.delete(id)
+        reject(new Error(`FakeHost.call(${name}): no tool.result within ${timeoutMs}ms`))
+      }, timeoutMs)
+      this.pending.set(id, (outcome) => {
+        clearTimeout(expired)
+        resolve(outcome)
+      })
+      this.socket.send(JSON.stringify({ type: 'tool.call', id, name, args, trust: 'remote' }))
     })
   }
 
+  /** Idempotent: `stopEverything` may well have got here first. */
   async close(): Promise<void> {
+    await this.teardown?.()
+  }
+
+  private teardown?: () => Promise<void>
+
+  private async shutdown(): Promise<void> {
     clearInterval(this.heartbeat)
     for (const client of this.server?.clients ?? []) client.terminate()
     await new Promise<void>((resolve) => this.server?.close(() => resolve()))

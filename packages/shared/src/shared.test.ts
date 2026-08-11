@@ -358,7 +358,7 @@ describe('redaction idempotence', () => {
     const once = redactBody({ password: 'hunter2' }) as Record<string, string>
     const twice = redactBody(once) as Record<string, string>
     expect(once['password']).toBe('«redacted:string:7»')
-    // The daemon redacts again after the extension already did; the length must survive.
+    // HAR import redacts again over bytes capture already redacted; the length must survive.
     expect(twice['password']).toBe('«redacted:string:7»')
   })
 

@@ -23,11 +23,25 @@ under old headless, so the suite runs headed, one worker, against a fixed fixtur
 | `relay.spec.ts` | The cloud pipe, including the two cases the WO-015 relay exists for: `tools/list` answered while **Chrome is closed**, and a call made in that state parked and then served once the worker re-dials inside the wake grace. Uses a persistent profile and genuinely closes the browser. | `relay/execution.spec.ts`, `remote/connector.spec.ts` |
 | `guards.spec.ts` | Every guard at `remote` trust, through a host that lies: a write refused until opted in, a destructive tool never offered *and* refused when asked for anyway, the result secret gate and its per-trust exemption, and a degraded tool that announces itself and refuses. | `relay/guards.spec.ts`, `runtime/surface.spec.ts`, part of `drift/degradation.spec.ts` |
 | `bridge.spec.ts` | The local pipe at full trust, driven by a real stdio MCP client: an unpaired process refused, a paired one listing the destructive tool, which then succeeds with `confirm: true` and is refused without it. | `connector/claude-code.spec.ts`, `desktop.spec.ts`, `cold-start.spec.ts`, `failures.spec.ts` |
-| `artifacts.spec.ts` | V-015.4: the secret sweep over the extension's own storage (`metrics.mjs` re-pointed, patterns verbatim), and the build guard on the shipped bundle. | `metrics.mjs` |
+| `artifacts.spec.ts` | V-015.4: the secret sweep over the extension's own storage — every object store of every IndexedDB database plus all of `chrome.storage.local`, not just the session under test (`metrics.mjs` re-pointed, patterns verbatim) — and the build guard on the shipped bundle. | `metrics.mjs` |
 
 Every refusal is checked against **the fixture app's own request log**, because that is the only
 evidence that a guard ran before dispatch rather than after. The executor tab's page load and the
-SPA's background polling are not the tool's request and are filtered out, not counted.
+SPA's background polling are not the tool's request and are filtered out, not counted. Every
+"nothing reached the target" assertion is followed by a call that *is* allowed, over the same host
+and the same log: without that control, a zero also passes for a host that quietly detached.
+
+## Teardown
+
+No spec cleans up in a `finally`. A Playwright **timeout** abandons the test body, so a `finally`
+there never runs — and the fixture app, the relay and the bridge outlive the run, after which the
+next run dies on its "port is free" wait. Instead every process, browser and temp directory started
+by `harness.ts` registers a teardown, and each spec runs `test.afterEach(stopEverything)`, which
+Playwright runs whether the body passed, failed or timed out.
+
+The children are spawned `detached`, and teardown kills the process **group** (`process.kill(-pid)`,
+escalating to `SIGKILL` after 2 s). `tsx` runs the script in a subprocess of its own, so killing the
+direct child reaps the wrapper and leaves the process actually holding the port running.
 
 ## The build guard, and why it is not a grep for `new Function`
 
@@ -53,10 +67,13 @@ today, visible to a Web Store reviewer.
   import: capture-time redaction replaces the value first, so the gate never fires on the recorded
   path. `store.test.ts` covers the gate directly, and `artifacts.spec.ts` proves the redaction it
   depends on.
-- **Doctor runs and drift classification** — the Doctor Run was deleted with the daemon.
-  `guards.spec.ts` keeps the half that survived: a degraded tool announcing itself in its
-  description and refusing before dispatch. `FixtureApp.set()` still flips `widenResponse`,
-  `breakResponse`, `sessionValid` and `delayMs` for whatever re-implements the rest.
+- **Doctor runs and drift classification** — the Doctor Run was deleted with the daemon, and
+  nothing replaced it: no scheduled replay, no five-way classification, no schema-widening patch,
+  no webhook. `DriftStatus` went out of `@douze/shared` with this round, because it had no producer
+  and no consumer left. `guards.spec.ts` keeps the half that survived: a tool degraded by a missing
+  fixture, announcing itself in its description and refusing before dispatch. `FixtureApp.set()`
+  still flips `widenResponse`, `breakResponse`, `sessionValid` and `delayMs` for whatever
+  re-implements the rest.
 - **The deployed relay** (V-015.2's second half) — `relay.spec.ts` runs against a local
   `startRelay`. Pointing it at a deployed one is a `RelayServer` swap and credentials this suite
   does not hold.

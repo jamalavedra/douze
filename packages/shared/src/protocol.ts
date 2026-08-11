@@ -93,7 +93,7 @@ export const RemoteRegistration = z.object({
 })
 export type RemoteRegistration = z.infer<typeof RemoteRegistration>
 
-/** WO-014 — concurrent platform sessions the daemon serves before refusing another. */
+/** WO-014 — concurrent platform sessions the relay serves per endpoint before refusing another. */
 export const REMOTE_MAX_SESSIONS = 4
 
 /** WO-014 — the relay drops a platform session idle for this long. */

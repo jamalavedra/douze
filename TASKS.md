@@ -6,6 +6,14 @@ Douze watches you use an authenticated dashboard for five minutes and turns the 
 > consolidated many of them (no `src/registry/`, `src/relay/`, `src/drift/` directories; one
 > `server.ts` in douzed; the review SPA is `packages/studio/src/app.ts` served by douzed). The
 > shipped layout is the package map in `README.md`; do not treat a path here as a file that exists.
+>
+> **Nor is anything below WO-015 a description of the product today.** WO-015 deleted
+> `packages/douzed` and `packages/cli`, and with them the `douze` command in every form: no
+> `douze start|stop|status`, no `douze mcp add`, no `douze doctor`, no `douze eject`, no
+> `Douze.mcpb`, no headless mode, no daemon-served review UI, and no drift detection (WO-011 —
+> read its header before believing anything under it). The two architecture diagrams and the
+> command blocks immediately below are the pre-WO-015 plan, kept for the record. `README.md` is the
+> only description of what a user can run.
 
 ```
   Chrome ext ──ws──▶ douzed ◀──http/loopback──┬── douze --mcp   (stdio, launched by any MCP client)
@@ -288,7 +296,19 @@ Build order #10 — enriches description quality (M1 scope) but the golden-path 
 
 ---
 
-## WO-011 — Drift detection
+## WO-011 — Drift detection (DELETED, NOT REPLACED — see WO-015 T-015.13)
+
+**Everything below shipped and is now gone.** It lived entirely in `packages/douzed` and
+`packages/cli`, both deleted in T-015.13, and WO-015 deliberately did not rebuild it. There is no
+scheduled replay, no `douze doctor`, no five-way classification, no schema-widening patch and no
+webhook on this architecture. `DriftStatus` was removed from `packages/shared/src/recipe.ts` in the
+T-015.14 review round, because nothing had produced or consumed it since.
+
+What survives is the `degraded` flag and its enforcement: `RecipeStore` sets it when an approved
+tool's fixture is missing, the description says so to the client, and `checkPolicy` refuses the call
+before any request goes out (`e2e/guards.spec.ts`). Nothing sets or clears it from a live check any
+more — including un-degrading a tool that recovered. When a target changes, the tool keeps calling
+the old endpoint until a human notices; the recovery path is to record the site again.
 
 Build order #11 — M2; needs the registry write path (WO-004) and replay through the relay (WO-009).
 
@@ -503,7 +523,9 @@ running at all.
 
 **Phase 4 — retire the daemon (1 week + review latency).**
 - [x] T-015.13 — **DONE (2026-08-11)**: `packages/douzed` and `packages/cli` are gone, with no shims and no re-exports; `pnpm-workspace.yaml` and the six remaining packages carry no reference to either. Headless mode, `.mcpb`, `douze-server.zip` and eject went with them, and `.github/workflows/release.yml` now publishes one asset. **Deviation:** `packages/studio/src/app.ts` went too — it turned out to be already dead (no importer) rather than the review UI T-015.4 was meant to reuse. **Two residues left behind, both harmless and both wrong to leave:** `Douze.mcpb` and `douze-server.zip` are still *tracked* files at the repo root and are no longer even in `.gitignore`; and `packages/shared/src/recipe.ts` still accepts `auth.mode: 'headless'` in the schema with no implementation anywhere behind it, so such a recipe loads and then executes through the browser regardless.
-- [ ] T-015.14 — **IN PROGRESS (2026-08-11)**: `e2e/` currently holds `harness.ts`, `global-setup.ts`, `eval/` and a `README.md` that is the requirements list the replacement inherits — no specs yet. **Deviation:** `e2e/metrics.mjs` was deleted rather than ported, because both of its halves were daemon-only: the secret sweep walked `DOUZE_HOME`, and the relay-overhead measurement called douzed's `/relay/...` route. Its patterns are preserved verbatim in `e2e/README.md` and it must be rebuilt against extension storage read out through the service worker; until it is, C-4 has no evidence on this architecture.
+- [ ] T-015.14 — **IN PROGRESS (2026-08-11)**: `e2e/` holds five specs (`journey`, `relay`, `guards`, `bridge`, `artifacts`) over `harness.ts`, `global-setup.ts` and `eval/`; `e2e/README.md` says what each one proves and what is still uncovered. **Deviation:** `e2e/metrics.mjs` was deleted rather than ported, because both of its halves were daemon-only: the secret sweep walked `DOUZE_HOME`, and the relay-overhead measurement called douzed's `/relay/...` route. The sweep half is back in `artifacts.spec.ts` against extension storage with its patterns verbatim; **the relay-overhead measurement is not**, so Q4's 1.2 ms figure has no evidence on this architecture and C-4 still has none.
+  **Review round (2026-08-11), three fixes worth recording:** (1) every spec cleaned up in a `finally`, which a Playwright TIMEOUT skips, so a timed-out run left the fixture app, the relay and the bridge alive and the *next* run died on its "port is free" wait — a leaked fixture server from an earlier run was found still holding 4180 after 1h47m, orphaned. Teardown moved into `test.afterEach(stopEverything)` and the children are now spawned `detached` so the process **group** is killed: `tsx` runs the script in a subprocess, so killing the direct child orphaned the thing actually holding the port. Verified by deliberately timing a spec out with all four children running — nothing survived, and the same spec without the hook leaks 4180 and 4290. (2) The degraded-tool "zero requests" assertion had no positive control, so it also passed for a host that had quietly detached; there is one now. (3) The secret sweep read one session's rows; it now dumps every object store of every IndexedDB database the extension holds.
+  **Capability recorded, not rebuilt:** drift detection (WO-011) has no producer on this architecture and was not rebuilt — see the WO-011 header. `DriftStatus` was deleted from `packages/shared/src/recipe.ts`; `README.md` and `e2e/README.md` now say plainly that Douze does not notice a site changing on its own.
 - [x] T-015.15 — **DONE (2026-08-11)**: `README.md` rewritten for one install — extension only, no terminal in the consumer path, the bridge named as the single exception; the daemon, the `douze` CLI, `.mcpb`, `douze-server.zip`, headless and eject are gone from it. The "What Douze does not do" correction is the substantive edit: "everything stays on your computer" now holds only until a hosted assistant is connected, after which the relay operator **and** the AI provider both see tool arguments and full result bodies. The release section states what is true — no tag, no git remote, no Web Store listing, so building it yourself is the only path. `INTERN_VERIFICATION.md` rewritten around the new boundaries (extension message guards, bridge pairing, relay endpoint auth) with the daemon's install-token/loopback-API inventory removed, and a known-gaps section that names what has never been verified. The `~/.douze` migration note is in README's recipe-format section: the importer takes the daemon's exact layout, and nothing can open a directory for it yet.
 - [ ] V-015.4 — Full suite green on the new harness; secret sweep clean over extension storage; the Web Store build contains no `new Function` (a bundler config that forces Node conditions silently swaps ajv back in — grep the worker bundle as a build guard).
 
@@ -526,6 +548,9 @@ running at all.
 ---
 
 ## Post-review gap found in use
+
+> Historical. Every command named in this section was deleted with `packages/cli` in T-015.13, and
+> the `doctor` behaviour it describes has no replacement — see the WO-011 header.
 
 The PRD 5.2 golden path names `douze studio`, `douze doctor <recipe>`, and `douze eject <recipe>`.
 All three were BUILT and tested (review UI, DriftWatcher behind `POST /doctor/:recipe`,
