@@ -89,9 +89,16 @@ const SESSION_REFUSED = {
     'connected to this daemon at once; close one and try again.',
 }
 
-export async function startRelay(options: { port: number; sessionIdleMs?: number }): Promise<Relay> {
-  // Only the tests set this; production reads the one number both halves of the protocol agree on.
+export async function startRelay(options: {
+  port: number
+  sessionIdleMs?: number
+  heartbeatMs?: number
+  requestTimeoutMs?: number
+}): Promise<Relay> {
+  // Only the tests set these; production reads the numbers both halves of the protocol agree on.
   const idleMs = options.sessionIdleMs ?? REMOTE_SESSION_IDLE_MS
+  const heartbeatMs = options.heartbeatMs ?? HEARTBEAT_MS
+  const timeoutMs = options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS
   const byToken = new Map<string, Endpoint>()
   const bySecret = new Map<string, Endpoint>()
   const registrations = new Map<string, { count: number; resetAt: number }>()
@@ -206,7 +213,7 @@ export async function startRelay(options: { port: number; sessionIdleMs?: number
       const timer = setTimeout(() => {
         endpoint.pending.delete(key)
         reject(new Refusal(504, { error: 'timeout', message: 'The daemon did not answer in time.' }))
-      }, REQUEST_TIMEOUT_MS)
+      }, timeoutMs)
       endpoint.pending.set(key, {
         timer,
         resolve: (reply) => {
@@ -395,7 +402,7 @@ export async function startRelay(options: { port: number; sessionIdleMs?: number
         }
         clearTimeout(deadline)
         endpoint = adopt(found, socket)
-        socket.send(JSON.stringify({ type: 'welcome', heartbeat_ms: HEARTBEAT_MS } satisfies RemoteRelayMessage))
+        socket.send(JSON.stringify({ type: 'welcome', heartbeat_ms: heartbeatMs } satisfies RemoteRelayMessage))
         return
       }
       switch (frame.data.type) {
@@ -429,12 +436,12 @@ export async function startRelay(options: { port: number; sessionIdleMs?: number
     endpoint.lastPong = Date.now()
     endpoint.lastSeen = endpoint.lastPong
     endpoint.heartbeat = setInterval(() => {
-      if (Date.now() - endpoint.lastPong > 2 * HEARTBEAT_MS) {
+      if (Date.now() - endpoint.lastPong > 2 * heartbeatMs) {
         socket.terminate()
         return
       }
       send(endpoint, { type: 'ping' })
-    }, HEARTBEAT_MS)
+    }, heartbeatMs)
     log('daemon.connected', { ep: endpoint.label })
     return endpoint
   }

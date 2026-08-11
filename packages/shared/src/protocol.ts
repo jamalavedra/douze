@@ -137,12 +137,13 @@ export type RemoteRelayMessage = z.infer<typeof RemoteRelayMessage>
 /**
  * WO-014 — the body of `POST /register`, the one relay route anyone on the internet can reach
  * unauthenticated. `daemon_version` reaches a relay log line, so it is held to a character set
- * that cannot carry a newline and forge an entry of its own.
+ * that cannot carry a newline and forge an entry of its own. `+` is in it because semver build
+ * metadata (`0.1.0+abc`) is a version a daemon legitimately reports.
  */
 export const RemoteRegistration = z.object({
   daemon_version: z
     .string()
-    .regex(/^[\w.-]{1,32}$/)
+    .regex(/^[\w.+-]{1,32}$/)
     .optional(),
   bearer_token: z.string().max(512).optional(),
 })

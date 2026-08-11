@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { findSurvivingSecrets, redactBody, redactHeaders, redactUrl } from './redact.js'
 import { isNoiseHost, shouldCapture } from './capture.js'
 import { parseRecipe, serializeRecipe } from './recipe-file.js'
-import { HEARTBEAT_MS, RemoteDaemonMessage, RemoteRelayMessage } from './protocol.js'
+import { HEARTBEAT_MS, RemoteDaemonMessage, RemoteRegistration, RemoteRelayMessage } from './protocol.js'
 
 describe('redaction (REQ-CAP-005)', () => {
   it('replaces credential headers but keeps type and length (AC-CAP-005.1/.3)', () => {
@@ -362,6 +362,14 @@ describe('remote relay frames (WO-014)', () => {
       expect(RemoteRelayMessage.parse(frame)).toEqual(frame)
     })
   }
+
+  it('accepts a build-metadata version and still refuses one carrying a newline', () => {
+    expect(RemoteRegistration.safeParse({ daemon_version: '0.1.0+abc' }).success).toBe(true)
+    // The log line the relay writes is one line per event, and this is what keeps it that way.
+    expect(RemoteRegistration.safeParse({ daemon_version: '0.1.0\nendpoint.registered ep=x' }).success).toBe(false)
+    expect(RemoteRegistration.safeParse({ daemon_version: '0.1.0\n' }).success).toBe(false)
+    expect(RemoteRegistration.safeParse({ daemon_version: '+'.repeat(33) }).success).toBe(false)
+  })
 
   it('rejects a frame from the wrong direction', () => {
     expect(RemoteDaemonMessage.safeParse({ type: 'session.open', sid: 's1' }).success).toBe(false)

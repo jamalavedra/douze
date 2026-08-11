@@ -35,7 +35,8 @@ interface FakeDaemon {
 
 /**
  * A douzed stand-in: dials in, says hello, and answers each mcp.message the way an MCP server
- * would. `reply` returning undefined models a daemon that never answers.
+ * would. `reply` returning undefined models a daemon that never answers; `pong: false` models one
+ * whose process is alive enough to hold the socket open and too wedged to answer a ping.
  */
 const connect = async (
   token: string,
@@ -44,6 +45,7 @@ const connect = async (
     id: m.id,
     result: { ok: true },
   }),
+  pong = true,
 ): Promise<FakeDaemon> => {
   const socket = new WebSocket(`ws://127.0.0.1:${relay.port}/ws`)
   const daemon: FakeDaemon = { socket, frames: [] }
@@ -57,7 +59,7 @@ const connect = async (
       const frame = JSON.parse(String(raw)) as FakeDaemon['frames'][number]
       daemon.frames.push(frame)
       if (frame.type === 'welcome') resolve()
-      if (frame.type === 'ping') socket.send(JSON.stringify({ type: 'pong' }))
+      if (frame.type === 'ping' && pong) socket.send(JSON.stringify({ type: 'pong' }))
       if (frame.type !== 'mcp.message' || !frame.message) return
       const answer = reply(frame.message)
       if (answer !== undefined) socket.send(JSON.stringify({ type: 'mcp.message', sid: frame.sid, message: answer }))
@@ -264,6 +266,23 @@ describe('isolation and failure', () => {
     })
   })
 
+  it('times out a call the daemon never answers', async () => {
+    await relay.close()
+    relay = await startRelay({ port: 0, requestTimeoutMs: 100 })
+    const { token, mcp_path } = await enroll()
+    const { sid } = await opened(mcp_path, token)
+
+    // The daemon holds the socket open and says nothing back. Without the timer this waiter is
+    // never settled and the caller's connection hangs for as long as it is willing to.
+    const res = await call(mcp_path, sid, 90)
+    expect(res.status).toBe(200)
+    expect(await res.json()).toMatchObject({
+      jsonrpc: '2.0',
+      id: 90,
+      error: { code: -32_000, message: expect.stringContaining('did not answer in time') },
+    })
+  })
+
   it('refuses a call with no daemon, an unknown session, and an oversize body', async () => {
     const { token, mcp_path } = await enroll()
 
@@ -443,6 +462,31 @@ describe('the daemon socket', () => {
     expect(await closed).toBe(1000)
     // The endpoint is served by the new socket, not left pointing at the dead one.
     expect((await initialize(mcp_path)).status).toBe(200)
+  })
+
+  it('drops a socket that stops answering pings', async () => {
+    await relay.close()
+    relay = await startRelay({ port: 0, heartbeatMs: 50 })
+    const { token, mcp_path } = await enroll()
+    await connect(token, undefined, false)
+
+    // Two missed pongs and the socket goes, whether or not the peer ever noticed: a half-open
+    // connection is indistinguishable from a live one until something insists on an answer.
+    await vi.waitFor(async () => expect((await initialize(mcp_path)).status).toBe(503), { timeout: 2_000 })
+  })
+
+  it('forgets its sessions when the daemon reconnects', async () => {
+    const { token, mcp_path } = await enroll()
+    const daemon = await connect(token)
+    const sid = (await initialize(mcp_path)).headers.get('Mcp-Session-Id') ?? ''
+
+    daemon.socket.close()
+    // `initialize` is refused as HTTP rather than as a JSON-RPC error, so it reports the drop plainly.
+    await vi.waitFor(async () => expect((await initialize(mcp_path)).status).toBe(503))
+
+    await connect(token)
+    // The reconnected daemon built fresh MCP instances and knows nothing of the old session id.
+    expect((await call(mcp_path, sid, 90)).status).toBe(404)
   })
 })
 
