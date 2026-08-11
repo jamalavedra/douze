@@ -5,6 +5,7 @@
  * and stays that way.
  */
 import type { CandidateView, EditableField } from '@douze/studio/browser'
+import type { AuditEntry } from './guards.js'
 
 export interface CapturedBody {
   /** Decoded text, present when the payload was textual. */
@@ -89,6 +90,16 @@ export type PopupCommand =
   | { type: 'douze:connect' }
   /** What is already set up on this site — the popup's quiet summary. */
   | { type: 'douze:site-tools'; origin: string }
+  /**
+   * AC-EXE-003.3 — the recent tool calls, most recent first. `douze status` printed these; the
+   * daemon's audit file is gone, so the same surface is read out of extension storage instead.
+   */
+  | { type: 'douze:audit'; limit?: number }
+
+/** What `douze:audit` answers with. */
+export interface AuditResult {
+  calls: AuditEntry[]
+}
 
 export interface PopupStatus {
   session: { id: string; name: string; origins: string[] } | null
@@ -136,14 +147,26 @@ export interface ReviewSaved {
 }
 
 /**
- * Connect page → service worker. T-015.10 wires these to the real attachment; until then the
- * worker answers every action with `error` set and nothing changed.
+ * Connect page → service worker. `status` and `pair` are live (T-015.8/12); T-015.10 wires the
+ * three that mint or retire a relay endpoint, and until then each answers with `error` set and
+ * nothing changed.
  */
 export type ConnectCommand =
   | { type: 'douze:connect:status' }
   | { type: 'douze:connect:start' }
   | { type: 'douze:connect:rotate' }
   | { type: 'douze:connect:stop' }
+  /**
+   * T-015.12 — the code a local bridge printed to its stderr, typed in by the user. Loopback alone
+   * is not consent: this is what earns a bridge `local` trust and its destructive tools with it.
+   */
+  | { type: 'douze:connect:pair'; code: string }
+  /**
+   * T-015.9 — exempt one tool's results from the secret gate, or put them back under it. Per trust
+   * level: exempting a tool so an app on this computer can read a token must not also start
+   * sending that token to a relay operator.
+   */
+  | { type: 'douze:connect:expose'; trust: 'local' | 'remote'; tool: string; allow: boolean }
 
 export interface ConnectState {
   /** Whether a link exists at all — the page shows setup or the link, never both. */

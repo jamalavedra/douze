@@ -9,6 +9,7 @@
     "smoke": "node smoke.mjs"
   },
   "dependencies": {
+    "@douze/mcp-host": "workspace:*",
     "@douze/shared": "workspace:*",
     "@douze/studio": "workspace:*"
   },

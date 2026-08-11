@@ -13,10 +13,12 @@ import type {
   ReviewState,
   SiteTool,
 } from './messages.js'
+import { RELAY_KEY, recentCalls, startAttachments, type RelayPairing } from './attach.js'
 import { DebuggerCapture } from './debugger-capture.js'
 import { installOracle } from './oracle.js'
 import { RECONCILE_GRACE_MS, Reconciler, admits, decodeBody, finalize, type ExchangeDraft } from './pipeline.js'
-import { RecipeStore } from './recipes.js'
+import { RecipeStore, type SurfaceTool } from './recipes.js'
+import { executeRelay } from './relay.js'
 import { ReviewSession } from './review-session.js'
 import { CaptureStore } from './store.js'
 
@@ -118,6 +120,78 @@ const openStores = (): Promise<{ captures: CaptureStore; recipes: RecipeStore }>
   }))
   return stores
 }
+
+// --- the attachment -------------------------------------------------------
+
+/**
+ * The Tool Surface, kept synchronously so a `tool.call` never has to await a store to find out
+ * whether the tool exists. Replaced wholesale by `RecipeStore.subscribe`, which is the same signal
+ * that triggers the `surface.push` to every host.
+ */
+let liveSurface: readonly SurfaceTool[] = []
+
+/** Notification id → where clicking it should take the user. Rebuilt with the worker. */
+const notificationTargets = new Map<string, string>()
+
+const hostnameOf = (origin: string): string => {
+  try {
+    return new URL(origin).hostname
+  } catch {
+    return origin
+  }
+}
+
+/** AC-EXE-002.3 — a session that has expired is surfaced with a link to the target's login page. */
+function notifyExpired(origin: string, loginUrl: string): void {
+  const site = hostnameOf(origin)
+  notify(
+    `douze-expired-${origin}`,
+    `Signed out of ${site}`,
+    `You've been signed out of ${site}, so your assistant can't act there. Click to sign in again.`,
+    loginUrl,
+  )
+}
+
+function notify(id: string, title: string, message: string, url?: string): void {
+  if (url !== undefined) notificationTargets.set(id, url)
+  else notificationTargets.set(id, chrome.runtime.getURL('connect.html'))
+  chrome.notifications.create(id, {
+    type: 'basic',
+    iconUrl: chrome.runtime.getURL('icon128.png'),
+    title,
+    message,
+  })
+}
+
+/**
+ * WO-015 T-015.8/9 — the one attachment client, serving the relay and every local bridge. Started
+ * at the top level so its `chrome.alarms` listener is registered before any await, and the alarm
+ * itself is recreated on every worker start because an evicted worker keeps no timers.
+ */
+const attachments = startAttachments({
+  surface: () => liveSurface,
+  // Never replay through the tab being recorded: the oracle would ingest our own request.
+  execute: (request) =>
+    executeRelay(request, { notifyExpired, ...(recording === null ? {} : { recordingTabId: recording.tabId }) }),
+  notify: (id, title, message) => notify(id, title, message),
+})
+
+/**
+ * The recipe store is opened at worker start rather than lazily: `RecipeStore.subscribe` is what
+ * keeps every attached host's cached surface honest, and a worker that only opened the store on
+ * the first capture would serve a stale one for its whole life. Dialling comes after, so the first
+ * `surface.push` of a connect is never the empty one.
+ */
+const dialled = hydrated.then(async () => {
+  const { recipes } = await openStores()
+  liveSurface = recipes.surface().tools
+  recipes.subscribe((state) => {
+    liveSurface = state.tools
+    // T-015.8 — a recipe change is a `surface.push` on every live attachment.
+    attachments.pushSurface()
+  })
+  await attachments.tick()
+})
 
 // --- capture --------------------------------------------------------------
 
@@ -420,24 +494,39 @@ async function onReviewCommand(command: ReviewCommand): Promise<ReviewState | Re
 // --- connect --------------------------------------------------------------
 
 /**
- * T-015.10 owns the real attachment: pairing credential in extension storage, the link shown once,
- * rotate and disconnect. Until then the page renders its setup screen and its trust disclosure,
- * and every action is refused by name rather than half-done.
+ * T-015.10 owns registering with a relay: `start`, `rotate` and `stop` all mint or retire an
+ * endpoint, and none of them is wired yet, so each is refused by name rather than half-done.
+ *
+ * What T-015.8 does own is answering honestly about the pairing that IS stored and whether the
+ * socket is up right now, and taking the bridge's pairing code (T-015.12) — both of which the page
+ * would otherwise have to guess at.
  */
 const NOT_CONNECTED_YET = 'Connecting to a hosted assistant is not wired up yet.'
 
-const connectState = (): ConnectState => ({
-  configured: false,
-  url: '',
-  mcp_url: '',
-  allow_writes: false,
-  connected: false,
-})
+async function connectState(): Promise<ConnectState> {
+  const stored = await chrome.storage.local.get(RELAY_KEY)
+  const relay = stored[RELAY_KEY] as RelayPairing | undefined
+  return {
+    configured: relay !== undefined,
+    url: relay?.url ?? '',
+    mcp_url: relay === undefined ? '' : `${relay.url}${relay.mcp_path}`,
+    allow_writes: relay?.allow_writes ?? false,
+    connected: attachments.connected(),
+  }
+}
 
-const onConnectCommand = (command: ConnectCommand): ConnectState =>
-  command.type === 'douze:connect:status'
-    ? connectState()
-    : { ...connectState(), error: NOT_CONNECTED_YET }
+async function onConnectCommand(command: ConnectCommand): Promise<ConnectState> {
+  if (command.type === 'douze:connect:pair') {
+    await attachments.pair(command.code)
+    return connectState()
+  }
+  if (command.type === 'douze:connect:expose') {
+    await attachments.setExposed(command.trust, command.tool, command.allow)
+    return connectState()
+  }
+  const state = await connectState()
+  return command.type === 'douze:connect:status' ? state : { ...state, error: NOT_CONNECTED_YET }
+}
 
 const status = (): PopupStatus => ({
   session: recording
@@ -529,6 +618,8 @@ chrome.runtime.onMessage.addListener((message: Inbound, sender, sendResponse) =>
         return status()
       }
       if (message.type === 'douze:site-tools') return { tools: await siteTools(message.origin) }
+      // AC-EXE-003.3 — the local audit `douze status` used to print, read back from storage.
+      if (message.type === 'douze:audit') return { calls: await recentCalls(message.limit) }
       if (message.type === 'douze:review') {
         await openReview(message.sessionId)
         return status()
@@ -555,6 +646,18 @@ chrome.runtime.onInstalled.addListener(() => {
     await DebuggerCapture.clearZombies()
     if (recording) await registerScripts(recording.session.origins)
   })
+})
+
+/**
+ * AC-EXE-002.3 — clicking the "signed out" notification opens the site's own login page, which is
+ * the only action that fixes it. Anything Douze raised without a target opens the connect page.
+ */
+chrome.notifications.onClicked.addListener((id) => {
+  const url = notificationTargets.get(id)
+  if (!url) return
+  notificationTargets.delete(id)
+  void chrome.tabs.create({ url })
+  void chrome.notifications.clear(id)
 })
 
 chrome.tabs.onRemoved.addListener((tabId) => {
@@ -618,6 +721,12 @@ Object.assign(globalThis, {
      */
     hasOrigin: (origin: string): Promise<boolean> =>
       chrome.permissions.contains({ origins: [`${origin}/*`] }),
+    /** Whether any host is attached right now, and what the last few calls did. */
+    async attached(): Promise<boolean> {
+      await dialled
+      return attachments.connected()
+    },
+    calls: (limit?: number) => recentCalls(limit),
     status,
   },
 })

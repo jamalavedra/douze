@@ -211,13 +211,22 @@ const storageArea = (items: Map<string, unknown>, area: string, onChanged: FakeE
   },
 })
 
+/** What the ISOLATED-world injection hands back; a test swaps it to drive execution. */
+type Injected = { status: number; headers: Record<string, string>; body: string; url: string; redirected: boolean }
+
 interface FakeChrome {
   onMessage: FakeEvent
+  onAlarm: FakeEvent
+  onNotificationClicked: FakeEvent
   reloaded: number[]
   created: string[]
   badge: string
   registered: string[]
   local: Map<string, unknown>
+  alarms: string[]
+  notifications: { id: string; title: string; message: string }[]
+  /** Swapped by a test that needs a specific response, or a slow one. */
+  inject: (url: string) => Promise<Injected>
 }
 
 const globals = globalThis as Record<string, unknown>
@@ -227,7 +236,25 @@ function installChrome(): FakeChrome {
   const onChanged = fakeEvent()
   const local = new Map<string, unknown>()
   const session = new Map<string, unknown>()
-  const state: FakeChrome = { onMessage, reloaded: [], created: [], badge: '', registered: [], local }
+  const state: FakeChrome = {
+    onMessage,
+    onAlarm: fakeEvent(),
+    onNotificationClicked: fakeEvent(),
+    reloaded: [],
+    created: [],
+    badge: '',
+    registered: [],
+    local,
+    alarms: [],
+    notifications: [],
+    inject: async (url: string) => ({
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ data: [{ id: 1 }] }),
+      url,
+      redirected: false,
+    }),
+  }
 
   globals['chrome'] = {
     runtime: {
@@ -236,6 +263,20 @@ function installChrome(): FakeChrome {
       getURL: (path: string) => `chrome-extension://douze/${path}`,
       getManifest: () => ({ version: '0.1.0' }),
     },
+    alarms: {
+      onAlarm: state.onAlarm,
+      create: (name: string) => {
+        state.alarms.push(name)
+      },
+    },
+    notifications: {
+      onClicked: state.onNotificationClicked,
+      create: (id: string, options: { title: string; message: string }) => {
+        state.notifications.push({ id, title: options.title, message: options.message })
+      },
+      clear: async () => undefined,
+    },
+    permissions: { contains: async () => true },
     storage: {
       local: storageArea(local, 'local', onChanged),
       session: storageArea(session, 'session', onChanged),
@@ -262,6 +303,9 @@ function installChrome(): FakeChrome {
         state.registered = scripts.map((script) => script.id)
       },
       unregisterContentScripts: async () => undefined,
+      // The one injection `executeRelay` makes for a cookie-authenticated tool: the ISOLATED-world
+      // fetch. `args[0]` is the URL it was told to call.
+      executeScript: async ({ args }: { args?: unknown[] }) => [{ result: await state.inject(String(args?.[0] ?? '')) }],
     },
     webRequest: {
       onBeforeRequest: fakeEvent(),
@@ -272,6 +316,67 @@ function installChrome(): FakeChrome {
   }
   return state
 }
+
+// --- WebSocket fake (T-015.8) ----------------------------------------------
+
+/**
+ * One host on the far side of an attachment. The worker dials; nothing here connects on its own,
+ * so a test decides exactly when `open`, `welcome` and a drop happen — which is the only way to
+ * assert on what the worker does with a call that was in flight when the socket died.
+ */
+class FakeSocket {
+  static readonly opened: FakeSocket[] = []
+  readyState = 0
+  readonly sent: Record<string, unknown>[] = []
+  private readonly listeners = new Map<string, Set<(event: unknown) => void>>()
+
+  constructor(readonly url: string) {
+    FakeSocket.opened.push(this)
+  }
+
+  addEventListener(type: string, handler: (event: unknown) => void): void {
+    const set = this.listeners.get(type) ?? new Set()
+    set.add(handler)
+    this.listeners.set(type, set)
+  }
+
+  send(text: string): void {
+    this.sent.push(JSON.parse(text) as Record<string, unknown>)
+  }
+
+  close(): void {
+    this.drop(1000)
+  }
+
+  /** The host accepted the socket. */
+  accept(): void {
+    this.readyState = 1
+    this.fire('open', {})
+  }
+
+  /** One host → extension frame. `extra` rides beside it, as the bridge's `secret` does. */
+  deliver(frame: unknown, extra: Record<string, unknown> = {}): void {
+    this.fire('message', { data: JSON.stringify({ ...(frame as object), ...extra }) })
+  }
+
+  drop(code = 1006): void {
+    if (this.readyState === 3) return
+    this.readyState = 3
+    this.fire('close', { code })
+  }
+
+  /** Frames of one type, in order. */
+  frames(type: string): Record<string, unknown>[] {
+    return this.sent.filter((frame) => frame['type'] === type)
+  }
+
+  private fire(type: string, event: unknown): void {
+    for (const handler of this.listeners.get(type) ?? []) handler(event)
+  }
+}
+
+const dialled = (match: string): FakeSocket | undefined =>
+  FakeSocket.opened.filter((socket) => socket.url.includes(match)).at(-1)
 
 // --- driving the worker ----------------------------------------------------
 
@@ -363,11 +468,15 @@ interface DouzeSurface {
 
 const douze = (): DouzeSurface => globals['__douze'] as DouzeSurface
 
-async function bootWorker(): Promise<void> {
+/** `seed` lands in `chrome.storage.local` BEFORE the worker starts, as a stored pairing does. */
+async function bootWorker(seed: Record<string, unknown> = {}): Promise<void> {
   databases.clear()
   fake = installChrome()
+  FakeSocket.opened.length = 0
+  for (const [key, value] of Object.entries(seed)) fake.local.set(key, value)
   globals['indexedDB'] = fakeIndexedDB
   globals['IDBKeyRange'] = FakeKeyRange
+  globals['WebSocket'] = FakeSocket
   vi.resetModules()
   await import('./background.js')
   await settle()
@@ -379,12 +488,13 @@ const capture = async (events: PageEvent[], origin = 'https://app.test'): Promis
 
 const openCaptures = (): Promise<CaptureStore> => CaptureStore.open()
 
-beforeEach(bootWorker)
+beforeEach(() => bootWorker())
 
 afterEach(() => {
   delete globals['chrome']
   delete globals['indexedDB']
   delete globals['IDBKeyRange']
+  delete globals['WebSocket']
   delete globals['__douze']
 })
 
@@ -576,6 +686,366 @@ describe('what the popup asks the worker for', () => {
     })) as { noiseHosts: string[] }
     expect(status.noiseHosts).toEqual(['metrics.internal.example'])
     expect(fake.local.get('noise_hosts')).toEqual(['metrics.internal.example'])
+  })
+})
+
+/**
+ * WO-015 T-015.8/9 — the attachment client and the guards, driven the way a host drives them:
+ * frames onto the socket the worker dialled. The far side is faked at the socket and nothing below
+ * it is, so the recipe store, `runToolCall` and `executeRelay` are all the real ones.
+ */
+
+const RELAY = { url: 'https://relay.test', token: 'relay-token', mcp_path: '/m/secret', allow_writes: false }
+
+/** Three tools on `app.test`, one of each side effect — the whole trust table in one recipe. */
+const SHOP_ALL = Recipe.parse({
+  version: 1,
+  name: 'shop',
+  target: { base_url: 'https://app.test' },
+  tools: [
+    {
+      name: 'list_orders',
+      description: 'List orders',
+      side_effect: 'read',
+      confidence: 0.9,
+      observations: 3,
+      approved: true,
+      request: { method: 'GET', path: '/orders' },
+      response: { primary_payload_path: '$.data' },
+      fixtures: ['shop/list_orders.json'],
+    },
+    {
+      name: 'create_order',
+      description: 'Create an order',
+      side_effect: 'write',
+      confidence: 0.9,
+      observations: 3,
+      approved: true,
+      request: { method: 'POST', path: '/orders' },
+      fixtures: ['shop/create_order.json'],
+    },
+    {
+      name: 'delete_order',
+      description: 'Delete an order',
+      side_effect: 'destructive',
+      confidence: 0.9,
+      observations: 3,
+      approved: true,
+      request: {
+        method: 'DELETE',
+        path: '/orders/{id}',
+        input_schema: {
+          type: 'object',
+          properties: { id: { type: 'string' }, confirm: { type: 'boolean' } },
+          required: ['id', 'confirm'],
+        },
+      },
+      fixtures: ['shop/delete_order.json'],
+    },
+  ],
+})
+
+/** Puts the recipe and its fixtures in storage, which is what moves the surface. */
+async function approveShop(): Promise<void> {
+  const recipes = await RecipeStore.open()
+  for (const tool of ['list_orders', 'create_order', 'delete_order']) {
+    await recipes.putFixture('shop', tool, { ok: true })
+  }
+  const saved = await recipes.save(SHOP_ALL)
+  expect(saved.ok, saved.error).toBe(true)
+  await settle()
+}
+
+const pushedNames = (socket: FakeSocket): string[][] =>
+  socket.frames('surface.push').map((frame) => (frame['tools'] as { name: string }[]).map((tool) => tool.name))
+
+/** Boots a worker with a stored pairing and takes the socket it dialled through the handshake. */
+async function attach(seed: Record<string, unknown>, match: string): Promise<FakeSocket> {
+  await bootWorker(seed)
+  const socket = dialled(match)
+  if (!socket) throw new Error(`nothing dialled ${match}; saw ${FakeSocket.opened.map((s) => s.url).join(', ')}`)
+  socket.accept()
+  await settle()
+  socket.deliver({ type: 'welcome', heartbeat_ms: 20_000 })
+  await settle()
+  return socket
+}
+
+const callFrame = (
+  id: string,
+  name: string,
+  args: Record<string, unknown>,
+  trust = 'remote',
+): Record<string, unknown> => ({ type: 'tool.call', id, name, args, trust })
+
+const resultFor = (socket: FakeSocket, id: string): Record<string, unknown> | undefined =>
+  socket.frames('tool.result').find((frame) => frame['id'] === id)
+
+const failure = (socket: FakeSocket, id: string): { code: string; message: string } =>
+  resultFor(socket, id)?.['error'] as { code: string; message: string }
+
+describe('the attachment handshake (T-015.8)', () => {
+  it('recreates the reconnect alarm at every worker start, because an evicted one keeps no timers', () => {
+    expect(fake.alarms).toContain('douze-attach')
+  })
+
+  it('says hello with the stored endpoint token and its own version, then pushes the surface', async () => {
+    const socket = await attach({ 'attach:relay': RELAY }, 'relay.test')
+    expect(socket.url).toBe('wss://relay.test/ws')
+    expect(socket.frames('hello')[0]).toEqual({
+      type: 'hello',
+      extension_version: '0.1.0',
+      token: 'relay-token',
+    })
+    // Pushed on connect even when it is empty: the host caches it, and nothing else corrects it.
+    expect(pushedNames(socket)).toEqual([[]])
+  })
+
+  it('answers a ping with a pong', async () => {
+    const socket = await attach({ 'attach:relay': RELAY }, 'relay.test')
+    socket.deliver({ type: 'ping' })
+    await settle()
+    expect(socket.frames('pong')).toHaveLength(1)
+  })
+
+  it('pushes again on every recipe change, and again on the next connect', async () => {
+    const socket = await attach({ 'attach:relay': RELAY }, 'relay.test')
+    await approveShop()
+    expect(pushedNames(socket).at(-1)).toEqual(['shop_list_orders'])
+
+    // The socket dies with the host, not with the pairing: the alarm re-dials and re-pushes,
+    // because a host that came back holds no surface at all until this arrives.
+    socket.drop()
+    fake.onAlarm.emit({ name: 'douze-attach' })
+    await settle()
+    const second = dialled('relay.test') as FakeSocket
+    expect(second).not.toBe(socket)
+    second.accept()
+    await settle()
+    second.deliver({ type: 'welcome', heartbeat_ms: 20_000 })
+    await settle()
+    expect(pushedNames(second).at(-1)).toEqual(['shop_list_orders'])
+  })
+})
+
+describe('the trust table, enforced in the extension (T-015.9)', () => {
+  it('never pushes a destructive tool to a remote host, and refuses one a lying host asks for', async () => {
+    const socket = await attach({ 'attach:relay': RELAY }, 'relay.test')
+    await approveShop()
+    expect(pushedNames(socket).at(-1)).toEqual(['shop_list_orders'])
+
+    // `trust: 'local'` is the host's claim; the extension derives its own from what it dialled.
+    socket.deliver(callFrame('c1', 'shop_delete_order', { id: '7', confirm: true }, 'local'))
+    await settle()
+    expect(resultFor(socket, 'c1')?.['result']).toBeUndefined()
+    expect(failure(socket, 'c1').code).toBe('trust_refused')
+    expect(failure(socket, 'c1').message).toContain('no setting that turns it on')
+  })
+
+  it('refuses a remote write until the attachment opted in, then pushes and runs it', async () => {
+    const readOnly = await attach({ 'attach:relay': RELAY }, 'relay.test')
+    await approveShop()
+    readOnly.deliver(callFrame('w1', 'shop_create_order', { item: 'lamp' }))
+    await settle()
+    expect(failure(readOnly, 'w1').code).toBe('trust_refused')
+
+    const allowed = await attach({ 'attach:relay': { ...RELAY, allow_writes: true } }, 'relay.test')
+    await approveShop()
+    expect(pushedNames(allowed).at(-1)).toEqual(['shop_list_orders', 'shop_create_order'])
+    allowed.deliver(callFrame('w2', 'shop_create_order', { item: 'lamp' }))
+    await settle()
+    expect(resultFor(allowed, 'w2')?.['error']).toBeUndefined()
+  })
+
+  it('gives a paired local bridge everything, and asks a destructive tool for confirm', async () => {
+    const socket = await attach({ 'attach:bridge': { secret: 'pinned-secret' } }, '127.0.0.1')
+    await approveShop()
+    expect(pushedNames(socket).at(-1)).toEqual(['shop_list_orders', 'shop_create_order', 'shop_delete_order'])
+    expect(socket.frames('hello')[0]).toEqual({
+      type: 'hello',
+      extension_version: '0.1.0',
+      secret: 'pinned-secret',
+    })
+
+    socket.deliver(callFrame('d1', 'shop_delete_order', { id: '7' }, 'remote'))
+    socket.deliver(callFrame('d2', 'shop_delete_order', { id: '7', confirm: true }, 'remote'))
+    await settle()
+    expect(failure(socket, 'd1').code).toBe('confirm_required')
+    expect(resultFor(socket, 'd2')?.['error']).toBeUndefined()
+  })
+
+  it('shapes a read to the recipe’s payload path and audits what it ran', async () => {
+    const socket = await attach({ 'attach:relay': RELAY }, 'relay.test')
+    await approveShop()
+    socket.deliver(callFrame('r1', 'shop_list_orders', {}))
+    await settle()
+
+    const result = resultFor(socket, 'r1')?.['result'] as { content: { text: string }[] }
+    expect(JSON.parse(result.content[0]!.text)).toMatchObject({ status: 200, data: [{ id: 1 }] })
+
+    const audit = (await sendFrom(extensionPage(), { type: 'douze:audit' })) as {
+      calls: { tool: string; trust: string; outcome: string }[]
+    }
+    expect(audit.calls[0]).toMatchObject({ tool: 'shop_list_orders', trust: 'remote', outcome: 'ok' })
+  })
+
+  it('refuses a result carrying a credential, naming where it was, and never sends it', async () => {
+    const socket = await attach({ 'attach:relay': RELAY }, 'relay.test')
+    await approveShop()
+    fake.inject = async (url) => ({
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ data: { session: JWT } }),
+      url,
+      redirected: false,
+    })
+    socket.deliver(callFrame('r2', 'shop_list_orders', {}))
+    await settle()
+
+    expect(failure(socket, 'r2').code).toBe('result_withheld')
+    expect(failure(socket, 'r2').message).toContain('$.content[0].text')
+    expect(JSON.stringify(socket.sent)).not.toContain(JWT)
+  })
+
+  it('exempts a tool from the gate at one trust level only', async () => {
+    const socket = await attach({ 'attach:relay': RELAY }, 'relay.test')
+    await approveShop()
+    fake.inject = async (url) => ({
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ data: { session: JWT } }),
+      url,
+      redirected: false,
+    })
+    const expose = (trust: string): Promise<unknown> =>
+      sendFrom(extensionPage(), { type: 'douze:connect:expose', trust, tool: 'shop_list_orders', allow: true })
+
+    // Exempting it for an app on this computer must not start sending the token to a relay too.
+    await expose('local')
+    await settle()
+    socket.deliver(callFrame('g1', 'shop_list_orders', {}))
+    await settle()
+    expect(failure(socket, 'g1').code).toBe('result_withheld')
+
+    await expose('remote')
+    await settle()
+    socket.deliver(callFrame('g2', 'shop_list_orders', {}))
+    await settle()
+    expect(resultFor(socket, 'g2')?.['error']).toBeUndefined()
+  })
+})
+
+describe('a call in flight when the socket drops (T-015.8)', () => {
+  it('is not answered after the reconnect, because the host already failed it', async () => {
+    const socket = await attach({ 'attach:relay': RELAY }, 'relay.test')
+    await approveShop()
+
+    let release: (() => void) | undefined
+    fake.inject = async (url) => {
+      await new Promise<void>((resolve) => {
+        release = resolve
+      })
+      return { status: 200, headers: {}, body: '{}', url, redirected: false }
+    }
+    socket.deliver(callFrame('slow', 'shop_list_orders', {}))
+    await settle()
+
+    socket.drop()
+    fake.onAlarm.emit({ name: 'douze-attach' })
+    await settle()
+    const second = dialled('relay.test') as FakeSocket
+    second.accept()
+    await settle()
+    second.deliver({ type: 'welcome', heartbeat_ms: 20_000 })
+    await settle()
+
+    release?.()
+    await settle()
+    // A tool can be a write; the host failed this id at the drop and never re-sends it, so an
+    // answer arriving now would settle nothing and could collide with a freshly minted id.
+    expect(resultFor(socket, 'slow')).toBeUndefined()
+    expect(resultFor(second, 'slow')).toBeUndefined()
+  })
+})
+
+describe('a host that refuses the pairing (T-015.8/12)', () => {
+  it('stops dialling the bridge on 1008 and asks for a code instead of retrying forever', async () => {
+    const socket = await attach({ 'attach:bridge': { secret: 'stale' } }, '127.0.0.1')
+    const before = FakeSocket.opened.length
+    socket.drop(1008)
+    await settle()
+
+    expect(fake.notifications.at(-1)?.title).toContain('could not pair')
+    expect(fake.local.get('attach:bridge')).toEqual({ blocked: true })
+
+    fake.onAlarm.emit({ name: 'douze-attach' })
+    await settle()
+    expect(FakeSocket.opened.length).toBe(before)
+  })
+
+  it('stops re-dialling a relay that rejected its token, and says the link needs remaking', async () => {
+    const socket = await attach({ 'attach:relay': RELAY }, 'relay.test')
+    const before = FakeSocket.opened.length
+    socket.drop(1008)
+    await settle()
+
+    expect(fake.notifications.at(-1)?.title).toBe('Douze lost its link')
+    fake.onAlarm.emit({ name: 'douze-attach' })
+    await settle()
+    expect(FakeSocket.opened.length).toBe(before)
+
+    // A token written by the connect page is a different one, so dialling resumes on its own.
+    await chrome.storage.local.set({ 'attach:relay': { ...RELAY, token: 'a-new-token' } })
+    fake.onAlarm.emit({ name: 'douze-attach' })
+    await settle()
+    const retried = dialled('relay.test') as FakeSocket
+    expect(retried).not.toBe(socket)
+    retried.accept()
+    await settle()
+    expect(retried.frames('hello')[0]).toMatchObject({ token: 'a-new-token' })
+  })
+
+  it('takes a fresh pairing code from the connect page and pins the secret it earns', async () => {
+    await attach({ 'attach:bridge': { secret: 'stale' } }, '127.0.0.1')
+    ;(dialled('127.0.0.1') as FakeSocket).drop(1008)
+    await settle()
+
+    await sendFrom(extensionPage(), { type: 'douze:connect:pair', code: 'four-word-code' })
+    await settle()
+    const retried = dialled('127.0.0.1') as FakeSocket
+    retried.accept()
+    await settle()
+    expect(retried.frames('hello')[0]).toMatchObject({ code: 'four-word-code' })
+
+    // The bridge mints the credential on a first pairing and hands it back BESIDE `welcome`; the
+    // protocol schema strips it, so it is read off the raw frame and pinned for every later dial.
+    retried.deliver({ type: 'welcome', heartbeat_ms: 20_000 }, { secret: 'minted-secret' })
+    await settle()
+    expect(fake.local.get('attach:bridge')).toEqual({ secret: 'minted-secret' })
+  })
+})
+
+describe('an expired session (AC-EXE-002.3)', () => {
+  it('notifies with the site’s name, and clicking it opens the login page', async () => {
+    const socket = await attach({ 'attach:relay': RELAY }, 'relay.test')
+    await approveShop()
+    fake.inject = async () => ({
+      status: 200,
+      headers: {},
+      body: '',
+      url: 'https://app.test/login',
+      redirected: true,
+    })
+    socket.deliver(callFrame('e1', 'shop_list_orders', {}))
+    await settle()
+
+    expect(failure(socket, 'e1').code).toBe('session_expired')
+    const notification = fake.notifications.at(-1)
+    expect(notification?.title).toBe('Signed out of app.test')
+
+    fake.onNotificationClicked.emit(notification?.id)
+    await settle()
+    expect(fake.created).toContain('https://app.test/login')
   })
 })
 
