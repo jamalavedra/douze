@@ -30,7 +30,8 @@ const sleep = (ms: number): Promise<void> =>
 
 export interface McpOptions {
   builder: ToolSurfaceBuilder
-  daemon: DaemonClient
+  /** Only the registry is read here, so the remote bridge can hand over a filtered view of it. */
+  daemon: Pick<DaemonClient, 'registry'>
   name?: string
   version?: string
   input?: Readable

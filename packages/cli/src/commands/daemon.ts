@@ -4,6 +4,7 @@ import { z } from 'incur'
 import { isAlive, readRuntime, startDaemon } from '@douze/douzed'
 import { DEFAULT_PORT, PORT_RANGE } from '@douze/shared'
 import { DaemonClient, startDetached } from '../daemon-client.js'
+import { readRelayConfig, readRemoteAudit, startRemoteBridge } from '../remote-bridge.js'
 
 type ErrorFn = (options: { code: string; message: string; exitCode?: number }) => never
 
@@ -78,6 +79,8 @@ export function register(cli: { command: (name: string, definition: unknown) => 
         // AC-REC-001.4 — a recipe that failed to load is named here rather than disappearing.
         degraded: registry.tools.filter((t) => t.degraded).map((t) => t.qualified_name),
         errors: registry.errors,
+        // T-014.3 — what the remote path has been asked to do, readable without a log file.
+        ...(readRelayConfig() ? { remote: { configured: true, recent_calls: readRemoteAudit(5) } } : {}),
       }
     },
   })
@@ -119,8 +122,15 @@ async function runForeground(port: number | undefined, error: ErrorFn): Promise<
   } catch (cause) {
     return error({ code: 'ALREADY_RUNNING', message: (cause as Error).message, exitCode: 1 })
   }
+  // WO-014 — the outbound bridge to a relay, if `douze connect` paired one. It dials out and
+  // opens no listener, and a relay that is down costs a reconnect loop and nothing else, so the
+  // daemon is up and serving loopback whatever the relay is doing.
+  const relayConfig = readRelayConfig()
+  const bridge = relayConfig ? startRemoteBridge(new DaemonClient(), relayConfig) : null
+
   for (const signal of ['SIGTERM', 'SIGINT'] as const) {
     process.on(signal, () => {
+      bridge?.close()
       void daemon.close().then(() => process.exit(0))
     })
   }
