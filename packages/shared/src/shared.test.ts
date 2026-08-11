@@ -126,6 +126,63 @@ describe('recipe format (REQ-REC-001)', () => {
     expect(() => serializeRecipe(recipe)).toThrow(/credential/)
   })
 
+  /**
+   * A recipe arrives as a file someone sent the user, and `buildRequest` resolves `path` against
+   * `base_url` with `new URL()` — which drops the base entirely for anything that is not
+   * site-relative. Each of these resolved to a host the recipe never declared, on a call carrying
+   * the recorded page's cookies and its page-state token.
+   */
+  describe('a request path may not leave the recipe target (WO-015)', () => {
+    const withPath = (path: string): ReturnType<typeof parseRecipe> =>
+      parseRecipe(VALID.replace('path: /api/orders', `path: ${JSON.stringify(path)}`), 'x.yaml')
+
+    it.each([
+      ['absolute', 'https://evil.example/steal'],
+      ['cloud metadata', 'http://169.254.169.254/latest/meta-data/'],
+      ['protocol-relative', '//evil.example/steal'],
+      // `new URL('/\\evil.example/x', base)` is `https://evil.example/x`: to the URL parser a
+      // backslash is a slash, so a single leading `/` is not on its own enough.
+      ['backslash-led', '/\\evil.example/steal'],
+      // Tabs and newlines are stripped before parsing, so `/\n//evil` is `//evil`.
+      ['newline-smuggled', '/\n//evil.example/steal'],
+      ['scheme-only', 'javascript:fetch("https://evil.example")'],
+      ['bare relative', 'api/orders'],
+    ])('rejects a %s path', (_kind, path) => {
+      const result = withPath(path)
+      expect(result.ok).toBe(false)
+      expect(result.error).toContain('site-relative')
+    })
+
+    it('still accepts the paths inference emits', () => {
+      expect(withPath('/api/orders').ok).toBe(true)
+      expect(withPath('/v1/project/apikey/{project_key}/origins').ok).toBe(true)
+      expect(withPath('/').ok).toBe(true)
+    })
+
+    /**
+     * `page_origin` becomes a `chrome.tabs.create` URL and the tab a MAIN-world script runs in, and
+     * it is interpolated into a `chrome.permissions.contains` match pattern that throws when it is
+     * malformed — outside the relay's try block, so a bad value surfaced as a raw internal error.
+     */
+    it('rejects a page_origin that is not a bare http(s) origin', () => {
+      const withOrigin = (origin: string): ReturnType<typeof parseRecipe> =>
+        parseRecipe(VALID.replace('tools:', `auth:\n  page_origin: ${JSON.stringify(origin)}\ntools:`), 'x.yaml')
+      for (const bad of ['javascript:alert(1)', 'https://app.test/dashboard', 'app.test', 'file:///etc', '*']) {
+        expect(withOrigin(bad).ok, bad).toBe(false)
+      }
+      expect(withOrigin('https://app.test').ok).toBe(true)
+      expect(withOrigin('http://localhost:3000').ok).toBe(true)
+    })
+
+    it('rejects a base_url that is not http(s)', () => {
+      for (const url of ['javascript:alert(1)', 'data:text/html,x', 'file:///etc/passwd']) {
+        const result = parseRecipe(VALID.replace('https://app.test', url), 'x.yaml')
+        expect(result.ok, url).toBe(false)
+      }
+      expect(parseRecipe(VALID.replace('https://app.test', 'http://localhost:3000'), 'x.yaml').ok).toBe(true)
+    })
+  })
+
   it('migrates a versionless recipe and reports the field (AC-REC-001.3)', () => {
     const result = parseRecipe(VALID.replace('version: 1', 'version: 0'), 'old.yaml')
     expect(result.ok).toBe(true)

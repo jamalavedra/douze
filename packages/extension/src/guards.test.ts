@@ -175,12 +175,26 @@ describe('call-time enforcement regardless of what was pushed (T-015.9)', () => 
     )
   })
 
-  it('lets the runtime arguments through whatever the schema says, and leaves a loose schema loose', () => {
+  it('lets the runtime arguments through whatever the schema says', () => {
     expect(() => checkPolicy(READ, { raw: true, confirm: true }, 'local', true)).not.toThrow()
-    // Inference emits `{}` for a shape it could not pin down; a constraint invented here would
-    // refuse calls the recording proves are fine.
-    const loose = tool('search', 'read', {}, { input_schema: {} })
-    expect(() => checkPolicy(loose, { anything: 1 }, 'remote', false)).not.toThrow()
+  })
+
+  /**
+   * A schema with no `properties` at all used to make `check` return no faults whatsoever, so
+   * validation for that tool was a no-op and any argument was appended to the URL by
+   * `buildRequest`. Inference emits `{}` for a tool that takes nothing (inference/engine.ts) —
+   * "takes nothing" is not "takes anything" — and a hand-written or imported recipe can say it
+   * outright, which is the untrusted path.
+   */
+  it('treats a schema with no properties as a tool that takes no parameters', () => {
+    for (const schema of [{}, { type: 'object' }, { type: 'object', required: [] }]) {
+      const loose = tool('search', 'read', {}, { input_schema: schema })
+      expect(() => checkPolicy(loose, {}, 'remote', false)).not.toThrow()
+      expect(() => checkPolicy(loose, { raw: true }, 'remote', false)).not.toThrow()
+      const error = refusal(() => checkPolicy(loose, { anything: 1 }, 'remote', false))
+      expect(error.code).toBe('invalid_arguments')
+      expect(error.message).toContain('"anything" is not a parameter of this tool')
+    }
   })
 
   it('exempts a page-filled parameter from the required check, because the caller cannot send it', () => {

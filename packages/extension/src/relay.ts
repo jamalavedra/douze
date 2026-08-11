@@ -103,13 +103,13 @@ export function readPageCredentials(expressions: string[]): Array<string | null>
       }
       return cursor === null || cursor === undefined ? null : String(cursor)
     }
-    try {
-      // eslint-disable-next-line no-eval -- last resort for accessor shapes we do not model.
-      const value: unknown = (0, eval)(source)
-      return value === null || value === undefined ? null : String(value)
-    } catch {
-      return null
-    }
+    // Anything else is not read. This ran `(0, eval)(source)` in the MAIN world of the user's
+    // authenticated dashboard, on a string that arrives with an imported recipe file — arbitrary
+    // code execution inside a logged-in session, for the price of sending someone a YAML. The four
+    // shapes above are everything inference emits (packages/studio/src/inference), so nothing that
+    // was ever produced legitimately reaches here; an unmodelled expression yields null and the
+    // credential is simply absent, which the target answers with the 401 the user can act on.
+    return null
   })
 }
 
@@ -253,6 +253,15 @@ export interface RelayDeps {
   recordingTabId?: number | undefined
 }
 
+/** `null` when the string is not a parseable absolute URL — an opaque scheme yields `"null"`. */
+const originOf = (url: string): string | null => {
+  try {
+    return new URL(url).origin
+  } catch {
+    return null
+  }
+}
+
 /** REQ-EXE-001 — runs one relayed request and shapes the protocol response. */
 export async function executeRelay(request: RelayRequest, deps: RelayDeps): Promise<RelayResponse> {
   const startedAt = Date.now()
@@ -264,6 +273,30 @@ export async function executeRelay(request: RelayRequest, deps: RelayDeps): Prom
     error,
     redirected_to_login: false,
   })
+
+  /**
+   * A relayed request may only reach the origin its recipe declares.
+   *
+   * `request.url` is the recipe's `path` resolved against its `base_url`, and `new URL()` throws
+   * the base away for a path that is absolute (`https://evil.example/steal`), protocol-relative
+   * (`//evil.example/steal`) or backslash-led. The permission check below then passes — it only
+   * ever saw `base_url` — and the request runs from a tab on the user's real dashboard, carrying
+   * that page's cookies and whatever token the recipe's `page_state` source reads out of its
+   * storage, to whoever wrote the recipe. `http://169.254.169.254/latest/meta-data/` is the same
+   * hole pointed at cloud metadata.
+   *
+   * The schema now rejects such a path (packages/shared/src/recipe.ts), but a recipe already in
+   * `chrome.storage` never passes the schema again, so the fact is re-established here against the
+   * URL that is actually about to be fetched.
+   */
+  const targetOrigin = originOf(request.url)
+  if (targetOrigin === null || targetOrigin !== request.origin) {
+    return fail(
+      `Douze refused to call ${request.url}: this tool belongs to ${request.origin}, and a relayed ` +
+        `request may not leave the origin it was recorded on. Remove the tool, or re-import the ` +
+        `recipe from a source you trust.`,
+    )
+  }
 
   /**
    * AC-EXE-001.3 — the call runs from the PAGE, not from the API it talks to.
@@ -290,7 +323,7 @@ export async function executeRelay(request: RelayRequest, deps: RelayDeps): Prom
   // Recorded is not the same as granted: a site's API lives on a host of its own, and Chrome
   // gives an extension nothing on an origin the user never allowed. Checked here so the reason
   // reaches the chat window as a sentence, rather than as "Cannot access contents of the page".
-  for (const origin of new Set([executeOrigin, request.origin])) {
+  for (const origin of new Set([executeOrigin, targetOrigin])) {
     if (!(await chrome.permissions.contains({ origins: [`${origin}/*`] }))) {
       return fail(
         `Douze has no permission for ${origin}, so it cannot run this there. ` +
@@ -333,6 +366,17 @@ export async function executeRelay(request: RelayRequest, deps: RelayDeps): Prom
         url = url.replaceAll(`%7B${param}%7D`, encodeURIComponent(value))
         url = url.replaceAll(`%7b${param}%7d`, encodeURIComponent(value))
       }
+      // Substitution happens after the origin was checked, so the origin is checked again. A
+      // placeholder in the PATH cannot move it — the value is percent-encoded, so it carries no
+      // `/` or `:` — but `base_url: https://{tenant}.evil.example` puts one in the HOST, and
+      // `z.url()` accepts that. Today only the ungranted host permission stops it, which is a
+      // second gate doing the first gate's job.
+      if (originOf(url) !== request.origin) {
+        return fail(
+          `Douze refused to call ${url}: filling this tool's page-supplied parameters moved it off ` +
+            `${request.origin}, and a relayed request may not leave the origin it was recorded on.`,
+        )
+      }
     }
 
     const body =
@@ -353,6 +397,36 @@ export async function executeRelay(request: RelayRequest, deps: RelayDeps): Prom
     if (result.error) return fail(result.error)
 
     const loginRedirect = isLoginRedirect(url, result.url)
+
+    /**
+     * Where the request LANDED, not where it was aimed. `redirect: 'follow'` means an open
+     * redirect on the user's own dashboard — reached through an argument the tool legitimately
+     * accepts — lands on a host of the attacker's choosing, and the fetch spec forwards custom
+     * headers such as `x-api-key` across that hop (only `Authorization` is stripped). Two things
+     * follow from a cross-origin landing, and both are refused here: the response body is fully
+     * attacker-controlled and would be handed to the model as if the dashboard had said it, and
+     * the caller would be told a call to another origin succeeded.
+     *
+     * Same-origin redirects are ordinary — a trailing slash, a canonical host — and still pass.
+     *
+     * What this cannot undo is the hop itself: by the time the response is back, the browser has
+     * already sent the request to the redirect target. `redirect: 'manual'` would prevent that but
+     * yields an opaque response with no readable `Location`, which breaks the same-origin
+     * redirects that must keep working. Refusing the result is the part that is enforceable here;
+     * a header allow-list at capture time is the place to shrink what the hop can carry.
+     */
+    const landedOrigin = originOf(result.url)
+    if (landedOrigin !== request.origin) {
+      // Still worth telling the user their session expired if that is what this was — pointed at
+      // the recipe's own login page, never at the URL the redirect chose.
+      if (loginRedirect) deps.notifyExpired(request.origin, loginUrlFor(request.origin))
+      return fail(
+        `Douze refused to call ${result.url}: the request to ${request.origin} was redirected to ` +
+          `another origin, and a relayed request may not leave the origin it was recorded on. ` +
+          `The response was discarded.`,
+      )
+    }
+
     // Notified whatever kind of tab ran it. An agent calling a tool the user is not sitting in
     // front of opens an ephemeral tab every time — which is the common case, and was the one case
     // that stayed silent, so a signed-out session looked like a broken tool instead.
