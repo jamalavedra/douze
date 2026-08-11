@@ -514,7 +514,10 @@ describe('pairing', () => {
 
     expect(await attach(mcp.bridge, { code: mcp.bridge.code ?? '' }, { abandon: 'silent' })).toBeNull()
 
-    expect(stderr).toContain('refused an unpaired connection (abandoned the handshake)')
+    // Waited for, not asserted outright: this end learns of the close a tick after the peer does,
+    // exactly as the test above it does. Asserting immediately passed alone and lost the race when
+    // the suite ran packages in parallel.
+    await until(() => stderr.includes('refused an unpaired connection (abandoned the handshake)'))
   })
 
   /**
