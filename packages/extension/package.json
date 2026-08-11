@@ -9,7 +9,8 @@
     "smoke": "node smoke.mjs"
   },
   "dependencies": {
-    "@douze/shared": "workspace:*"
+    "@douze/shared": "workspace:*",
+    "@douze/studio": "workspace:*"
   },
   "devDependencies": {
     "@types/chrome": "0.2.2",
