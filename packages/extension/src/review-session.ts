@@ -1,4 +1,4 @@
-import { parseRecipe, serializeRecipe } from '@douze/shared'
+import { parseRecipe, serializeRecipe, type Exchange, type Recipe, type Tool } from '@douze/shared'
 import {
   approve as approveCandidate,
   authFrom,
@@ -7,6 +7,7 @@ import {
   candidatesFrom,
   editCandidate,
   findCandidate,
+  fixtureReference,
   prepareSave,
   unapprove as unapproveCandidate,
   type Candidate,
@@ -50,6 +51,14 @@ export class ReviewSession {
     private readonly config: RecipeConfig,
     private readonly recipes: RecipeStore,
     private readonly items: Candidate[],
+    /**
+     * True when the candidates ARE the stored recipe's own tools (`openRecipe`) rather than a
+     * fresh inference over a capture. `mergeRecipe` exists to protect what is stored from being
+     * clobbered by re-inference, and merging a recipe against itself is not that: `mergeTool`
+     * keeps `approved` from the stored side, so every tick the reader just made would be merged
+     * straight back out again.
+     */
+    private readonly fromRecipe = false,
   ) {}
 
   static async open(
@@ -72,6 +81,45 @@ export class ReviewSession {
       auth,
     )
     return new ReviewSession(config, stores.recipes, candidates)
+  }
+
+  /**
+   * The same review, for a recipe that arrived as a FILE rather than as a recording.
+   *
+   * `RecipeStore.importFiles` now lands every imported tool unapproved whatever the file claimed,
+   * which left an imported recipe inert with nowhere to go: every review route named a capture
+   * session, and an imported recipe has no capture behind it. This is that route. It is the same
+   * page, the same tick boxes and the same `save()` — approving an imported tool is exactly as
+   * much work, and exactly as much reading, as approving a recorded one.
+   *
+   * The evidence each candidate shows is the fixture the file shipped, which is what a fixture
+   * already is: one real, redacted exchange. A tool with no fixture still appears, showing the
+   * request it would make and an empty response — that is genuinely all that is known about it,
+   * and hiding it would be worse than saying so.
+   *
+   * There is no inference here and there cannot be: inference reads exchanges, and a file supplies
+   * assertions. So what the reader is shown is the file's own words. They are editable on the same
+   * page, and the recipe is stored before any of this — nothing here can be approved without
+   * having passed `parseRecipe`, credential gate, mutation check and description cap included.
+   */
+  static async openRecipe(name: string, stores: { recipes: RecipeStore }): Promise<ReviewSession> {
+    const recipe = stores.recipes.recipe(name)
+    if (!recipe) throw new Error(`no recipe "${name}"`)
+    const fixtures = await stores.recipes.fixtures(name)
+    // Cloned: `recipe` is the store's own cached parse, and approving a candidate mutates the tool.
+    const items = structuredClone(recipe.tools).map((tool) => ({
+      tool,
+      evidence: {
+        exchange_ids: [],
+        sample: sampleFrom(recipe, tool, fixtures[fixtureReference(name, tool.name)] as Fixture | undefined),
+      },
+    }))
+    return new ReviewSession(
+      { recipeName: name, baseUrl: recipe.target.base_url, auth: recipe.auth },
+      stores.recipes,
+      items,
+      true,
+    )
   }
 
   /** What the review page shows as its heading: the site, not the URL it was recorded from. */
@@ -120,7 +168,8 @@ export class ReviewSession {
       throw new Error(`nothing is approved in "${name}" — approve at least one tool before saving`)
     }
 
-    const prepared = prepareSave(this.config, this.items, this.recipes.recipe(name), await this.storedFixtures())
+    const existing = this.fromRecipe ? null : this.recipes.recipe(name)
+    const prepared = prepareSave(this.config, this.items, existing, await this.storedFixtures())
     const yaml = serializeRecipe(prepared.recipe)
     const validated = parseRecipe(yaml, name)
     if (!validated.ok || !validated.recipe) throw new Error(validated.error ?? `${name}: recipe rejected`)
@@ -139,6 +188,36 @@ export class ReviewSession {
       if (fixture?.tool !== undefined) (out[fixture.tool] ??= []).push(fixture)
     }
     return out
+  }
+}
+
+/**
+ * The one exchange a stored recipe knows about, which is its fixture — `toFixture` turned an
+ * exchange into it on the way in, and `prepareSave` turns this back into a fixture on the way out,
+ * re-redacting as it goes. A tool that shipped without a fixture gets the request its own recipe
+ * describes and an empty response, so the review page shows what it would do rather than nothing.
+ */
+function sampleFrom(recipe: Recipe, tool: Tool, fixture: Fixture | undefined): Exchange {
+  const request = fixture?.request
+  const response = fixture?.response
+  return {
+    id: '',
+    session_id: '',
+    position: 0,
+    started_at: fixture ? Date.parse(fixture.recorded_at) : Date.now(),
+    duration_ms: 0,
+    method: request?.method ?? tool.request.method,
+    url: request?.url ?? new URL(tool.request.path, recipe.target.base_url).toString(),
+    origin: new URL(recipe.target.base_url).origin,
+    request_headers: request?.headers ?? {},
+    ...(request?.body === undefined ? {} : { request_body: request.body }),
+    status: response?.status ?? 0,
+    response_headers: response?.headers ?? {},
+    ...(response?.body === undefined ? {} : { response_body: response.body }),
+    body_missing: false,
+    background: false,
+    source: 'har',
+    credentials: [],
   }
 }
 

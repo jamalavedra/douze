@@ -220,6 +220,17 @@ export class RecipeStore {
    * Import is `save` for every recipe in the set — the same `parseRecipe`, so a recipe carrying a
    * credential value is refused here too. Nothing is written unless the whole set validates and
    * no name collides, so a rejected import cannot leave half a recipe behind.
+   *
+   * **An import always lands unapproved.** `approved` used to come out of the file, which made a
+   * file the one way to skip the whole approval model: someone sends a colleague a .yaml, they
+   * click Add, and the tools are live on every attached assistant with no review page, no tick
+   * boxes and no moment where a human read what they do. Approval is consent, consent is a person
+   * reading a description, and a file is not a person. `ReviewSession.openRecipe` takes an
+   * imported recipe through the same page a recording goes through — see review-session.ts.
+   *
+   * The stored bytes are therefore the re-serialised recipe rather than the file's own, which is
+   * the one place this store stops being byte-for-byte with what it was given. That is the honest
+   * outcome: what is stored now says what is true.
    */
   async importFiles(files: ExportedFile[], options: { overwrite?: boolean } = {}): Promise<ImportResult> {
     const result: ImportResult = { ok: false, imported: [], fixtures: [], conflicts: [], errors: [] }
@@ -235,7 +246,8 @@ export class RecipeStore {
         const name = parsed.recipe.name
         if (this.loaded.has(name) && !options.overwrite) result.conflicts.push(name)
         else {
-          writes[RECIPE_PREFIX + name] = file.content
+          const tools = parsed.recipe.tools.map((tool) => ({ ...tool, approved: false }))
+          writes[RECIPE_PREFIX + name] = serializeRecipe({ ...parsed.recipe, tools })
           result.imported.push(name)
         }
         continue
@@ -252,6 +264,32 @@ export class RecipeStore {
         result.fixtures.push(reference)
       } catch (cause) {
         result.errors.push(`${file.path}: ${(cause as Error).message}`)
+      }
+    }
+
+    /**
+     * AC-REC-003, extended to fixtures. Conflict detection covered recipe NAMES only, and a
+     * fixture key comes straight out of the file: `fixtures/other-recipe/read_orders.json` in an
+     * import that ships no `other-recipe` silently replaced the example answer another recipe's
+     * approved tool depends on, with nothing on screen. A fixture may only be written under a
+     * recipe this same import is writing, and only over one already stored when the reader
+     * answered the conflict prompt — the same answer, for the same reason.
+     */
+    const owners = new Set([...result.imported, ...result.conflicts])
+    for (const reference of result.fixtures) {
+      const owner = reference.split('/')[0] ?? ''
+      if (!owners.has(owner)) {
+        result.errors.push(
+          `${reference}: this example answer belongs to "${owner}", which is not one of the skills in this file`,
+        )
+      } else if (
+        // A recipe already reported as a conflict answers for its own fixtures: the reader says
+        // "replace shop" once, not once per example answer under it.
+        !result.conflicts.includes(owner) &&
+        this.fixturePresent.has(reference) &&
+        !options.overwrite
+      ) {
+        result.conflicts.push(reference)
       }
     }
 

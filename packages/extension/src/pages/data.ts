@@ -126,6 +126,16 @@ function recipeItem(recipe: DataState['recipes'][number]): HTMLElement {
   const remove = armedDelete(`recipe:${recipe.name}`, 'Delete for good', `the ${recipe.name} skills`, () => {
     void run({ type: 'douze:data:delete-recipe', name: recipe.name }, "Couldn't delete those skills.")
   })
+  /**
+   * The way an imported skill set becomes a used one. A file lands with nothing turned on — a file
+   * is not a person reading a description, and only a person can approve — so this is the same
+   * review page a recording goes to, opened on the recipe instead of a capture.
+   */
+  const review = el('button', { type: 'button', className: 'quiet', textContent: 'Set up skills' })
+  review.setAttribute('aria-label', `Set up skills from ${recipe.name}`)
+  review.addEventListener('click', () => {
+    void chrome.runtime.sendMessage({ type: 'douze:review', sessionId: `recipe:${recipe.name}` })
+  })
   return el('li', {}, [
     el('p', { className: 'desc', textContent: recipe.name }),
     el('p', {
@@ -133,9 +143,11 @@ function recipeItem(recipe: DataState['recipes'][number]): HTMLElement {
       textContent:
         arming === `recipe:${recipe.name}`
           ? `Deleting these stops your assistants using ${recipe.name}. The example answers go too, and the recording they came from stays.`
-          : `${recipe.tools} in use`,
+          : recipe.tools === 0
+            ? 'Nothing turned on yet — open it to choose what to keep.'
+            : `${recipe.tools} in use`,
     }),
-    el('div', { className: 'selection-actions' }, [remove]),
+    el('div', { className: 'selection-actions' }, [review, remove]),
   ])
 }
 
@@ -204,8 +216,11 @@ function renderImport(): void {
   const line = byId('import-report')
   line.hidden = report === undefined || conflicts.length > 0
   if (!report) return
+  // Nothing an import brings is turned on, however the file was marked — say so here rather than
+  // let "Added x" read as "x is live", which is what it used to mean and no longer does.
   line.textContent = report.ok
-    ? `Added ${report.imported.join(', ') || 'nothing'}${report.fixtures.length > 0 ? `, with ${report.fixtures.length} example answers` : ''}.`
+    ? `Added ${report.imported.join(', ') || 'nothing'}${report.fixtures.length > 0 ? `, with ${report.fixtures.length} example answers` : ''}. ` +
+      `Nothing is turned on yet — choose "Set up skills" below to read what each one does.`
     : report.errors.join(' ')
 }
 

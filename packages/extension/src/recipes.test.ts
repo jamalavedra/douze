@@ -328,22 +328,57 @@ describe('export and import (V-015.1)', () => {
     expect(JSON.parse(files[1]?.content ?? '')).toMatchObject({ tool: 'list_orders' })
   })
 
-  it('round-trips byte-identically through export → import → export', async () => {
+  /**
+   * The round trip is no longer byte-identical, and that is the fix rather than a regression: an
+   * import lands unapproved whatever the file said, so the stored recipe says `approved: false`
+   * where the exported one said true. Everything else — every file, in the same order, with the
+   * same fixtures — still comes back.
+   */
+  it('round-trips through export → import → export, with nothing approved on the way back', async () => {
     const store = await open()
     await populate(store, 'shop')
     await populate(store, 'depot')
     const exported = await store.exportAll()
 
-    // A clean install importing the bundle: same files back out, byte for byte, same order.
     items.clear()
     const fresh = await open()
     const imported = await fresh.importFiles(exported)
     expect(imported).toMatchObject({ ok: true, imported: ['depot', 'shop'], conflicts: [], errors: [] })
-    expect(await fresh.exportAll()).toEqual(exported)
-    expect(fresh.surface().tools.map((t) => t.qualified_name)).toEqual([
-      'depot_list_orders',
-      'shop_list_orders',
+
+    const back = await fresh.exportAll()
+    expect(back.map((f) => f.path)).toEqual(exported.map((f) => f.path))
+    // The fixtures are byte-identical; only the recipes' approval changed.
+    expect(back.filter((f) => f.path.endsWith('.json'))).toEqual(
+      exported.filter((f) => f.path.endsWith('.json')),
+    )
+    for (const file of back.filter((f) => f.path.endsWith('.yaml'))) {
+      expect(file.content).toContain('approved: false')
+      expect(file.content).not.toContain('approved: true')
+    }
+    // AC-REC-002.5 — and therefore nothing on the surface until someone approves it.
+    expect(fresh.surface().tools).toEqual([])
+  })
+
+  /**
+   * #1 — the consent bypass. `approved` used to come out of the file, so someone sending a
+   * colleague a .yaml put tools on their surface, and on every assistant attached to it, with no
+   * review page, no tick boxes and no moment where a human read what they do.
+   */
+  it('lands an import unapproved however the file marked it, and stores it that way', async () => {
+    const store = await open()
+    const approved = serializeRecipe(recipeOf('shop'))
+    expect(approved).toContain('approved: true')
+
+    const result = await store.importFiles([
+      { path: 'recipes/shop.yaml', content: approved },
+      { path: 'fixtures/shop/list_orders.json', content: JSON.stringify(fixtureOf('list_orders')) },
     ])
+
+    expect(result.ok).toBe(true)
+    expect(store.recipe('shop')?.tools.map((t) => t.approved)).toEqual([false])
+    expect(store.surface().tools).toEqual([])
+    // Not just filtered on the way out: what is on disk says what is true.
+    expect(String(items.get('recipe:shop'))).toContain('approved: false')
   })
 
   it('accepts a bare file picked out of ~/.douze, with no export directories', async () => {
@@ -352,8 +387,49 @@ describe('export and import (V-015.1)', () => {
       { path: 'shop.yaml', content: serializeRecipe(recipeOf('shop')) },
       { path: 'shop/list_orders.json', content: `${JSON.stringify(fixtureOf('list_orders'), null, 2)}\n` },
     ]
-    expect(await store.importFiles(files)).toMatchObject({ ok: true, imported: ['shop'] })
-    expect(store.surface().tools[0]?.degraded).toBe(false)
+    expect(await store.importFiles(files)).toMatchObject({ ok: true, imported: ['shop'], fixtures: ['shop/list_orders.json'] })
+    // Unapproved, so it is not on the surface — the recipe and its fixture are both there.
+    expect(store.recipe('shop')?.tools.map((t) => t.approved)).toEqual([false])
+    expect(await store.fixture('shop/list_orders.json')).toMatchObject({ tool: 'list_orders' })
+  })
+
+  /**
+   * #4 — conflict detection covered recipe NAMES only, and a fixture key comes straight out of
+   * the file. An import shipping `fixtures/shop/list_orders.json` and no `shop` recipe replaced
+   * the example answer a live approved tool depends on, silently.
+   */
+  it('refuses a fixture belonging to a recipe the import does not ship', async () => {
+    const store = await open()
+    await populate(store, 'shop')
+    const original = await store.fixture('shop/list_orders.json')
+
+    const result = await store.importFiles([
+      { path: 'recipes/depot.yaml', content: serializeRecipe(recipeOf('depot')) },
+      { path: 'fixtures/shop/list_orders.json', content: JSON.stringify({ tool: 'list_orders', planted: true }) },
+    ])
+
+    expect(result.ok).toBe(false)
+    expect(result.errors.join(' ')).toMatch(/belongs to "shop"/)
+    // Nothing is written unless the whole set validates: depot did not land either.
+    expect(storedNames()).toEqual(['shop'])
+    expect(await store.fixture('shop/list_orders.json')).toEqual(original)
+  })
+
+  it('reports a fixture it would replace as a conflict when its recipe is new', async () => {
+    // An orphaned fixture — its recipe was deleted by hand, or never imported.
+    await fakeChrome.storage.local.set({ 'fixture:shop/list_orders.json': fixtureOf('list_orders') })
+    const fresh = await open()
+
+    const files: ExportedFile[] = [
+      { path: 'recipes/shop.yaml', content: serializeRecipe(recipeOf('shop')) },
+      { path: 'fixtures/shop/list_orders.json', content: JSON.stringify({ tool: 'list_orders', replaced: true }) },
+    ]
+    expect(await fresh.importFiles(files)).toMatchObject({ ok: false, conflicts: ['shop/list_orders.json'] })
+    expect(await fresh.fixture('shop/list_orders.json')).not.toMatchObject({ replaced: true })
+
+    // AC-REC-003 — and taken once the reader says so, by name.
+    expect(await fresh.importFiles(files, { overwrite: true })).toMatchObject({ ok: true })
+    expect(await fresh.fixture('shop/list_orders.json')).toMatchObject({ replaced: true })
   })
 
   it('refuses a recipe carrying a credential value (AC-REC-001.2)', async () => {
