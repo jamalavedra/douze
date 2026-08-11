@@ -347,6 +347,60 @@ Build order #13 — M3; the explicitly degraded cron path, needing only the rela
 
 ---
 
+## WO-014 — Remote relay: hosted MCP endpoint for clients that cannot run local processes (PLANNED)
+
+Build order #14 — post-release; needs the MCP surface (WO-008) and relay execution (WO-009), and
+sits behind the release gates (C-1, C-2, tagged release). Serves ChatGPT, claude.ai web/mobile,
+Dust, and any other hosted MCP client. Client-agnostic by construction: the only contract is
+streamable-HTTP MCP; per-client differences are onboarding text, not code. Local clients (Claude
+Desktop/Code, Cursor, Codex) keep the loopback path — nothing changes for them.
+
+### Security model (decided up front)
+
+The destructive-confirm guard is a caller-supplied `confirm: true` argument — consent UX for a
+well-behaved local client, not an authentication boundary. A compromised relay or stolen endpoint
+token can forge it. Therefore the remote surface is **read-only by default, enforced by the
+daemon**, per-tool opt-in for writes, and destructive tools are never callable remotely in v1.
+
+| Boundary | What crosses it | Protection |
+|---|---|---|
+| Browser ↔ extension | raw traffic, credentials | unchanged: redaction before anything leaves the extension |
+| Extension ↔ daemon | redacted exchanges, relay execs | unchanged: install token, loopback-only |
+| Daemon → relay (new) | MCP frames: tool args + full result bodies | outbound-only WSS, relay token, TLS; daemon treats this path as less trusted than loopback |
+| Relay ↔ AI platform (new) | same MCP frames | per-user secret URL (v1) or OAuth (v2), TLS |
+| Platform ↔ model | tool results enter the conversation | out of our control — disclosed, not mitigated |
+
+Facts to disclose verbatim, not soften: the relay operator can read and inject traffic
+(self-hosting via `DOUZE_RELAY_URL` is the only remedy); the platform stores whatever tools
+return; result bodies are live dashboard data. Strict-local-only users must not run
+`douze connect`. Residual risk we own no lever for: prompt injection via attacker-authored
+dashboard content steering the agent — bounded by the read-only default and per-tool allowlist.
+
+Out of scope v1: multiple daemons per token, payload E2E encryption (platforms need plaintext),
+platform IP allowlisting (egress ranges churn), remote destructive tools (no flag, no exception),
+per-client adapters.
+
+### Tasks
+
+- [ ] T-014.0 — Phase-0 spike, blocks everything: OpenAI `tunnel-client` against `douze --mcp` proves the ChatGPT round-trip with zero code; compatibility matrix (auth methods accepted, streaming, write gating, plan gating) for ChatGPT, claude.ai custom connectors, and Dust. Decides secret-URL vs OAuth. Kill criterion: if every target gates writes to enterprise plans and the audience is consumer, stop here.
+- [ ] T-014.1 — Remote frame set in `packages/shared/src/protocol.ts`: `hello` (token auth), `mcp.request`/`mcp.response` carrying opaque JSON-RPC, existing heartbeat discipline. No capture frames, no buffering — a call during a disconnect fails fast like `extension_disconnected`.
+- [ ] T-014.2 — `douze connect` / `douze connect --rotate` / `douze disconnect` in `packages/cli`: device-code pairing (short TTL, single-use, code shown only in the local terminal), relay token at `$DOUZE_HOME` mode 0600, one outbound WSS from the daemon bridged into the existing `mcp.ts` machinery. Opens no new listeners; disconnect revokes both ends.
+- [ ] T-014.3 — Capability scoping at the daemon: remote calls enter only through the schema-validating MCP surface (never raw `/relay`); read-only by default; `--allow-writes` / per-tool allowlist; destructive refused unconditionally; strict frame validation, size caps, per-call timeout, bounded in-flight concurrency; a local audit line per remote call surfaced by `douze status`.
+- [ ] T-014.4 — Remote result gate: `findSurvivingSecrets` over outbound result bodies on the remote path only; refuse responses carrying credential-shaped values, with a per-tool override.
+- [ ] T-014.5 — `packages/relay` (open-source, self-hostable): stateless `{token → daemon socket}` map, per-user streamable-HTTP MCP endpoint, SSE pass-through, in-flight calls fail on daemon disconnect, per-token and per-IP rate limits, body-size and duration caps. Secret-URL auth (≥32-byte base64url, TLS-only, never logged). Logs carry timestamps, sizes, token-hash prefix — no payloads, no tool names; metrics are counters.
+- [ ] T-014.6 — Conditional on T-014.0: minimal OAuth 2.1 + PKCE + dynamic client registration, access tokens short-lived and bound to the pairing, DCR rate-limited. Skipped if secret-URL suffices for all target clients.
+- [ ] T-014.7 — UX and disclosure: `douze connect` output ends with per-client attach steps (the command output is the onboarding); README section; the trust-model table above moves into INTERN_VERIFICATION.md's authentication inventory when this ships.
+
+### Verification
+
+- [ ] V-014.1 — A remote write is refused by default with zero target requests, succeeds only after explicit opt-in; a remote destructive call is refused regardless of flags or a forged `confirm: true`.
+- [ ] V-014.2 — Two tenants' interleaved concurrent calls show no crossover; responses correlate by UUID to the issuing tenant only.
+- [ ] V-014.3 — Relay log sweep finds no payloads, tool names, or credential-shaped values; the result gate refuses a fixture response embedding a JWT and passes after the per-tool override.
+- [ ] V-014.4 — Session expiry, degraded-tool refusal, and zero-retry semantics through the remote path are identical to the local path; daemon disconnect fails all in-flight remote calls immediately.
+- [ ] V-014.5 — A fake connector speaking plain streamable-HTTP MCP (the entire compatibility contract) completes list + read through relay → daemon → extension → fixture.
+
+---
+
 ## Open Questions (PRD 5.3 — resolve during implementation)
 
 - [x] Q1 — **RESOLVED (verified)**: incur's `Mcp.serve()` does NOT support mid-session re-registration — `collectTools` snapshots once at connect. The escape hatch works and was executed end-to-end: `Cli.toCommands` (live Map) + `Mcp.collectTools` + `Mcp.callTool` + own `McpServer`, whose `registerTool()` handle fires `notifications/tools/list_changed` automatically. Original question: Does incur support re-registering tools mid-session and emitting `listChanged`? Spike in M0 (T-008.1). Fallback: a thin wrapper that re-emits `tools/list` on reload.
