@@ -79,6 +79,31 @@ describe('the popup', () => {
     expect(background).not.toContain('reviewUrl')
     expect(background).not.toMatch(/review\.html\?[^`]*token/)
   })
+
+  /**
+   * WO-015 T-015.1 — recording writes to the extension's own store, so "Douze can't reach its
+   * background service" is a state that can no longer happen. A screen that cannot be reached is
+   * worse than no screen: it is the one the popup would have shown on a perfectly healthy install.
+   */
+  it('shows only the states a daemon-free extension can be in', () => {
+    const switched = popup.match(/const name of \[([^\]]+)\]/)?.[1] ?? ''
+    expect(switched.replace(/['\s]/g, '').split(',')).toEqual([
+      'unsupported',
+      'ready',
+      'watching',
+      'finished',
+    ])
+    expect(html).not.toContain('id="disconnected"')
+    expect(html).not.toContain('Douze.mcpb')
+  })
+
+  it('asks the worker what is set up here, rather than a daemon over loopback', () => {
+    expect(popup).toContain("type: 'douze:site-tools'")
+    expect(popup).not.toContain('daemon.js')
+    expect(popup).not.toMatch(/127\.0\.0\.1|fetch\(/)
+    expect(background).toContain("if (message.type === 'douze:site-tools')")
+    expect(background).toContain('recipes\n    .surface()')
+  })
 })
 
 describe('the review page', () => {
