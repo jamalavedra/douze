@@ -75,6 +75,12 @@ test('a recorded dashboard becomes a tool a hosted assistant can call, with no d
   await review.goto(`chrome-extension://${extensionId}/review.html?session=${sessionId}`)
   await expect.poll(() => review.locator('code.name').allTextContents(), { timeout: 20_000 }).toContain('list_orders')
   // AC-REC-002.3 — reads are pre-selected, the write is not, and one click must not approve it.
+  // Asserted on the boxes themselves: the surface checks further down cannot tell "never approved"
+  // apart from "approved but filtered out", because the pairing below is read-only either way.
+  const boxFor = async (tool: string): Promise<boolean> =>
+    review.locator('li', { has: review.locator(`code.name:text-is("${tool}")`) }).locator('input').isChecked()
+  expect(await boxFor('list_orders')).toBe(true)
+  expect(await boxFor('create_order')).toBe(false)
   await review.locator('#go').click()
   await expect(review.locator('h1')).toContainText('All set')
 
@@ -86,7 +92,20 @@ test('a recorded dashboard becomes a tool a hosted assistant can call, with no d
       .map(([key, value]) => [key, String(value)] as const)
   })
   expect(recipes.map(([key]) => key)).toEqual(['recipe:orders'])
-  expect(recipes[0]![1]).toContain('list_orders')
+  const yaml = recipes[0]![1]
+  expect(yaml).toContain('list_orders')
+  // The write was recorded and written down, but not approved: what the user did not tick is the
+  // difference between a tool that exists and a tool that can run. Asserted per tool rather than by
+  // counting approvals, because a recording legitimately yields more than one read and all of them
+  // are pre-selected.
+  const toolBlock = (name: string): string => {
+    const start = yaml.indexOf(`- name: ${name}`)
+    expect(start, `${name} is missing from the saved recipe`).toBeGreaterThan(-1)
+    const next = yaml.indexOf('- name: ', start + 1)
+    return yaml.slice(start, next === -1 ? undefined : next)
+  }
+  expect(toolBlock('list_orders')).toContain('approved: true')
+  expect(toolBlock('create_order')).toContain('approved: false')
 
   // --- the cloud pipe ----------------------------------------------------
   const endpoint = await relay.register()
@@ -97,7 +116,7 @@ test('a recorded dashboard becomes a tool a hosted assistant can call, with no d
   const initialized = await mcp.initialize()
   expect(initialized.result?.['protocolVersion']).toBe('2025-06-18')
   await expect.poll(() => mcp.tools(), { timeout: 20_000 }).toContain('orders_list_orders')
-  // The write was never approved in review, so it is on no surface at all.
+  // Belt and braces: unapproved above, and a read-only pairing would hide it even if it were not.
   expect(await mcp.tools()).not.toContain('orders_create_order')
 
   await app.reset()
