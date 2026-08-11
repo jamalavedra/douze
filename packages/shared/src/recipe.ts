@@ -38,6 +38,12 @@ export const CredentialSource = z.discriminatedUnion('kind', [
 ])
 
 export const AuthDescriptor = z.object({
+  /**
+   * Every call runs in the browser. `headless` was a second mode that executed from a daemon with
+   * a session out of the OS keychain; it died with the daemon, and a recipe declaring it would
+   * have loaded and then executed through the browser anyway. Kept as an accepted value only so an
+   * older recipe still parses — nothing reads it.
+   */
   mode: z.enum(['browser_relay', 'headless']).default('browser_relay'),
   credential_source: z.array(CredentialSource).default([{ kind: 'cookie' }]),
   /**
@@ -46,10 +52,6 @@ export const AuthDescriptor = z.object({
    * own page: that is where the token lives and the origin the target's CORS expects.
    */
   page_origin: z.string().optional(),
-  /** AC-EXE-004.2 — headless refresh endpoint, applied once on 401. */
-  refresh_endpoint: z.string().optional(),
-  /** AC-EXE-004.1 — keychain reference only, never a session value. */
-  keychain_ref: z.string().optional(),
 })
 
 /** REQ-INF-005 — how a paginated collection is driven. */

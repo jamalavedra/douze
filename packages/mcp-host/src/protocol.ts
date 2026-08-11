@@ -16,7 +16,11 @@ import { HEARTBEAT_MS, SideEffect } from '@douze/shared'
 /**
  * What an attachment is, decided by whoever built the host and never claimed by a client:
  * `local` is a loopback bridge the user paired in person, `remote` is anything else.
- * The extension's guards (T-015.9) read this off the frame — see the trust table in TASKS.md.
+ *
+ * The extension deliberately does NOT take this off the frame. It derives its own level from what
+ * it dialled, because a host that lies would otherwise talk itself into destructive tools; this
+ * field tells the extension what the host believes, and the guards decide anyway. See the trust
+ * table in TASKS.md.
  */
 export const Trust = z.enum(['local', 'remote'])
 export type Trust = z.infer<typeof Trust>

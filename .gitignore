@@ -6,3 +6,6 @@ playwright-report
 .DS_Store
 douze-extension.zip
 .claude/
+
+Douze.mcpb
+douze-server.zip

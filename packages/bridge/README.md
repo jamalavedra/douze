@@ -46,7 +46,7 @@ reachable from anything an MCP client sends.
 
 ```jsonc
 // .mcp.json, or your client's equivalent
-{ "mcpServers": { "douze": { "command": "npx", "args": ["-y", "@douze/bridge"] } } }
+{ "mcpServers": { "douze": { "command": "node", "args": ["/absolute/path/to/douze/packages/bridge/dist/index.js"] } } }
 ```
 
 The first run prints a pairing code to stderr:

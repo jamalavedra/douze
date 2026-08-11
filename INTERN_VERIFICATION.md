@@ -463,13 +463,13 @@ lacks a test.
   (`describeSync`), and there is no options page in the manifest to put a toggle on. The 96.4%
   template-only score against a ≥90% bar is why this is acceptable, not evidence that the model path
   works.
-- **Connecting a hosted assistant may not be wired.** Confirm before testing it:
-  `rg NOT_CONNECTED_YET packages/extension/src` — while `douze:connect:start` / `rotate` / `stop`
-  return that message, the connect page renders and refuses, and nothing in the extension calls the
-  relay's `/register`. T-015.10 owns closing this.
-- **The recipe schema still accepts `auth.mode: headless`** with no implementation behind it
-  anywhere; the daemon owned that path and it was deleted. A recipe declaring it will load and then
-  execute through the browser regardless.
+- **No hosted client has ever attached.** Connecting is wired end to end and unit-tested against a
+  faked relay, but no ChatGPT, claude.ai or Dust connector has been pointed at a real endpoint, so
+  how those clients render a JSON-RPC error, a 404 session, or a non-SSE response is still
+  assumption. This is the single largest untested claim in the product.
+- **The recipe schema still accepts `auth.mode: headless`** so an older recipe parses, but nothing
+  reads it: every call executes in the browser. The keychain and refresh-endpoint fields that mode
+  needed are gone.
 - **No server-initiated stream on the remote surface.** `GET /m/<secret>` is 405, so a hosted client
   sees new tools only when it next polls `tools/list`. That is a weaker guarantee than C-2 requires
   of the local path, where stdio carries `notifications/tools/list_changed` properly.

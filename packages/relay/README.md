@@ -19,7 +19,7 @@ process, nothing is written to disk, and no payload is logged.
 
 The relay operator can read and inject every MCP message that crosses it — tool arguments and
 full result bodies, which are live dashboard data. That is a property of the design, not a bug to
-be patched: the only remedy is running your own, which is what `DOUZE_REMOTE_URL` is for.
+be patched: the only remedy is running your own and pointing the extension's connect page at it.
 
 **The relay also holds each endpoint's tool surface in memory** — every tool name, description and
 input schema the extension has pushed — because that is what `tools/list` is answered from. This
@@ -110,4 +110,6 @@ above assumes never happens.
 A systemd unit is enough to run it; the one deployment so far is a user unit with
 `Restart=always` behind a Cloudflare tunnel pointed at `http://127.0.0.1:9787`.
 
-On the extension side, point Douze at your instance with `DOUZE_REMOTE_URL`.
+On the extension side, type your instance's address into the connect page instead of leaving the
+default. There is no environment variable any more — the extension is the client now, and it has
+no shell to read one from.
