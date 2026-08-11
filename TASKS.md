@@ -618,6 +618,40 @@ will always be incomplete; the human reading the list has to be the backstop, an
   nowhere in the repo, so the deployed rate limit is folklore.
 - The audit log cannot distinguish a stolen MCP URL from the legitimate connector.
 
+### Still open when this was written
+
+Fixes are in flight for the SSRF, the redirect origin check, the bridge crypto, the false
+disclosures and the relay's silent refusals. These are not yet assigned to anyone:
+
+- **The classification problem above** — extend the destructive vocabulary AND let a reviewer
+  promote write→destructive on the review page, reusing the edit plumbing that already exists for
+  name and description. The regex is a starting guess; the human reading the list is the backstop.
+- **Mark tool results as data, not instruction**, in `runToolCall`'s returned content. Five lines,
+  and the only mitigation that touches whether the model treats dashboard text as an instruction at
+  all — every other control here narrows what an injected instruction can reach.
+- **A non-blocking notification per remote write.** Approve-once-call-forever is the wrong
+  granularity against a production dashboard; a blocking per-call prompt would be switched off in a
+  week, a notification would not.
+- **Confirmation on the two irreversible grants** (enabling writes, exempting a tool from the result
+  gate). Both fire immediately on click today, while rotate and stop — trivially reversible — route
+  through a confirm dialog.
+- **A default rate limit.** `rate_limit_per_minute` has no producer, so the limiter short-circuits
+  for every tool; one `?? 60` at the call site makes forty tested lines live.
+- **A numeric ceiling from observed values** in inference, so an observed `limit=20` stops permitting
+  `limit=1000000`. Leave the open-enum decision alone — that one is deliberate.
+- **Bridge re-pairing after an extension reinstall is a dead end.** A paired bridge prints no code,
+  the extension cannot verify a credential-keyed challenge without the secret, and the deadline path
+  closes the socket without printing the one sentence that names the fix — while the connect page
+  tells the user to restart the app and type the code it prints. There is no code.
+- **Five behaviours whose tests cannot fail** (mutation-verified): the audit cap, `rate_limited`
+  being retryable, the 32 KB boundary (only >64 KB is tested), reconnect backoff, and the half-open
+  socket watchdog.
+- **Smaller**: `openStores()` caches a rejected promise for the worker's life, so one IndexedDB
+  hiccup disables capture until eviction; `relay_unreachable` has no producer; `WAKE_GRACE_MS` and
+  the heartbeat constant are each declared twice; e2e spawns `src/bin.ts` rather than the built
+  `dist`, so a broken build ships green; `journey.spec.ts`'s write-not-offered assertion is
+  tautological under a read-only pairing.
+
 ### Judged correct, so they are not re-litigated later
 
 Payload-free relay logs and argument-free audit entries are the right call (ASVS 16.2.5 asks that
