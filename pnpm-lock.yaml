@@ -102,6 +102,15 @@ importers:
         specifier: 8.1.5
         version: 8.1.5(@types/node@26.1.2)(esbuild@0.28.1)(tsx@4.23.1)(yaml@2.9.0)
 
+  packages/mcp-host:
+    dependencies:
+      '@douze/shared':
+        specifier: workspace:*
+        version: link:../shared
+      zod:
+        specifier: 4.4.3
+        version: 4.4.3
+
   packages/relay:
     dependencies:
       '@douze/shared':
