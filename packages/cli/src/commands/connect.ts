@@ -20,7 +20,7 @@ export function register(cli: { command: (name: string, definition: unknown) => 
   cli.command('connect', {
     description: 'Pair this daemon with a Douze relay so hosted chat clients can reach it',
     args: z.object({
-      url: z.string().optional().describe('Relay base URL (defaults to $DOUZE_RELAY_URL)'),
+      url: z.string().optional().describe('Relay base URL (defaults to $DOUZE_REMOTE_URL)'),
     }),
     options: z.object({
       rotate: z.boolean().default(false).describe('Issue a new token and MCP URL, invalidating the old pair'),
@@ -41,11 +41,11 @@ export function register(cli: { command: (name: string, definition: unknown) => 
           exitCode: 1,
         })
       }
-      const url = (c.args.url ?? process.env['DOUZE_RELAY_URL'] ?? existing?.url ?? '').replace(/\/+$/, '')
+      const url = (c.args.url ?? process.env['DOUZE_REMOTE_URL'] ?? existing?.url ?? '').replace(/\/+$/, '')
       if (!url) {
         return c.error({
           code: 'NO_RELAY_URL',
-          message: 'Give a relay URL: `douze connect https://relay.example`, or set DOUZE_RELAY_URL.',
+          message: 'Give a relay URL: `douze connect https://relay.example`, or set DOUZE_REMOTE_URL.',
           exitCode: 1,
         })
       }
@@ -175,7 +175,7 @@ function instructions(config: RelayConfig, restarted: boolean): string {
         ' destructive tools are never callable remotely.',
     'The relay operator can read and inject traffic on this path, and the platform stores whatever',
     'your tools return — which is live data from your dashboards. Run your own relay with',
-    'DOUZE_RELAY_URL if that is not acceptable.',
+    'DOUZE_REMOTE_URL if that is not acceptable.',
     restarted ? 'Restarted douzed, which is now connected.' : 'Start douzed with `douze start` to connect it.',
     '',
   ].join('\n')

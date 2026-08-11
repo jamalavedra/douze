@@ -10,7 +10,7 @@ lives in memory and dies with the process, nothing is written to disk, and no pa
 
 The relay operator can read and inject every MCP message that crosses it — tool arguments and
 full result bodies, which are live dashboard data. That is a property of the design, not a bug to
-be patched: the only remedy is running your own, which is what `DOUZE_RELAY_URL` is for.
+be patched: the only remedy is running your own, which is what `DOUZE_REMOTE_URL` is for.
 
 Secrets are stored as sha256 hashes, so the running process holds nothing that would let anyone
 impersonate a daemon or reach a user's tools; the URL secret is a ≥32-byte base64url random that
@@ -48,4 +48,4 @@ anything reaching that port is already inside the terminator.
 | --- | --- | --- |
 | `RELAY_PORT` | `9787` | the port to bind |
 
-On the daemon side, point Douze at your instance with `DOUZE_RELAY_URL`.
+On the daemon side, point Douze at your instance with `DOUZE_REMOTE_URL`.

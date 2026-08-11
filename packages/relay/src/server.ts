@@ -15,7 +15,7 @@ import { HEARTBEAT_MS, REMOTE_SESSION_IDLE_MS, RemoteDaemonMessage, type RemoteR
  * not hand over a credential that would let anyone reach a user's daemon.
  *
  * The trust boundary is honest and narrow: the operator can read and inject MCP traffic. That is
- * disclosed rather than mitigated (README), and self-hosting via DOUZE_RELAY_URL is the remedy.
+ * disclosed rather than mitigated (README), and self-hosting via DOUZE_REMOTE_URL is the remedy.
  */
 
 export interface Relay {

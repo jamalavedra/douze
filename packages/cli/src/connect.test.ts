@@ -45,7 +45,7 @@ let bearerSeen: unknown
 beforeAll(async () => {
   home = mkdtempSync(join(tmpdir(), 'douze-connect-'))
   process.env['DOUZE_HOME'] = home
-  delete process.env['DOUZE_RELAY_URL']
+  delete process.env['DOUZE_REMOTE_URL']
 
   server = createServer((request, response) => {
     let body = ''

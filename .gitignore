@@ -8,3 +8,4 @@ playwright-report
 *.mcpb
 douze-extension.zip
 douze-server.zip
+.claude/

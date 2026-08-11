@@ -371,7 +371,7 @@ daemon**, per-tool opt-in for writes, and destructive tools are never callable r
 | Platform ↔ model | tool results enter the conversation | out of our control — disclosed, not mitigated |
 
 Facts to disclose verbatim, not soften: the relay operator can read and inject traffic
-(self-hosting via `DOUZE_RELAY_URL` is the only remedy); the platform stores whatever tools
+(self-hosting via `DOUZE_REMOTE_URL` is the only remedy); the platform stores whatever tools
 return; result bodies are live dashboard data. Strict-local-only users must not run
 `douze connect`. Residual risk we own no lever for: prompt injection via attacker-authored
 dashboard content steering the agent — bounded by the read-only default and per-tool allowlist.
