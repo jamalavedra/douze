@@ -70,6 +70,8 @@
       .tools li[data-effect='write'] .kind { color: var(--changes); }
       .tools li[data-effect='destructive'] { border-color: var(--danger); }
       .tools li[data-effect='destructive'] .kind { color: var(--danger); }
+      .hosted { border-top: 1px solid var(--line); margin-top: 16px; }
+      .hosted p { margin: 4px 0 0; }
       .error { color: var(--danger); font-size: 11px; margin: 12px 0 0; }
       .note { color: var(--muted); font-size: 11px; margin: 8px 0 0; }
       details { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 8px; }
@@ -125,6 +127,13 @@
       </section>
 
       <p class="error" id="error" role="alert" hidden></p>
+
+      <!-- Outside the one-section-at-a-time switch above: sharing Douze with a hosted assistant
+           has nothing to do with whether a site was just recorded. -->
+      <section class="hosted" id="hosted">
+        <button id="connect">Use with ChatGPT or claude.ai</button>
+        <p class="muted">Opens a page that walks you through it.</p>
+      </section>
     </main>
 
     <details>

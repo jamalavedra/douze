@@ -9,17 +9,25 @@ import {
 } from '@douze/shared'
 import type {
   CaptureBatch,
+  ConnectCommand,
+  ConnectState,
   GestureEvent,
   PageEvent,
   PopupCommand,
   PopupStatus,
   RequestEvent,
+  ReviewCommand,
+  ReviewSaved,
+  ReviewState,
 } from './messages.js'
-import { needsPairing, pairAny, reviewUrl } from './daemon.js'
+import { needsPairing, pairAny } from './daemon.js'
 import { DebuggerCapture } from './debugger-capture.js'
 import { installOracle } from './oracle.js'
 import { RECONCILE_GRACE_MS, Reconciler, admits, decodeBody, finalize, type ExchangeDraft } from './pipeline.js'
+import { RecipeStore } from './recipes.js'
 import { executeRelay } from './relay.js'
+import { ReviewSession } from './review-session.js'
+import { CaptureStore } from './store.js'
 import { DaemonSocket } from './ws-client.js'
 
 /**
@@ -379,10 +387,95 @@ function annotate(note: string): void {
  * The popup asks for permission on the origins the session recorded, and Chrome closes a popup
  * to show that prompt — so anything the popup queued behind the answer never ran, and pressing
  * the button appeared to do nothing at all. The worker outlives the prompt.
+ *
+ * WO-015 T-015.4 — an extension page, not a daemon URL. The session id is in the query string
+ * because there is nothing left to authenticate: only this extension can open `chrome-extension://`.
  */
 async function openReview(sessionId: string): Promise<void> {
-  await chrome.tabs.create({ url: reviewUrl({ port: settings.port, token: settings.token }, sessionId) })
+  await chrome.tabs.create({
+    url: chrome.runtime.getURL(`review.html?session=${encodeURIComponent(sessionId)}`),
+  })
 }
+
+/** The connect page, opened the same way and from the same place, for the same reason. */
+async function openConnect(): Promise<void> {
+  await chrome.tabs.create({ url: chrome.runtime.getURL('connect.html') })
+}
+
+// --- review ---------------------------------------------------------------
+
+/**
+ * Inference is expensive and every command names its session, so the session is built once and
+ * kept. It is in-memory only.
+ *
+ * ponytail: a worker Chrome respawns mid-review loses unsaved edits and approvals, and the page
+ * silently rebuilds from the capture. Persist the session if anyone ever loses work to it.
+ */
+const reviews = new Map<string, ReviewSession>()
+let stores: Promise<{ captures: CaptureStore; recipes: RecipeStore }> | undefined
+
+const openStores = (): Promise<{ captures: CaptureStore; recipes: RecipeStore }> => {
+  stores ??= Promise.all([CaptureStore.open(), RecipeStore.open()]).then(([captures, recipes]) => ({
+    captures,
+    recipes,
+  }))
+  return stores
+}
+
+async function reviewSession(sessionId: string): Promise<ReviewSession> {
+  const open = reviews.get(sessionId)
+  if (open) return open
+  const session = await ReviewSession.open(sessionId, await openStores())
+  reviews.set(sessionId, session)
+  return session
+}
+
+async function onReviewCommand(command: ReviewCommand): Promise<ReviewState | ReviewSaved | { ok: true }> {
+  const session = await reviewSession(command.sessionId)
+  if (command.type === 'douze:review:load') {
+    return { site: session.site(), recipe: session.recipeName(), candidates: session.candidates() }
+  }
+  if (command.type === 'douze:review:edit') {
+    session.edit(command.name, command.field, command.value)
+    // AC-REC-002.2 — the edit reaches the recipe immediately, so the surface picks it up without
+    // the user remembering to press anything.
+    await session.save()
+    return { ok: true }
+  }
+  if (command.type === 'douze:review:enable') {
+    session.approve(command.names)
+    return { ok: true }
+  }
+  if (command.type === 'douze:review:disable') {
+    session.unapprove(command.names)
+    return { ok: true }
+  }
+  await session.save()
+  // Read back rather than trusting a report shape: what is approved now is what the surface holds.
+  return { tools: session.candidates().filter((c) => c.approved).map((c) => c.name) }
+}
+
+// --- connect --------------------------------------------------------------
+
+/**
+ * T-015.10 owns the real attachment: pairing credential in extension storage, the link shown once,
+ * rotate and disconnect. Until then the page renders its setup screen and its trust disclosure,
+ * and every action is refused by name rather than half-done.
+ */
+const NOT_CONNECTED_YET = 'Connecting to a hosted assistant is not wired up yet.'
+
+const connectState = (): ConnectState => ({
+  configured: false,
+  url: '',
+  mcp_url: '',
+  allow_writes: false,
+  connected: false,
+})
+
+const onConnectCommand = (command: ConnectCommand): ConnectState =>
+  command.type === 'douze:connect:status'
+    ? connectState()
+    : { ...connectState(), error: NOT_CONNECTED_YET }
 
 const status = (): PopupStatus => ({
   session: recording
@@ -432,7 +525,9 @@ function notifyExpired(origin: string, loginUrl: string): void {
 
 // --- listeners (top level, synchronous) -----------------------------------
 
-chrome.runtime.onMessage.addListener((message: CaptureBatch | PopupCommand, sender, sendResponse) => {
+type Inbound = CaptureBatch | PopupCommand | ReviewCommand | ConnectCommand
+
+chrome.runtime.onMessage.addListener((message: Inbound, sender, sendResponse) => {
   if (message.type === 'douze:capture') {
     const tabId = sender.tab?.id
     // Everything arriving from a content script is attacker-controlled: a page can forge these,
@@ -446,6 +541,10 @@ chrome.runtime.onMessage.addListener((message: CaptureBatch | PopupCommand, send
   }
   void hydrated
     .then(async () => {
+      // The pages come first: they are the only senders that are not the popup, and every one of
+      // their commands names its own session rather than reading the worker's live state.
+      if (message.type.startsWith('douze:review:')) return onReviewCommand(message as ReviewCommand)
+      if (message.type.startsWith('douze:connect:')) return onConnectCommand(message as ConnectCommand)
       if (message.type === 'douze:start') return startSession(message)
       if (message.type === 'douze:stop') return stopSession()
       if (message.type === 'douze:annotate') {
@@ -458,6 +557,10 @@ chrome.runtime.onMessage.addListener((message: CaptureBatch | PopupCommand, send
       }
       if (message.type === 'douze:review') {
         await openReview(message.sessionId)
+        return status()
+      }
+      if (message.type === 'douze:connect') {
+        await openConnect()
         return status()
       }
       return status()
