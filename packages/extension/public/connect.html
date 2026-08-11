@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Use Douze with ChatGPT or claude.ai</title>
+    <!--
+      WO-015 T-015.4 — #ConnectPage, the no-terminal path to a hosted assistant. Everything
+      `douze connect` printed in a terminal has to be readable here instead, including what it
+      costs: the link is the password, and both the relay and the assistant's provider see live
+      data from the user's own dashboards. That is why the trust section is on the page rather
+      than behind a disclosure.
+    -->
+    <link rel="stylesheet" href="page.css" />
+  </head>
+  <body>
+    <main>
+      <header class="hero">
+        <div class="brand">
+          <img class="brand-icon" src="icon128.png" alt="" />
+          <p class="eyebrow">Douze</p>
+        </div>
+        <div aria-live="polite">
+          <h1>Use Douze with ChatGPT or claude.ai</h1>
+          <p class="sub" id="link-state"></p>
+        </div>
+      </header>
+      <section id="setup" hidden>
+        <p>
+          ChatGPT, claude.ai and Dust run on someone else's computer, so they can't reach this one
+          by themselves. Connecting gives them a web address to call instead. What they ask for is
+          answered here, by the Douze already running in this browser, and nothing new starts
+          listening on this computer.
+        </p>
+        <p class="sub" id="relay"></p>
+        <div class="actions">
+          <p>You can stop sharing at any time.</p>
+          <button type="button" class="primary" id="connect">Connect</button>
+        </div>
+      </section>
+      <section id="ready" hidden>
+        <label class="field-label" for="mcp-url">Your private link</label>
+        <div class="copy-row">
+          <input class="field" id="mcp-url" type="text" readonly />
+          <button type="button" class="primary" id="copy">Copy</button>
+        </div>
+        <p class="sub" id="copied" role="status" hidden></p>
+        <h2 class="section-heading">Where to paste it</h2>
+        <ul class="steps">
+          <li><strong>ChatGPT</strong> &mdash; Settings &rarr; Connectors &rarr; Developer Mode &rarr; add a connector</li>
+          <li><strong>claude.ai</strong> &mdash; Settings &rarr; Connectors &rarr; Add custom connector</li>
+          <li><strong>Dust</strong> &mdash; Admin &rarr; Tools &rarr; Add MCP server</li>
+        </ul>
+        <div class="actions">
+          <button type="button" class="quiet" id="rotate">Get a new link</button>
+          <button type="button" class="quiet danger" id="stop">Stop sharing</button>
+        </div>
+        <section class="confirm" id="confirm" hidden>
+          <p id="confirm-copy"></p>
+          <button type="button" class="primary" id="confirm-yes"></button>
+          <button type="button" class="quiet" id="confirm-no">Cancel</button>
+        </section>
+      </section>
+      <section class="trust">
+        <h2 class="section-heading">What you are trusting</h2>
+        <ul>
+          <li id="scope"></li>
+          <li>That link is the password. Anyone holding it can call these tools.</li>
+          <li>
+            The relay operator can read and inject every message that crosses it — your tool
+            arguments and full result bodies.
+          </li>
+          <li>The AI platform stores whatever your tools return, under its retention policy rather than yours.</li>
+          <li>Those result bodies are live data from your dashboards, fetched from your account just now.</li>
+        </ul>
+      </section>
+      <p id="error" role="alert"></p>
+    </main>
+    <script type="module" src="connect.js"></script>
+  </body>
+</html>

@@ -31,6 +31,7 @@ const el = {
   finishedText: $<HTMLParagraphElement>('finished-text'),
   finishedAction: $<HTMLButtonElement>('finished-action'),
   error: $<HTMLParagraphElement>('error'),
+  connect: $<HTMLButtonElement>('connect'),
   useDebugger: $<HTMLInputElement>('use-debugger'),
   noise: $<HTMLTextAreaElement>('noise'),
   saveNoise: $<HTMLButtonElement>('save-noise'),
@@ -184,6 +185,14 @@ el.watch.addEventListener('click', async () => {
     }),
   )
   return undefined
+})
+
+// Sent, not awaited: the worker opens the tab, and opening one closes this popup — so a
+// continuation here would never run, which is exactly what made the review button look dead.
+// Offered whatever else the popup is showing; the page is served by the extension itself, so
+// there is nothing that has to be up first.
+el.connect.addEventListener('click', () => {
+  void chrome.runtime.sendMessage({ type: 'douze:connect' })
 })
 
 el.done.addEventListener('click', async () => {

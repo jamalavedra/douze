@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Review your Douze skills</title>
+    <!--
+      WO-015 T-015.4 — studio's `reviewPage` markup, verbatim apart from three things an
+      extension page changes: the stylesheet is a file rather than an inline `<style>`, the brand
+      mark is the extension's own icon rather than a base64 blob, and the script is an external
+      module because MV3's CSP refuses an inline one. There is no session id and no token in this
+      URL to expire, which is the whole point of the move.
+    -->
+    <link rel="stylesheet" href="page.css" />
+  </head>
+  <body>
+    <main>
+      <header class="hero">
+        <div class="brand">
+          <img class="brand-icon" src="icon128.png" alt="" />
+          <p class="eyebrow" id="eyebrow">Douze</p>
+        </div>
+        <div aria-live="polite">
+          <h1 id="title">Review your skills</h1>
+          <p class="sub" id="sub">Working out what this site can do&hellip;</p>
+        </div>
+      </header>
+      <div class="toolbar" id="toolbar" hidden>
+        <p><strong id="count">0 selected</strong></p>
+        <div class="selection-actions">
+          <button type="button" class="quiet" id="all">Select all</button>
+          <button type="button" class="quiet" id="none">Clear</button>
+        </div>
+      </div>
+      <div id="groups"></div>
+      <div class="actions" id="actions" hidden>
+        <p>Runs only when you ask.</p>
+        <button type="button" class="primary" id="go" disabled>Choose a skill</button>
+      </div>
+      <section class="success" id="after" hidden aria-live="polite">
+        <span class="success-mark" aria-hidden="true">&#10003;</span>
+        <div>
+          <h2>Skills added</h2>
+          <p id="success-copy"></p>
+          <button type="button" class="quiet" id="back">Review selection</button>
+        </div>
+      </section>
+      <p id="error" role="alert"></p>
+    </main>
+    <script type="module" src="review.js"></script>
+  </body>
+</html>
