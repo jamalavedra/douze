@@ -1,0 +1,21 @@
+{
+  "name": "@douze/bridge",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "bin": { "douze-bridge": "dist/index.js" },
+  "exports": { ".": "./src/index.ts" },
+  "scripts": {
+    "build": "vite build",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@douze/mcp-host": "workspace:*",
+    "@douze/shared": "workspace:*",
+    "ws": "8.18.3"
+  },
+  "devDependencies": {
+    "@types/ws": "8.18.1",
+    "vite": "8.1.5"
+  }
+}
