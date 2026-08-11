@@ -107,7 +107,9 @@
              screen-reader user has to tell them Douze is still watching. -->
         <p class="count" id="count" aria-live="polite"></p>
         <label for="note">What did you just do?</label>
-        <textarea id="note" rows="2" placeholder="moved a task to Done"></textarea>
+        <!-- maxlength matches MAX_NOTE_CHARS: the note becomes the first sentence of a tool
+             description, and an over-long one is refused by the store rather than stored. -->
+        <textarea id="note" rows="2" maxlength="500" placeholder="moved a task to Done"></textarea>
         <button class="quiet" id="add-note">Add note</button>
         <p class="note" id="noted" role="status" hidden>Noted.</p>
         <button class="primary" id="done">Done</button>

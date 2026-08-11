@@ -1,6 +1,6 @@
 // First, and before any schema is built: see the file for why.
 import './zod-config.js'
-import { NOISE_HOSTS, type CaptureSession, type Exchange, type NoiseConfig } from '@douze/shared'
+import { MAX_NOTE_CHARS, NOISE_HOSTS, type CaptureSession, type Exchange, type NoiseConfig } from '@douze/shared'
 import type {
   CaptureBatch,
   ConnectCommand,
@@ -482,7 +482,11 @@ async function stopSession(): Promise<PopupStatus> {
 function annotate(note: string): void {
   if (!recording || !note.trim()) return
   const sessionId = recording.session.id
-  const text = note.trim()
+  // Truncated rather than refused. The note is free text the user typed to describe what they just
+  // did, and this path is fire-and-forget: a note the store rejects would throw into the write
+  // chain and vanish with nothing said, which is the worst of both. The popup's `maxlength` stops
+  // it happening at all; this is what keeps the worker honest if anything else ever calls in.
+  const text = note.trim().slice(0, MAX_NOTE_CHARS)
   void sequence(async () => (await openStores()).captures.annotate(sessionId, text))
 }
 
