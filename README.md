@@ -25,7 +25,9 @@ This is the part worth reading carefully.
   the site sees an ordinary request from an ordinary tab, exactly as if you'd clicked the button
   yourself. When you sign out, the assistant loses access too.
 - **Everything stays on your computer.** What Douze learns is a file in your home folder. There is
-  no account, no server, and no upload.
+  no account, no server, and no upload. The one exception is opt-in and off until you ask for it:
+  connecting a hosted assistant like ChatGPT sends your tool calls through a relay — see
+  [Remote clients](#remote-clients-chatgpt-claudeai-dust).
 - **Nothing runs without your say-so.** Actions are off until you turn them on, one at a time.
   Anything that deletes or refunds asks you to confirm every single time.
 
@@ -92,6 +94,73 @@ actions.
 
 Now just ask. The new abilities show up in a running conversation within a few seconds — you
 don't have to restart anything.
+
+## Remote clients (ChatGPT, claude.ai, Dust)
+
+Everything above runs on your own machine. ChatGPT, claude.ai in a browser or on a phone, and Dust
+cannot start a program on your laptop, so they reach Douze through a relay instead: your daemon
+dials out to it, the relay hands the assistant a URL, and messages pass between the two. Nothing
+new listens on your machine.
+
+This is the one part of Douze that needs a terminal:
+
+```sh
+douze connect https://relay.example
+```
+
+(Installed from `douze-server.zip`? That's `node ~/Documents/douze-server/index.js connect
+https://relay.example`.)
+
+The command registers this daemon with the relay, saves the pairing at `~/.douze/relay.json` with
+owner-only permissions, restarts the daemon if it is running, and prints one URL. **That URL is the
+password** — anyone holding it can call your tools. It appears once, in your own terminal; the
+relay keeps only a hash of it, and Douze sends it nowhere else.
+
+Paste it into your client:
+
+| Client | Where |
+|---|---|
+| ChatGPT | Settings → Connectors → Developer Mode → add a connector |
+| claude.ai | Settings → Connectors → Add custom connector |
+| Dust | Admin → Tools → Add MCP server |
+
+Remote clients get **read tools only**. `douze connect <url> --allow-writes` adds write tools too.
+Destructive tools are never callable remotely — no flag, no exception. The confirmation a
+destructive tool asks for is just an argument the caller supplies, so anyone holding the URL could
+supply it; it is consent, not a lock, and it is not strong enough for this path.
+
+`--bearer <token>` makes the relay demand an `Authorization: Bearer` header as well, which is what
+Dust's setup expects. `douze connect --rotate` issues a fresh token and URL and kills the old pair
+immediately. `douze disconnect` revokes the pairing at both ends and stops serving hosted clients.
+
+Douze also refuses to send back a result that still holds a credential-shaped value after
+redaction. The client sees an error naming the tool and where the value was; if it is business data
+you actually want, add that tool to `expose` in `~/.douze/relay.json`.
+
+### What you are trusting
+
+- The relay operator can read and inject every message that crosses it — your tool arguments and
+  full result bodies.
+- The AI platform stores whatever your tools return, under its retention policy rather than yours.
+- Those result bodies are live data from your dashboards, fetched from your account just now.
+
+Run your own relay if that is not acceptable, or do not run `douze connect` at all. Nothing else in
+Douze reaches the network, so staying strictly local means staying off this path.
+
+### Running your own relay
+
+`packages/relay` is the whole service: one Node 22 process, no database, no volume, nothing written
+to disk, so a restart costs a reconnect and nothing else.
+
+```sh
+pnpm --filter @douze/relay build
+node packages/relay/dist/bin.js         # binds RELAY_PORT, default 9787
+```
+
+Terminate TLS in front of it — it binds plain HTTP on `0.0.0.0` and assumes anything reaching that
+port is already inside the terminator. Then point Douze at it with `DOUZE_REMOTE_URL`, or pass the
+URL to `douze connect` directly. `packages/relay/README.md` has the HTTP API, the session rules, and
+what the logs are allowed to carry.
 
 ## When something goes wrong
 
@@ -192,6 +261,7 @@ remains as defence in depth for anything that reaches a boundary without being r
 | `packages/extension` | Chrome MV3 extension — capture and relay execution |
 | `packages/studio` | Inference engine, description writer, package ejector |
 | `packages/cli` | `douze` CLI and `douze --mcp`, built on [`incur`](https://github.com/wevm/incur) |
+| `packages/relay` | The self-hostable relay that gives hosted clients a streamable-HTTP MCP endpoint |
 
 ## Recipe format
 
@@ -241,12 +311,16 @@ douze bundle                         # emit Douze.mcpb (see `pnpm bundle` below)
 douze mcp add --agent cursor         # register with cursor | vscode | claude-code |
                                      #   claude-desktop | windsurf
 
+douze connect https://relay.example  # pair with a relay for hosted clients; --allow-writes,
+                                     #   --bearer <token>, --rotate
+douze disconnect                     # revoke the pairing at both ends
+
 douze doctor jira                    # replay fixtures against the live target, report drift
 douze eject jira --out ./jira-tools  # emit a standalone incur package for one recipe
 ```
 
 `DOUZE_HOME` (default `~/.douze`) holds recipes, fixtures, the capture database, the audit log, and
-the install token.
+the install token — plus `relay.json` and `remote-audit.jsonl` once a relay is paired.
 
 ## Development
 

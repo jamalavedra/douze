@@ -1,8 +1,8 @@
 # Douze intern verification flow
 
 Use this guide to verify Douze without touching a real account first. It covers the complete
-capture-to-call path, the two authentication boundaries, the local HTTP/WebSocket API, and the
-remaining live-verification work.
+capture-to-call path, the authentication boundaries — target site, local control, and the opt-in
+remote relay — the local HTTP/WebSocket API, and the remaining live-verification work.
 
 ## Pass criteria
 
@@ -234,6 +234,91 @@ Run the repository-wide artifact sweep after the browser suite:
 pnpm exec tsx e2e/metrics.mjs
 ```
 
+### D. Remote relay authentication
+
+This boundary exists only after `douze connect`. It is the path a hosted client (ChatGPT,
+claude.ai, Dust) takes to reach the daemon, and it is treated as less trusted than loopback
+throughout. Everything below is in the source tree; none of it has been exercised against a real
+platform yet, so treat this section as code-verified and live-unverified.
+
+**Pairing.** `douze connect <url>` POSTs `/register` to the relay with the daemon version and an
+optional `bearer_token`, and receives `{token, mcp_path}`. The token authenticates the daemon's
+WebSocket; the secret is the path half of the platform-facing URL. They are two independent
+32-byte base64url randoms, so a URL leaked into a platform log does not yield the ability to
+impersonate the daemon. The relay stores only sha256 hashes of both (and of the bearer), so a
+memory dump of a running relay hands over neither. `douze connect --rotate` POSTs `/rotate` and
+kills the old pair immediately; `douze disconnect` DELETEs `/register` and removes the local
+pairing even when the relay cannot be reached. See `packages/cli/src/commands/connect.ts` and
+`packages/relay/src/server.ts`.
+
+**Local storage.** `$DOUZE_HOME/relay.json` holds the URL, token, MCP path, `allow_writes`, a
+boolean recording whether a bearer was registered (never its value), and the optional `expose`
+list. It is written mode `0600` and re-chmodded on rotate, because `mode` only applies at creation.
+
+**WebSocket authentication.** The daemon dials `wss://<relay>/ws` outbound and opens no listener.
+Its first frame must be `hello{token}` within 5 seconds; an unknown token or any other first frame
+closes the socket with 1008. One socket per endpoint — a second `hello` is a reconnecting daemon
+and replaces the first. A rotate closes the live socket with 1008 so the daemon re-hellos with the
+token it just received.
+
+**Per-endpoint authentication.** `POST /m/<secret>` is authenticated by the secret in the path.
+If a bearer was registered, `Authorization: Bearer` is also required and compared with
+`timingSafeEqual` over hashes. `POST /rotate` and `DELETE /register` require the
+`x-douze-relay-token` header. `GET /health` is unauthenticated.
+
+**Capability scoping.** Enforced at the daemon, not at the relay or the platform:
+`filterRemoteRegistry` in `packages/cli/src/remote-bridge.ts` serves the remote MCP instance a
+registry containing read tools always, write tools only when `allow_writes` is set, and destructive
+tools never — no configuration can put one back. The destructive guard's `confirm: true` is a
+caller-supplied argument, which is consent UX for a well-behaved local client and forgeable by
+anyone holding the URL. Remote calls enter only through the schema-validating MCP surface; the raw
+`/relay` route is not reachable from this path. Each platform session gets its own MCP server
+instance, capped at `REMOTE_MAX_SESSIONS`; an excess session is refused, not queued.
+
+**Result gate.** `gateResult` runs `findSurvivingSecrets` over every `tools/call` result before it
+leaves the machine and replaces a result carrying credential-shaped values with a JSON-RPC error
+naming the tool and the paths found. Redaction already ran on the way into a fixture, but a live
+response is whatever the target returned just now and the platform stores it. Naming the tool in
+`expose` in `relay.json` is the only override.
+
+**Audit.** Every remote `tools/call` appends `{ts, sid, tool}` to `$DOUZE_HOME/remote-audit.jsonl`;
+`douze status` reports `remote: {configured, recent_calls}` with the last five. An unwritable audit
+file warns on stderr rather than killing the daemon.
+
+**Relay logging.** One line per event carrying a timestamp, an event name, a duration, and an
+8-character hash prefix per endpoint — never a payload, tool name, session id, or secret in any
+form.
+
+| Boundary | What crosses it | Protection |
+|---|---|---|
+| Browser ↔ extension | raw traffic, credentials | redaction before anything leaves the extension |
+| Extension ↔ daemon | redacted exchanges, relay execs | install token, loopback-only |
+| Daemon → relay | MCP frames: tool args and full result bodies | outbound-only WSS, relay token, TLS; the daemon treats this path as less trusted than loopback |
+| Relay ↔ AI platform | the same MCP frames | per-user secret URL, optional static bearer, TLS |
+| Platform ↔ model | tool results enter the conversation | out of our control — disclosed, not mitigated |
+
+Three facts are disclosed rather than mitigated, and the README states them without softening: the
+relay operator can read and inject traffic (self-hosting via `DOUZE_REMOTE_URL` is the only
+remedy); the platform stores whatever the tools return; those result bodies are live dashboard
+data. A strict-local-only user must not run `douze connect`. The residual risk nobody here owns a
+lever for is prompt injection through attacker-authored dashboard content steering the agent,
+bounded by the read-only default and the per-tool opt-in.
+
+Verify this boundary with:
+
+```sh
+pnpm --filter @douze/relay test
+pnpm --filter @douze/cli test
+```
+
+The relay tests cover the streamable-HTTP round trip, session routing by `Mcp-Session-Id`, the
+1008 close on an unknown token, rotate/delete authentication, the bearer requirement, registration
+rate limiting, two-tenant isolation under interleaved calls, immediate failure of in-flight calls
+when the daemon socket drops, and a log sweep asserting no payload, token, path secret, tool name,
+or session id ever reaches stderr. The CLI tests cover pairing and `relay.json` mode 0600
+(`connect.test.ts`), the capability filter, the result gate, and the bridge's session lifecycle
+(`remote-bridge.test.ts`).
+
 ## Local HTTP API inventory
 
 Base URL is the runtime's `http://127.0.0.1:<port>`. Unless noted, send JSON and
@@ -336,7 +421,7 @@ For every failure, capture:
 Never paste `$DOUZE_HOME/token`, cookies, authorization values, live response bodies, or a real
 account's stored browser profile into an issue.
 
-## Known verification gaps as of 2026-08-06
+## Known verification gaps as of 2026-08-11
 
 - `TASKS.md` still has C-1 (real Openfort read) and C-2 (second recipe without reconnect) open.
 - The headless implementation and unit tests exist, but the tracked `douze headless enable|disable`
@@ -345,3 +430,10 @@ account's stored browser profile into an issue.
 - The README release link still uses the `OWNER` placeholder and no release has been tagged, so
   install verification from published artifacts is not yet possible.
 - The browser harness assumes the fixed macOS Helium path and cannot run headless.
+- The remote relay (section D) has never been run against a real platform: no ChatGPT, claude.ai,
+  or Dust attach has been performed, no relay has been deployed, and the TLS-terminating deployment
+  it assumes is unverified. Its unit tests use a local relay process and a fake daemon socket.
+  There is also no server-initiated stream on that surface — `GET /m/<secret>` is 405 and a
+  `notifications/tools/list_changed` arriving with no request waiting is counted and dropped, so a
+  remote client sees new tools only when it next polls `tools/list`. That is a weaker guarantee
+  than C-2 requires of the local path.
