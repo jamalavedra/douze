@@ -98,3 +98,44 @@ export class DouzeError extends Error {
     return { error: this.code, message: this.message, ...this.detail }
   }
 }
+
+/**
+ * WO-014 — the JSON protocol douzed speaks to the relay over a single outbound `wss://`.
+ * The daemon dials out and opens no listener, so every frame below travels that one socket.
+ *
+ * Frames carry a `sid` because several platform clients can hold an MCP session against the same
+ * daemon at once: each gets its own MCP server instance, so their JSON-RPC ids cannot collide and
+ * each runs its own `initialize` handshake. The relay never parses `message` — it reads `sid` to
+ * pick a socket and forwards the payload untouched, which is what keeps tool arguments and result
+ * bodies opaque to it beyond the transport itself.
+ */
+
+export const RemoteDaemonMessage = z.discriminatedUnion('type', [
+  /** First frame after connect; the relay closes with 1008 if the token does not match. */
+  z.object({ type: z.literal('hello'), token: z.string(), daemon_version: z.string() }),
+  z.object({ type: z.literal('pong') }),
+  /** One JSON-RPC message from the daemon-side MCP server for `sid`. */
+  z.object({ type: z.literal('mcp.message'), sid: z.string(), message: z.unknown() }),
+  /** The daemon has finished tearing that session's MCP server instance down. */
+  z.object({ type: z.literal('session.closed'), sid: z.string() }),
+])
+
+export const RemoteRelayMessage = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('welcome'), heartbeat_ms: z.number() }),
+  z.object({ type: z.literal('ping') }),
+  /** A new platform MCP session; the daemon spins up an isolated MCP server instance for it. */
+  z.object({ type: z.literal('session.open'), sid: z.string() }),
+  /** One JSON-RPC message from the platform client. */
+  z.object({ type: z.literal('mcp.message'), sid: z.string(), message: z.unknown() }),
+  /** The relay expired or lost the platform session; the daemon tears that instance down. */
+  z.object({ type: z.literal('session.close'), sid: z.string() }),
+])
+
+export type RemoteDaemonMessage = z.infer<typeof RemoteDaemonMessage>
+export type RemoteRelayMessage = z.infer<typeof RemoteRelayMessage>
+
+/** WO-014 — concurrent platform sessions the daemon serves before refusing another. */
+export const REMOTE_MAX_SESSIONS = 4
+
+/** WO-014 — the relay drops a platform session idle for this long. */
+export const REMOTE_SESSION_IDLE_MS = 600_000
