@@ -1,10 +1,14 @@
 {
-  "name": "@recon/cli",
+  "name": "@douze/cli",
   "version": "0.1.0",
   "type": "module",
   "private": true,
-  "bin": { "recon": "./dist/index.js" },
-  "exports": { ".": "./src/index.ts" },
+  "bin": {
+    "douze": "./dist/index.js"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
   "scripts": {
     "build": "vite build",
     "typecheck": "tsc --noEmit -p tsconfig.json",
@@ -12,8 +16,9 @@
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.0.0-alpha.4",
-    "@recon/recond": "workspace:*",
-    "@recon/shared": "workspace:*",
+    "@douze/douzed": "workspace:*",
+    "@douze/shared": "workspace:*",
+    "@douze/studio": "workspace:*",
     "incur": "0.4.26",
     "zod": "4.4.3"
   },

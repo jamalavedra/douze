@@ -3,20 +3,19 @@ import { appendFileSync } from 'node:fs'
 import type { WebSocket } from 'ws'
 import {
   HEARTBEAT_MS,
-  ReconError,
+  DouzeError,
   redactBody,
   findSurvivingSecrets,
   type RelayRequest,
   type RelayResponse,
   type ServerMessage,
-  type SurfaceToolLike,
-} from './types.js'
-import type { SurfaceTool } from './registry.js'
+} from '@douze/shared'
+import type { SurfaceTool, SurfaceToolLike } from './registry.js'
 
 /**
  * #RelayBridge — holds the extension WebSocket, correlates requests to responses, and enforces
  * every call guard *before* forwarding. Guards live here rather than in client code so they
- * cannot be bypassed by calling recond directly or from an ejected package.
+ * cannot be bypassed by calling douzed directly or from an ejected package.
  */
 export class RelayBridge {
   private socket: WebSocket | null = null
@@ -45,9 +44,9 @@ export class RelayBridge {
       // Fail every in-flight call immediately. Waiting out a 120s timeout for a failure we
       // already know about is the opposite of AC-CON-004's legibility requirement.
       this.failPending(
-        new ReconError(
+        new DouzeError(
           'extension_disconnected',
-          'The Recon Chrome extension disconnected while this call was in flight. Open Chrome and confirm the Recon extension is enabled, then retry.',
+          'The Douze Chrome extension disconnected while this call was in flight. Open Chrome and confirm the Douze extension is enabled, then retry.',
         ),
       )
     })
@@ -104,23 +103,30 @@ export class RelayBridge {
   /** Guards that must fire before any network request is issued (AC-EXE-003.2 and .4). */
   private guard(surface: SurfaceTool, args: Record<string, unknown>): void {
     if (surface.degraded) {
-      throw new ReconError(
+      // The assistant reads this out to whoever asked, so it is written for them: what happened, that
+      // nothing ran, and the one thing that fixes it. The developer's route back — the reason and
+      // the doctor command — travels in the detail, where a person is not made to read it.
+      throw new DouzeError(
         'tool_degraded',
-        `Tool "${surface.qualified_name}" is degraded and will not run: ${surface.degraded_reason ?? 'contract no longer matches the target'}. Run \`recon doctor ${surface.recipe}\` to review the proposed fix.`,
-        { tool: surface.qualified_name, change: surface.degraded_reason },
+        `"${surface.qualified_name}" stopped working because ${siteOf(surface.base_url)} changed how it works. Douze did not run it. To fix it, open the site in Chrome, click the Douze button, and record it again.`,
+        {
+          tool: surface.qualified_name,
+          change: surface.degraded_reason,
+          fix: `douze doctor ${surface.recipe}`,
+        },
       )
     }
     if (surface.tool.side_effect === 'destructive' && args['confirm'] !== true) {
-      throw new ReconError(
+      throw new DouzeError(
         'confirm_required',
         `Tool "${surface.qualified_name}" performs a destructive action. Re-run it with confirm=true to proceed.`,
         { tool: surface.qualified_name },
       )
     }
     if (!this.connected) {
-      throw new ReconError(
+      throw new DouzeError(
         'extension_disconnected',
-        `The Recon Chrome extension is not connected, so "${surface.qualified_name}" cannot run against ${surface.base_url}. Open Chrome and confirm the Recon extension is enabled.`,
+        `The Douze Chrome extension is not connected, so "${surface.qualified_name}" cannot run against ${surface.base_url}. Open Chrome and confirm the Douze extension is enabled.`,
         { tool: surface.qualified_name, target: surface.base_url },
       )
     }
@@ -162,9 +168,9 @@ export class RelayBridge {
     // minutes, and send() would otherwise no-op into a dead socket until the timeout fires.
     if (!this.connected) {
       return Promise.reject(
-        new ReconError(
+        new DouzeError(
           'extension_disconnected',
-          `The Recon Chrome extension is not connected, so "${surface.qualified_name}" cannot run against ${surface.base_url}. Open Chrome and confirm the Recon extension is enabled.`,
+          `The Douze Chrome extension is not connected, so "${surface.qualified_name}" cannot run against ${surface.base_url}. Open Chrome and confirm the Douze extension is enabled.`,
           { tool: surface.qualified_name, target: surface.base_url },
         ),
       )
@@ -175,9 +181,9 @@ export class RelayBridge {
       const timer = setTimeout(() => {
         this.pending.delete(request.id)
         reject(
-          new ReconError(
+          new DouzeError(
             'timeout',
-            `Tool "${surface.qualified_name}" did not return within ${request.timeout_ms}ms.`,
+            `Tool "${surface.qualified_name}" did not return within ${humanDuration(request.timeout_ms)}.`,
             { tool: surface.qualified_name, elapsed_ms: request.timeout_ms },
           ),
         )
@@ -191,9 +197,11 @@ export class RelayBridge {
   private classify(surface: SurfaceTool, response: RelayResponse): void {
     const expired = response.status === 401 || response.status === 403 || response.redirected_to_login
     if (!expired) return
-    throw new ReconError(
+    // "Session" is our word, not the reader's, and an origin with a scheme on it is not how anyone
+    // thinks about the site they were just using. Both are still in the detail for a client.
+    throw new DouzeError(
       'session_expired',
-      `Your session for ${surface.base_url} has expired. Sign in again in Chrome, then retry.`,
+      `You have been signed out of ${siteOf(surface.base_url)}. Sign in again in Chrome, then retry.`,
       { tool: surface.qualified_name, target: surface.base_url },
     )
   }
@@ -217,6 +225,28 @@ export class RelayBridge {
 }
 
 /**
+ * The site as the reader knows it. A scheme is our plumbing, not part of the name anyone would
+ * say out loud; the port stays, because for a local app it is genuinely part of the address.
+ */
+const siteOf = (url: string): string => {
+  try {
+    return new URL(url).host
+  } catch {
+    return url
+  }
+}
+
+/** "120000ms" is a number the reader has to convert; this is the same fact in their units. */
+const humanDuration = (ms: number): string => {
+  if (ms < 60_000) {
+    const seconds = Math.round(ms / 1000)
+    return seconds === 1 ? '1 second' : `${seconds} seconds`
+  }
+  const minutes = Math.round(ms / 60_000)
+  return minutes === 1 ? '1 minute' : `${minutes} minutes`
+}
+
+/**
  * Turns validated tool arguments into a concrete request: path params are substituted into the
  * Endpoint Template, the rest become a query string or a JSON body depending on the method.
  */
@@ -230,7 +260,17 @@ export function buildRequest(
   delete remaining['confirm']
   delete remaining['raw']
 
-  const resolvedPath = path.replace(/\{(\w+)\}/g, (_, name: string) => {
+  // Parameters the PAGE fills, not the caller: the extension substitutes them after reading the
+  // value out of page state. Left in the URL untouched here — resolving them to nothing produced
+  // `/v1/project/apikey//origins`, which is a 404 wearing a different hat.
+  const pageFilled = new Set(
+    (surface.credential_source ?? []).flatMap((source) =>
+      source.kind === 'page_state' && source.param ? [source.param] : [],
+    ),
+  )
+
+  const resolvedPath = path.replace(/\{(\w+)\}/g, (whole, name: string) => {
+    if (pageFilled.has(name)) return whole
     const value = remaining[name]
     delete remaining[name]
     return encodeURIComponent(String(value ?? ''))
@@ -258,6 +298,7 @@ export function buildRequest(
     headers: { ...headers, ...(body === undefined ? {} : { 'content-type': 'application/json' }) },
     ...(body === undefined ? {} : { body }),
     credential_source: surface.credential_source ?? [],
+    ...(surface.page_origin === undefined ? {} : { execute_origin: surface.page_origin }),
     timeout_ms,
   }
 }

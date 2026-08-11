@@ -12,9 +12,9 @@ describe('zip writer', () => {
   })
 
   it('produces an archive the system unzip can read (AC-CON-001.1)', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'recon-zip-'))
+    const dir = mkdtempSync(join(tmpdir(), 'douze-zip-'))
     const archive = join(dir, 'test.mcpb')
-    const manifest = JSON.stringify({ manifest_version: '0.2', name: 'recon' })
+    const manifest = JSON.stringify({ manifest_version: '0.2', name: 'douze' })
 
     writeFileSync(
       archive,

@@ -1,14 +1,14 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { join } from 'node:path'
-import { Recipe } from '@recon/shared'
+import { Recipe } from '@douze/shared'
 import { DEGRADED_NOTICE, executeHeadless, Keychain } from './headless.js'
 import type { SurfaceTool } from './registry.js'
 
 const PORT = 4187
 const ORIGIN = `http://127.0.0.1:${PORT}`
-/** A dedicated service name so tests never touch a real Recon keychain entry. */
-const keychain = new Keychain('recon-headless-test')
+/** A dedicated service name so tests never touch a real Douze keychain entry. */
+const keychain = new Keychain('douze-headless-test')
 const ACCOUNT = `test-${process.pid}`
 
 let app: ChildProcess

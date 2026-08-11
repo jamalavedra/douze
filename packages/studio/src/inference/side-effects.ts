@@ -1,4 +1,4 @@
-import type { SideEffect } from '@recon/shared'
+import type { SideEffect } from '@douze/shared'
 
 /** AC-INF-003.2 — the destructive vocabulary. Matched case-insensitively, substring, not word. */
 export const DESTRUCTIVE_PATTERN = /delete|remove|purge|cancel|refund|revoke/i

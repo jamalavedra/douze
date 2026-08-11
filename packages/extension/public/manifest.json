@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Recon Capture",
+  "name": "Douze",
   "version": "0.1.0",
-  "description": "Record authenticated dashboard traffic and relay tool calls from Claude.",
+  "description": "Let your AI assistant use the websites you're signed into. Douze watches a site while you use it, then your assistant can do those things for you. Nothing leaves your computer.",
   "minimum_chrome_version": "116",
   "permissions": ["scripting", "storage", "alarms", "tabs", "webRequest", "notifications"],
   "optional_permissions": ["debugger"],
@@ -12,7 +12,7 @@
   "icons": { "16": "icon16.png", "48": "icon48.png", "128": "icon128.png" },
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Recon",
+    "default_title": "Douze",
     "default_icon": { "16": "icon16.png", "48": "icon48.png", "128": "icon128.png" }
   }
 }

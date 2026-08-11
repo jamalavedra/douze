@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { ReconError } from '@recon/shared'
-import type { SurfaceTool } from '@recon/recond'
+import { DouzeError } from '@douze/shared'
+import type { SurfaceTool } from '@douze/douzed'
 import { DaemonHttpError, type DaemonClient } from './daemon-client.js'
 import { PROGRESS_INTERVAL_MS, RelayClient } from './relay-client.js'
 
@@ -90,12 +90,12 @@ describe('long-call survival (REQ-CON-003)', () => {
   it('cancels at the ceiling with a timeout naming the tool and elapsed time (AC-CON-003.2)', async () => {
     const request = vi.fn().mockReturnValue(new Promise(() => undefined))
     const call = new RelayClient(daemonWith(request)).call(surface, {}, { ceilingMs: 120_000 })
-    const assertion = expect(call).rejects.toBeInstanceOf(ReconError)
+    const assertion = expect(call).rejects.toBeInstanceOf(DouzeError)
 
     await vi.advanceTimersByTimeAsync(120_001)
     await assertion
 
-    await call.catch((error: ReconError) => {
+    await call.catch((error: DouzeError) => {
       expect(error.code).toBe('timeout')
       expect(error.message).toContain('jira_list')
       expect(error.message).toContain('120s')

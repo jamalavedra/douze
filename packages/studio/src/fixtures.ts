@@ -1,6 +1,6 @@
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
-import { findSurvivingSecrets, redactBody, redactHeaders, type Exchange } from '@recon/shared'
+import { findSurvivingSecrets, redactBody, redactHeaders, type Exchange } from '@douze/shared'
 
 /** REQ-REC-004 — a real, redacted exchange stored beside the recipe for load checks and drift. */
 export interface Fixture {

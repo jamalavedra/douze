@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 /**
- * COV_RUN_004.1 and COV_RUN_004.2 — a real `recon --mcp` child process, spoken to over stdio in
+ * COV_RUN_004.1 and COV_RUN_004.2 — a real `douze --mcp` child process, spoken to over stdio in
  * actual JSON-RPC. Nothing here imports the server: if the built binary cannot answer
  * `initialize`, `tools/list`, and `tools/call`, or cannot announce a surface that changed on
  * disk, this fails. That is the whole point of running it out of process.
@@ -73,14 +73,14 @@ const getTool = `  - name: get_issue
 beforeAll(async () => {
   expect(existsSync(ENTRY)).toBe(true)
 
-  home = mkdtempSync(join(tmpdir(), 'recon-mcp-'))
+  home = mkdtempSync(join(tmpdir(), 'douze-mcp-'))
   mkdirSync(join(home, 'recipes'), { recursive: true })
   mkdirSync(join(home, 'fixtures'), { recursive: true })
   writeFileSync(join(home, 'fixtures', 'list.json'), '{"data":[{"id":"o-1"}]}')
   writeFileSync(join(home, 'recipes', 'jira.yaml'), recipe('jira', listTool('jira')))
   writeFileSync(join(home, 'recipes', 'linear.yaml'), recipe('linear', listTool('linear')))
 
-  const env = { ...process.env, RECON_HOME: home, RECON_FOREGROUND: '1', RECON_REGISTRY_POLL_MS: '250' }
+  const env = { ...process.env, DOUZE_HOME: home, DOUZE_FOREGROUND: '1', DOUZE_REGISTRY_POLL_MS: '250' }
   // Port 0 keeps the scratch daemon off the fixed default, so a real install can stay up.
   daemon = spawn(RUNNER, [ENTRY, 'start', '--port', '0'], { env, stdio: 'pipe' })
   await waitForHealth(home)
@@ -95,16 +95,16 @@ afterAll(() => {
   console.log(`\n--- MCP stdio transcript ---\n${transcript.join('\n')}\n---`)
 })
 
-describe('recon --mcp over real stdio', () => {
+describe('douze --mcp over real stdio', () => {
   it('initializes and advertises listChanged (AC-RUN-002.2)', async () => {
     const result = await mcp.request('initialize', {
       protocolVersion: '2025-06-18',
       capabilities: { roots: { listChanged: true } },
-      clientInfo: { name: 'recon-acceptance', version: '0.0.0' },
+      clientInfo: { name: 'douze-acceptance', version: '0.0.0' },
     })
     mcp.notify('notifications/initialized', {})
 
-    expect(result).toMatchObject({ serverInfo: { name: 'recon' } })
+    expect(result).toMatchObject({ serverInfo: { name: 'douze' } })
     expect((result as { capabilities: { tools?: { listChanged?: boolean } } }).capabilities.tools?.listChanged).toBe(
       true,
     )
@@ -274,7 +274,7 @@ function summarize(message: JsonRpcMessage): string {
 }
 
 async function waitForHealth(scratchHome: string): Promise<void> {
-  const runtimeFile = join(scratchHome, 'recond.json')
+  const runtimeFile = join(scratchHome, 'douzed.json')
   const deadline = Date.now() + 20_000
   while (Date.now() < deadline) {
     if (existsSync(runtimeFile)) {
@@ -287,5 +287,5 @@ async function waitForHealth(scratchHome: string): Promise<void> {
     }
     await new Promise((resolve) => setTimeout(resolve, 100))
   }
-  throw new Error('recond never became reachable')
+  throw new Error('douzed never became reachable')
 }

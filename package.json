@@ -1,5 +1,5 @@
 {
-  "name": "recon-monorepo",
+  "name": "douze-monorepo",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@10.33.4",
@@ -8,13 +8,20 @@
   },
   "scripts": {
     "build": "pnpm -r build",
+    "bundle": "pnpm --filter @douze/cli build && node packages/cli/dist/index.js bundle",
+    "pack:extension": "cd packages/extension/dist && zip -qrFS ../../../douze-extension.zip .",
+    "pack:server": "cd packages/cli/dist && zip -qrFS ../../../douze-server.zip .",
+    "release:local": "pnpm build && pnpm bundle && pnpm pack:extension && pnpm pack:server",
     "typecheck": "pnpm -r exec tsc --noEmit",
+    "lint": "oxlint packages e2e fixtures",
     "test": "pnpm -r test",
-    "e2e": "playwright test"
+    "e2e": "playwright test",
+    "verify:e2e": "playwright test e2e/verification/full-app.spec.ts e2e/relay/execution.spec.ts e2e/relay/guards.spec.ts"
   },
   "devDependencies": {
     "@playwright/test": "1.62.0",
     "@types/node": "26.1.2",
+    "oxlint": "1.77.0",
     "tsx": "4.23.1",
     "typescript": "7.0.2",
     "vitest": "4.1.10"

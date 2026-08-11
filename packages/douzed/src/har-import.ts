@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { isInferableContentType, isNoiseHost, shouldCapture, type Exchange } from '@recon/shared'
+import { isInferableContentType, isNoiseHost, shouldCapture, type Exchange } from '@douze/shared'
 import type { CaptureStore } from './capture-store.js'
 
 /** The slice of the HAR 1.2 spec we actually read. */
@@ -109,6 +109,7 @@ export function importHar(
       ...(missing ? { body_missing_reason: 'har_no_content' as const } : {}),
       background: false,
       source: 'har',
+      credentials: [],
     }
 
     store.appendExchange(exchange)

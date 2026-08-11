@@ -51,7 +51,26 @@ describe('noise filtering (REQ-CAP-004)', () => {
     const base = { url: 'https://app.test/api/x', origin: 'https://app.test' }
     expect(shouldCapture({ ...base, response_content_type: 'application/json' }, origins)).toBe(true)
     expect(shouldCapture({ ...base, response_content_type: 'text/css' }, origins)).toBe(false)
-    expect(shouldCapture({ ...base, origin: 'https://other.test', response_content_type: 'application/json' }, origins)).toBe(false)
+    expect(
+      shouldCapture({ ...base, origin: 'https://other.test', response_content_type: 'application/json' }, origins),
+    ).toBe(false)
+  })
+
+  /**
+   * Live capture passes null: the recorded tab is what scoped the request, and the host it called
+   * is usually the site's API rather than the site itself. A HAR has no tab to attribute an entry
+   * to, so it still names its origins.
+   */
+  it('keeps another host when the caller has already scoped the request (AC-CAP-004.2)', () => {
+    const api = { url: 'https://api.test/v1/x', origin: 'https://api.test' }
+    expect(shouldCapture({ ...api, response_content_type: 'application/json' }, null)).toBe(true)
+    expect(shouldCapture({ ...api, response_content_type: 'text/css' }, null)).toBe(false)
+    expect(
+      shouldCapture(
+        { url: 'https://x.sentry.io/api/1/envelope', origin: 'https://x.sentry.io', response_content_type: 'application/json' },
+        null,
+      ),
+    ).toBe(false)
   })
 })
 
@@ -129,6 +148,148 @@ describe('URL redaction (REQ-CAP-005)', () => {
   it('leaves an ordinary URL untouched', () => {
     const url = 'https://app.test/api/orders?status=open&page=2'
     expect(redactUrl(url)).toBe(url)
+  })
+})
+
+/**
+ * The redactor and the write gate must agree, or an ordinary exchange is refused with no way for
+ * anyone to find out why. A developer console hands out API keys under names like
+ * `publishableKey`, which no key-based list will ever contain — recording dashboard.openfort.io
+ * retained zero exchanges, twice, for exactly this reason.
+ */
+describe('redaction and the write gate agree (AC-REC-004.2)', () => {
+  const cases: [string, unknown][] = [
+    ['a prefixed key under an innocuous name', { publishableKey: 'pk_test_4f9a2b7c1d8e3f6a0b5c' }],
+    ['a JWT under an innocuous name', { identity: 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r-wW1gFWFOEjXk' }],
+    ['a key nested in an array', { data: [{ id: 'pro_1', secretKey: 'sk_live_9f8e7d6c5b4a39281706' }] }],
+  ]
+
+  for (const [what, body] of cases) {
+    it(`redacts ${what}, so the gate has nothing to refuse`, () => {
+      const redacted = redactBody(body)
+      expect(findSurvivingSecrets(redacted)).toEqual([])
+      // The value is gone, not merely tolerated.
+      expect(JSON.stringify(redacted)).not.toContain('pk_test_')
+      expect(JSON.stringify(redacted)).not.toContain('sk_live_')
+      expect(JSON.stringify(redacted)).not.toContain('eyJhbGciOi')
+    })
+  }
+
+  it('redacts a credential in a header nobody listed', () => {
+    const out = redactHeaders({ 'x-openfort-key': 'pk_live_1a2b3c4d5e6f7a8b9c0d', accept: 'application/json' })
+    expect(findSurvivingSecrets(out)).toEqual([])
+    expect(out['accept']).toBe('application/json')
+  })
+
+  it('leaves ordinary prose and short values alone', () => {
+    const body = { name: 'My project', note: 'the quick brown fox jumps over the lazy dog', count: 3 }
+    expect(redactBody(body)).toEqual(body)
+  })
+})
+
+/**
+ * A URL is structure, and judging it as one string made every ordinary REST call read as a
+ * credential: long, mixed-alphabet, no spaces, a digit in `/v1/`. The write gate refused 30 of 31
+ * exchanges from a real dashboard on that basis, while a 96-character GitHub URL passed because it
+ * contained no digit — so the review page showed nothing but GitHub.
+ */
+describe('URLs are judged part by part (REQ-CAP-005)', () => {
+  const ordinary = [
+    'https://api.openfort.io/v1/players?limit=20&order=desc',
+    'https://api.openfort.io/v1/projects/pro_1a2b3c/policies?expand=transaction_intents',
+    'https://dashboard.example.com/api/v2/orders/10482/line-items?include=shipping',
+  ]
+
+  for (const url of ordinary) {
+    it(`leaves an ordinary API URL alone: ${new URL(url).pathname}`, () => {
+      expect(findSurvivingSecrets(url)).toEqual([])
+      expect(redactUrl(url)).toBe(url)
+    })
+  }
+
+  /**
+   * A recipe stores `request.path` with no scheme, so the URL branch alone did not cover it and
+   * `serializeRecipe` refused to write the recipe the review page had just built — "Couldn't save
+   * that" on the one button that matters.
+   */
+  const paths = [
+    '/v1/projects/pro_1a2b3c4d5e6f/policies/pol_9x8y7z6w',
+    '/v1/players?limit=20&order=desc&expand=transaction_intents',
+    '/v1/projects/{projectId}/policies/{policyId}/rules',
+  ]
+
+  for (const path of paths) {
+    it(`leaves an ordinary recipe path alone: ${path.slice(0, 40)}`, () => {
+      expect(findSurvivingSecrets(path)).toEqual([])
+    })
+  }
+
+  it('still catches a credential in a bare path', () => {
+    expect(findSurvivingSecrets('/v1/s/pk_live_1a2b3c4d5e6f7a8b9c0d/players')).toEqual(['$'])
+  })
+
+  const credentials: [string, string][] = [
+    ['a prefixed key in the path', 'https://api.example.com/v1/projects/pk_live_1a2b3c4d5e6f7a8b9c0d/players'],
+    ['a JWT in the path', 'https://api.example.com/v1/s/eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r-wW1gFWFOEjXk/x'],
+    ['a token in the query', 'https://api.example.com/v1/players?api_key=sk_live_9f8e7d6c5b4a39281706'],
+    ['a high-entropy path segment', 'https://api.example.com/v1/session/9f8e7d6c5b4a392817064f9a2b7c1d8e3f6a0b5c1d2e'],
+  ]
+
+  for (const [what, url] of credentials) {
+    it(`redacts ${what}, and the gate is satisfied afterwards`, () => {
+      expect(findSurvivingSecrets(url).length).toBeGreaterThan(0)
+      const redacted = redactUrl(url)
+      expect(findSurvivingSecrets(redacted)).toEqual([])
+      // Twice on the way to disk — the extension, then the store — so it has to settle.
+      expect(redactUrl(redacted)).toBe(redacted)
+    })
+  }
+})
+
+/**
+ * A URL is persisted whole, so every slot of it is a hiding place. The query and the path were
+ * covered; the fragment and the userinfo were not, and an OAuth implicit flow puts the access
+ * token in exactly the one the gate could not see.
+ */
+describe('URL fragment and userinfo (REQ-CAP-005)', () => {
+  const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r-wW1gFWFOEjXk'
+  const cases: [string, string, string][] = [
+    ['an implicit-flow token in the fragment', `https://app.example.com/callback#access_token=${jwt}&state=x`, jwt],
+    ['a password in the userinfo', 'https://user:hunter2@api.example.com/v1/orders', 'hunter2'],
+    [
+      'a bare high-entropy fragment',
+      'https://app.example.com/callback#9f8e7d6c5b4a392817064f9a2b7c1d8e3f6a0b5c1d2e',
+      '9f8e7d6c5b4a392817064f9a2b7c1d8e3f6a0b5c1d2e',
+    ],
+  ]
+
+  for (const [what, url, secret] of cases) {
+    it(`flags and redacts ${what}`, () => {
+      expect(findSurvivingSecrets(url).length).toBeGreaterThan(0)
+      const redacted = redactUrl(url)
+      expect(decodeURIComponent(redacted)).not.toContain(secret)
+      expect(findSurvivingSecrets(redacted)).toEqual([])
+      // Twice on the way to disk — the extension, then the store — so it has to settle.
+      expect(redactUrl(redacted)).toBe(redacted)
+    })
+  }
+
+  it('keeps the placeholder in the slot the secret occupied', () => {
+    const redacted = new URL(redactUrl(`https://app.example.com/cb#access_token=${jwt}&state=x`))
+    expect(new URLSearchParams(redacted.hash.slice(1)).get('access_token')).toBe(`«redacted:string:${jwt.length}»`)
+    expect(new URLSearchParams(redacted.hash.slice(1)).get('state')).toBe('x')
+    expect(new URL(redactUrl('https://user:hunter2@api.example.com/v1/x')).username).toBe('user')
+  })
+
+  it('leaves an ordinary fragment alone', () => {
+    const url = 'https://app.example.com/dashboard#/orders/10482'
+    expect(findSurvivingSecrets(url)).toEqual([])
+    expect(redactUrl(url)).toBe(url)
+  })
+
+  it('judges an unparseable URL-shaped string whole instead of failing open', () => {
+    const token = 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8s9T0u1V2'
+    expect(findSurvivingSecrets(`https://[bad${token}`).length).toBeGreaterThan(0)
   })
 })
 

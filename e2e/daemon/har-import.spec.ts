@@ -1,21 +1,21 @@
 import { test, expect } from '@playwright/test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { Recond, REPO } from '../harness.js'
+import { Douzed, REPO } from '../harness.js'
 
 /** COV_CAP_006 — a HAR must produce the same shape of session as live capture. */
 test.describe('COV_CAP_006: HAR import parity', () => {
-  let recond: Recond
+  let douzed: Douzed
 
   test.beforeEach(async () => {
-    recond = new Recond()
-    await recond.start()
+    douzed = new Douzed()
+    await douzed.start()
   })
 
-  test.afterEach(() => recond.stop())
+  test.afterEach(() => douzed.stop())
 
   const importHar = async (har: unknown, name: string) =>
-    (await recond.api('/import/har', { method: 'POST', body: JSON.stringify({ har, name }) })).json()
+    (await douzed.api('/import/har', { method: 'POST', body: JSON.stringify({ har, name }) })).json()
 
   test('@COV_CAP_006.1 should import a HAR with filtering and redaction applied', async () => {
     const har = JSON.parse(readFileSync(join(REPO, 'fixtures/orders.har'), 'utf8'))
@@ -25,7 +25,7 @@ test.describe('COV_CAP_006: HAR import parity', () => {
     expect(result.imported).toBe(4)
     expect(result.skipped).toBe(3)
 
-    const detail = await (await recond.api(`/sessions/${result.session_id}`)).json()
+    const detail = await (await douzed.api(`/sessions/${result.session_id}`)).json()
     const urls = detail.exchanges.map((e: { url: string }) => e.url)
     expect(urls.every((u: string) => u.startsWith('https://app.test'))).toBe(true)
     expect(urls.some((u: string) => u.includes('google-analytics'))).toBe(false)
@@ -63,7 +63,7 @@ test.describe('COV_CAP_006: HAR import parity', () => {
     const result = await importHar(har, 'bodyless')
     expect(result.imported).toBe(2)
 
-    const detail = await (await recond.api(`/sessions/${result.session_id}`)).json()
+    const detail = await (await douzed.api(`/sessions/${result.session_id}`)).json()
     expect(detail.exchanges).toHaveLength(2)
     for (const exchange of detail.exchanges) {
       expect(exchange.body_missing).toBe(true)

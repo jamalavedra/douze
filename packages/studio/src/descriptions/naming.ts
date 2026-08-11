@@ -1,4 +1,4 @@
-import type { SideEffect } from '@recon/shared'
+import type { SideEffect } from '@douze/shared'
 import { plural, singular, snake } from '../inference/templating.js'
 
 /**

@@ -1,0 +1,45 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish the release artifacts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub Release and upload its assets
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: Enable pnpm
+        run: corepack enable
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Build the release artifacts
+        run: pnpm release:local
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" --generate-notes douze-extension.zip Douze.mcpb douze-server.zip

@@ -1,15 +1,16 @@
 {
-  "name": "@recon/recond",
+  "name": "@douze/douzed",
   "version": "0.1.0",
   "type": "module",
   "private": true,
   "exports": { ".": "./src/index.ts" },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.build.json",
     "test": "vitest run"
   },
   "dependencies": {
-    "@recon/shared": "workspace:*",
+    "@douze/shared": "workspace:*",
+    "@douze/studio": "workspace:*",
     "chokidar": "5.0.0",
     "hono": "4.12.32",
     "ws": "8.18.3",

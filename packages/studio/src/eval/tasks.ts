@@ -2,7 +2,7 @@ import type { LabeledTask } from './selection.js'
 
 /**
  * The labeled task set for the reference "orders" recipe (COV_INF_006.3). Tasks are written the
- * way a user would type them into Claude — paraphrases, synonyms, and sloppy grammar — not as
+ * way a user would type them into a chat — paraphrases, synonyms, and sloppy grammar — not as
  * restatements of the tool names, which would make the eval measure nothing.
  */
 export const REFERENCE_TASKS: LabeledTask[] = [

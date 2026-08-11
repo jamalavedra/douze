@@ -10,9 +10,9 @@ import { defineConfig } from 'vite'
  * origin into `host_permissions`; production builds set nothing and ask the user at record time.
  */
 const testOrigin = (): import('vite').Plugin => ({
-  name: 'recon-test-origin',
+  name: 'douze-test-origin',
   closeBundle() {
-    const origin = process.env['RECON_TEST_ORIGIN']
+    const origin = process.env['DOUZE_TEST_ORIGIN']
     if (!origin) return
     const file = resolve(import.meta.dirname, 'dist/manifest.json')
     const manifest = JSON.parse(readFileSync(file, 'utf8')) as { host_permissions: string[] }

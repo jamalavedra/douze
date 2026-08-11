@@ -1,21 +1,34 @@
-import { EventEmitter } from 'node:events'
+import { EventEmitter, once } from 'node:events'
 import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import watch from 'chokidar'
-import { Recipe, Tool, parseRecipe, type CredentialSource } from '@recon/shared'
+import { Recipe, Tool, parseRecipe, type CredentialSource } from '@douze/shared'
 
 /** One entry of the Tool Surface: a tool plus the recipe it came from. */
 export interface SurfaceTool {
-  /** AC-RUN-001.2 — `<recipe>_<tool>` over MCP, `recon <recipe> <tool>` in the CLI. */
+  /** AC-RUN-001.2 — `<recipe>_<tool>` over MCP, `douze <recipe> <tool>` in the CLI. */
   qualified_name: string
   recipe: string
   base_url: string
   tool: Tool
   /** AC-EXE-001.3 — descriptor only; the extension resolves the actual value at call time. */
   credential_source: CredentialSource[]
+  /** The origin whose tab runs the call; absent means the target's own. */
+  page_origin?: string
   /** AC-RUN-001.5 — exposed but rejected at call time, with the reason named. */
   degraded: boolean
   degraded_reason?: string
+}
+
+/**
+ * The minimum a request builder needs about a tool. Structural so one builder serves the relay,
+ * headless mode, and an ejected package alike (AC-EJT-002.1).
+ */
+export interface SurfaceToolLike {
+  base_url: string
+  tool: Pick<Tool, 'request'>
+  credential_source?: CredentialSource[]
+  page_origin?: string
 }
 
 export interface RegistryState {
@@ -47,7 +60,13 @@ export class RecipeRegistry extends EventEmitter {
     super()
   }
 
-  start(): void {
+  /**
+   * Resolves once the watcher is live. On macOS, fsevents delivers nothing for the window
+   * between `watch()` and 'ready', so a recipe written in that gap was simply never seen —
+   * invisible until some later edit happened to touch the directory again. Awaiting 'ready'
+   * closes the window, and the second load picks up whatever landed while it was open.
+   */
+  async start(): Promise<void> {
     this.loadAll()
     // AC-RUN-002.1 — an edit must reach the surface within 5 seconds; 250ms of write-settling
     // is well inside that and avoids reloading a half-written file.
@@ -61,6 +80,8 @@ export class RecipeRegistry extends EventEmitter {
         this.loadAll()
       })
     }
+    await once(this.watcher, 'ready')
+    this.loadAll()
   }
 
   async stop(): Promise<void> {
@@ -73,7 +94,9 @@ export class RecipeRegistry extends EventEmitter {
     const before = JSON.stringify(this.state().tools)
 
     // A file that disappeared should stop being served.
+    // oxlint-disable-next-line unicorn/no-useless-spread -- snapshot before mutating the collection being iterated
     for (const known of [...this.loaded.keys()]) if (!files.includes(known)) this.loaded.delete(known)
+    // oxlint-disable-next-line unicorn/no-useless-spread -- snapshot before mutating the collection being iterated
     for (const known of [...this.errors.keys()]) if (!files.includes(known)) this.errors.delete(known)
 
     for (const file of files) {
@@ -116,6 +139,7 @@ export class RecipeRegistry extends EventEmitter {
           base_url: recipe.target.base_url,
           tool,
           credential_source: recipe.auth.credential_source,
+          ...(recipe.auth.page_origin === undefined ? {} : { page_origin: recipe.auth.page_origin }),
           degraded: tool.flags.degraded || fixtureIssue !== null,
           ...(reason === undefined ? {} : { degraded_reason: reason }),
         })

@@ -2,17 +2,17 @@ import { test, expect } from '@playwright/test'
 import { spawn, execFileSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { Recond, REPO, waitFor } from '../harness.js'
+import { Douzed, REPO, waitFor, TSX } from '../harness.js'
 
 /** COV_RUN_003 — daemon lifecycle. Real spawned processes, not in-process construction. */
 test.describe('COV_RUN_003: Daemon lifecycle', () => {
   test('@COV_RUN_003.1 should refuse to start a second instance', async () => {
-    const recond = new Recond()
-    await recond.start()
+    const douzed = new Douzed()
+    await douzed.start()
 
-    // Start it again against the same RECON_HOME and capture what it says.
-    const second = spawn('npx', ['tsx', join(REPO, 'packages/recond/src/bin.ts')], {
-      env: { ...process.env, RECON_HOME: recond.home },
+    // Start it again against the same DOUZE_HOME and capture what it says.
+    const second = spawn(TSX, [join(REPO, 'packages/douzed/src/bin.ts')], {
+      env: { ...process.env, DOUZE_HOME: douzed.home },
     })
     let stderr = ''
     second.stderr.on('data', (chunk) => (stderr += String(chunk)))
@@ -24,21 +24,28 @@ test.describe('COV_RUN_003: Daemon lifecycle', () => {
     expect(stderr).toMatch(/pid \d+/)
 
     // Exactly one process is listening on that port.
-    const listeners = execFileSync('bash', ['-c', `lsof -nP -iTCP:${recond.port} -sTCP:LISTEN | tail -n +2 | wc -l`])
+    const listeners = execFileSync('bash', ['-c', `lsof -nP -iTCP:${douzed.port} -sTCP:LISTEN | tail -n +2 | wc -l`])
     expect(Number(String(listeners).trim())).toBe(1)
 
-    recond.stop()
+    await douzed.stop()
   })
 
   test('@COV_RUN_003.2 should auto-start from a client and survive a restart', async () => {
-    const recond = new Recond()
+    // Two cold auto-starts, each compiling the daemon entry under tsx, while the rest of the
+    // suite is still holding Helium instances. The product default (45 s) is sized for a user's
+    // machine, not for this contention, so the spec raises its own ceiling.
+    test.setTimeout(240_000)
+    const douzed = new Douzed()
 
-    // With recond stopped, a client command must start it and complete.
-    const home = recond.home
+    // With douzed stopped, a client command must start it and complete.
+    const home = douzed.home
     const cli = (args: string[]) =>
       new Promise<{ code: number; out: string }>((resolve) => {
-        const child = spawn('npx', ['tsx', join(REPO, 'packages/cli/src/bin.ts'), ...args], {
-          env: { ...process.env, RECON_HOME: home },
+        const child = spawn(TSX, [join(REPO, 'packages/cli/src/bin.ts'), ...args], {
+          // DOUZE_PORT=0 for the same reason the harness sets it: this spec auto-starts real
+          // daemons, and one that outlives the run would otherwise squat 8787 — the port the
+          // shipped extension probes first — for every later spec and for the developer.
+          env: { ...process.env, DOUZE_HOME: home, DOUZE_START_TIMEOUT_MS: '120000', DOUZE_PORT: '0' },
         })
         let out = ''
         child.stdout.on('data', (c) => (out += String(c)))
@@ -48,7 +55,7 @@ test.describe('COV_RUN_003: Daemon lifecycle', () => {
 
     const first = await cli(['status'])
     expect(first.code).toBe(0)
-    const runtime = JSON.parse(readFileSync(join(home, 'recond.json'), 'utf8'))
+    const runtime = JSON.parse(readFileSync(join(home, 'douzed.json'), 'utf8'))
     expect(runtime.pid).toBeGreaterThan(0)
 
     // Kill the daemon; the next command must recover with no user action. The kill itself may
@@ -72,7 +79,7 @@ test.describe('COV_RUN_003: Daemon lifecycle', () => {
     const second = await cli(['status'])
     expect(second.code).toBe(0)
 
-    const restarted = JSON.parse(readFileSync(join(home, 'recond.json'), 'utf8'))
+    const restarted = JSON.parse(readFileSync(join(home, 'douzed.json'), 'utf8'))
     expect(restarted.pid).toBeGreaterThan(0)
     await waitFor(async () => (await fetch(`http://127.0.0.1:${restarted.port}/health`)).ok, 'daemon to be reachable')
 
@@ -81,6 +88,6 @@ test.describe('COV_RUN_003: Daemon lifecycle', () => {
     } catch {
       // already gone
     }
-    recond.stop()
+    await douzed.stop()
   })
 })

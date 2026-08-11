@@ -1,7 +1,7 @@
-import type { ResponseContract } from '@recon/shared'
+import type { ResponseContract } from '@douze/shared'
 import type { JsonSchema } from '../types.js'
 
-/** `Pagination` is exported from @recon/shared as a Zod schema value, not a type. */
+/** `Pagination` is exported from @douze/shared as a Zod schema value, not a type. */
 type Pagination = NonNullable<ResponseContract['pagination']>
 
 /**

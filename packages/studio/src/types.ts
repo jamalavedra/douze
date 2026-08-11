@@ -1,4 +1,4 @@
-import type { Exchange, Tool, UiProvenance } from '@recon/shared'
+import type { Exchange, Tool, UiProvenance } from '@douze/shared'
 
 /** JSON Schema documents are plain objects; nothing here needs a schema-of-schemas. */
 export type JsonSchema = Record<string, unknown>

@@ -7,9 +7,10 @@ import {
   defaultRedaction,
   redactBody,
   redactHeaders,
+  redactUrl,
   shouldCapture,
-} from '@recon/shared'
-import type { CapturedBody, GestureEvent } from './messages.js'
+} from '@douze/shared'
+import type { CapturedBody, CredentialHint, GestureEvent } from './messages.js'
 
 /** AC-CAP-003.1 — a gesture older than this did not cause the request. */
 export const PROVENANCE_WINDOW_MS = 2000
@@ -71,6 +72,9 @@ export function attribute(
 
 /** Everything known about one observed request, before session context is applied. */
 export interface ExchangeDraft {
+  /** AC-EXE-001.3 — the page that issued the request, and where its credentials live. */
+  page_origin?: string | undefined
+  credentials?: CredentialHint[] | undefined
   method: string
   url: string
   started_at: number
@@ -112,12 +116,16 @@ const originOf = (url: string): string => {
 
 /**
  * AC-CAP-004 — the shared filter decides inclusion, so live capture and HAR import cannot
- * drift apart. Returns null when the draft is noise, off-origin, or not an inferable type.
+ * drift apart. False when the draft is noise or not an inferable type.
+ *
+ * No origin list: every caller has already established that the recorded tab made this request,
+ * and the target is frequently a different host than the page — the API subdomain the dashboard
+ * talks to is the whole point of recording it (see `shouldCapture`).
  */
-export function admits(draft: ExchangeDraft, origins: string[], noise: NoiseConfig = defaultNoise()): boolean {
+export function admits(draft: ExchangeDraft, noise: NoiseConfig = defaultNoise()): boolean {
   return shouldCapture(
     { url: draft.url, origin: originOf(draft.url), response_content_type: draft.response_content_type },
-    origins,
+    null,
     noise,
   )
 }
@@ -136,7 +144,8 @@ export function finalize(draft: ExchangeDraft, ctx: SessionContext, id: string):
     started_at: draft.started_at,
     duration_ms: draft.duration_ms,
     method: draft.method,
-    url: draft.url,
+    // A credential in a query string bypasses header and body redaction entirely.
+    url: redactUrl(draft.url, redaction),
     origin: originOf(draft.url),
     request_headers: redactHeaders(draft.request_headers, redaction),
     ...(draft.request_body === undefined ? {} : { request_body: redactBody(draft.request_body, redaction) }),
@@ -150,55 +159,83 @@ export function finalize(draft: ExchangeDraft, ctx: SessionContext, id: string):
     background: 'background' in provenance,
     ...('provenance' in provenance ? { provenance: provenance.provenance } : {}),
     source: draft.source,
+    ...(draft.page_origin === undefined ? {} : { page_origin: draft.page_origin }),
+    // Locations, not values: a storage key and a header name pass redaction untouched, which is
+    // the point — the recipe has to say where the credential comes from without carrying one.
+    credentials: draft.credentials ?? [],
   }
 }
 
+/** Observation jitter between two capture paths watching one request. */
+const SAME_REQUEST_MS = 50
+
 /**
  * T-002.6 — an exchange the interceptor and the debugger both saw is emitted exactly once.
- * The two paths share no request id, so they are correlated on (method, url, ordinal) with a
- * per-source counter, the same correlation the webRequest oracle uses.
  *
- * ponytail: ordinals drift if one path misses a request to a URL another path saw twice; the
- * consequence is one duplicate, not a lost exchange. Correlate on timing too if it bites.
+ * The paths share no request id, so a MAIN-world emission is matched to a deferred oracle or
+ * debugger draft by (method, url) within the grace window, consuming one credit per match.
+ *
+ * Counting an ordinal per source and then keying the claim source-blind does NOT work, and the
+ * failure is silent data loss rather than a duplicate: the oracle observes a SUPERSET of
+ * MAIN-world traffic — service workers and sendBeacon are its whole reason to exist — so its
+ * counter runs ahead. A service-worker GET (oracle ordinal 1) and a later page fetch of the same
+ * URL (main-world ordinal 1) collide on one key, and the oracle-only exchange, which is exactly
+ * the headers-only record AC-CAP-002.3 mandates, is dropped. Credits cannot collide that way:
+ * one MAIN-world emission suppresses at most one deferred draft.
  */
 export class Reconciler {
-  private readonly ordinals = new Map<string, number>()
-  private readonly claimed = new Map<string, number>()
+  /**
+   * Unconsumed MAIN-world emissions per `method|url`, holding each one's `started_at`. Matching
+   * on the REQUEST's own start time rather than on arrival is what separates "one request both
+   * paths saw" from "two requests to the same URL": the former share a start instant, the latter
+   * do not, however close together they arrive.
+   */
+  private readonly credits = new Map<string, number[]>()
   private deferred: Array<{ key: string; due: number; draft: ExchangeDraft }> = []
 
-  private nextKey(draft: ExchangeDraft): string {
-    const counterKey = `${draft.source}|${draft.method}|${draft.url}`
-    const ordinal = (this.ordinals.get(counterKey) ?? 0) + 1
-    this.ordinals.set(counterKey, ordinal)
-    return `${draft.method}|${draft.url}|${ordinal}`
+  private static key(draft: ExchangeDraft): string {
+    return `${draft.method}|${draft.url}`
   }
 
   /**
-   * The MAIN-world path emits immediately and claims the key; the oracle and debugger paths
+   * The MAIN-world path emits immediately and banks a credit; the oracle and debugger paths
    * wait out the grace window so a body-bearing capture of the same request wins.
    */
   accept(draft: ExchangeDraft, now: number): ExchangeDraft[] {
-    const key = this.nextKey(draft)
+    const key = Reconciler.key(draft)
     if (draft.source === 'main_world') {
-      this.claimed.set(key, now)
+      const credits = this.credits.get(key) ?? []
+      credits.push(draft.started_at)
+      this.credits.set(key, credits)
       return [draft]
     }
     this.deferred.push({ key, due: now + RECONCILE_GRACE_MS, draft })
     return []
   }
 
-  /** Drafts whose grace window has elapsed and that no richer capture claimed. */
+  /** Drafts whose grace window has elapsed and that no richer capture accounted for. */
   due(now: number): ExchangeDraft[] {
     const ready = this.deferred.filter((entry) => entry.due <= now)
     this.deferred = this.deferred.filter((entry) => entry.due > now)
+
     const out: ExchangeDraft[] = []
     for (const entry of ready) {
-      if (this.claimed.has(entry.key)) continue
-      this.claimed.set(entry.key, now)
+      const credits = this.credits.get(entry.key)
+      // Same underlying request => same start instant, allowing for observation jitter between
+      // the two paths. A genuinely separate call to the same URL starts at a different time.
+      const index = credits?.findIndex((at) => Math.abs(at - entry.draft.started_at) <= SAME_REQUEST_MS) ?? -1
+      if (credits && index >= 0) {
+        credits.splice(index, 1)
+        if (credits.length === 0) this.credits.delete(entry.key)
+        continue
+      }
       out.push(entry.draft)
     }
-    for (const [key, at] of this.claimed) {
-      if (now - at > 5 * 60_000) this.claimed.delete(key)
+
+    for (const [key, times] of this.credits) {
+      const fresh = times.filter((at) => now - at <= 5 * 60_000)
+      if (fresh.length === 0) this.credits.delete(key)
+      else this.credits.set(key, fresh)
     }
     return out
   }

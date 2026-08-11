@@ -4,7 +4,7 @@ import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { parseRecipe, type Recipe } from '@recon/shared'
+import { parseRecipe, type Recipe } from '@douze/shared'
 import { StudioSession } from './api.js'
 import { eject } from './eject.js'
 import { makeExchanges } from './testing.js'
@@ -64,7 +64,7 @@ function fixtureAppExchanges() {
 
 beforeAll(() => {
   rmSync(EJECT_ROOT, { recursive: true, force: true })
-  home = mkdtempSync(join(tmpdir(), 'recon-eject-'))
+  home = mkdtempSync(join(tmpdir(), 'douze-eject-'))
   fixturesDir = join(home, 'fixtures')
 
   const studio = StudioSession.fromExchanges(
@@ -171,7 +171,7 @@ describe('AC-EJT-001 standalone package emission', () => {
   })
 
   // AC-EJT-001.3
-  it('declares incur as its only runtime dependency and imports no Recon module', () => {
+  it('declares incur as its only runtime dependency and imports no Douze module', () => {
     ejectTo('one')
     const manifest = JSON.parse(readEmitted('one', 'package.json')) as {
       dependencies: Record<string, string>
@@ -182,7 +182,7 @@ describe('AC-EJT-001 standalone package emission', () => {
 
     for (const file of ['src/tools.ts', 'src/execute.ts', 'src/index.ts', 'src/replay.ts']) {
       const source = readEmitted('one', file)
-      expect(source, file).not.toContain('@recon/')
+      expect(source, file).not.toContain('@douze/')
       for (const match of source.matchAll(/^import[^']*from '([^']+)'/gm)) {
         expect(match[1], `${file} imports ${match[1] ?? ''}`).toMatch(/^(incur|node:[a-z_]+|\.\/[\w.]+\.js)$/)
       }
@@ -214,7 +214,7 @@ describe('AC-EJT-001 standalone package emission', () => {
       expect(readEmitted('one', file), file).toContain('from recipe "orders-fixture" (recipe schema version 1)')
     }
     // package.json cannot carry a comment, so the same sentence is a field.
-    expect(JSON.parse(readEmitted('one', 'package.json'))['_recon']).toContain(
+    expect(JSON.parse(readEmitted('one', 'package.json'))['_douze']).toContain(
       'from recipe "orders-fixture" (recipe schema version 1)',
     )
   })
@@ -261,7 +261,7 @@ describe('AC-EJT-002 ejected execution', () => {
       const child = spawn(TSX, ['src/index.ts', ...args], {
         cwd: join(EJECT_ROOT, dir),
         stdio: ['ignore', 'pipe', 'pipe'],
-        env: { ...process.env, RECON_HOME: join(home, 'absent'), ...env },
+        env: { ...process.env, DOUZE_HOME: join(home, 'absent'), ...env },
       })
       let out = ''
       child.stdout?.on('data', (chunk) => (out += String(chunk)))
@@ -270,14 +270,14 @@ describe('AC-EJT-002 ejected execution', () => {
     })
 
   // AC-EJT-002.1
-  it('executes through the relay when recond is reachable', async () => {
+  it('executes through the relay when douzed is reachable', async () => {
     ejectTo('relay')
     const seen: { path: string; token: string | null; body: unknown }[] = []
     const daemon = await stubDaemon(seen)
     try {
       const result = await run('relay', ['list_orders', '--format', 'json'], {
-        RECON_RELAY_URL: `http://127.0.0.1:${daemon.port}`,
-        RECON_TOKEN: 'stub-token',
+        DOUZE_RELAY_URL: `http://127.0.0.1:${daemon.port}`,
+        DOUZE_INSTALL_TOKEN: 'stub-token',
       })
       expect(result.code).toBe(0)
 
@@ -300,8 +300,8 @@ describe('AC-EJT-002 ejected execution', () => {
     const daemon = await stubDaemon([], { status: 400, body: { code: 'confirm_required', error: 'needs confirm=true' } })
     try {
       const result = await run('relay', ['delete_order', '1044', '--confirm'], {
-        RECON_RELAY_URL: `http://127.0.0.1:${daemon.port}`,
-        RECON_TOKEN: 'stub-token',
+        DOUZE_RELAY_URL: `http://127.0.0.1:${daemon.port}`,
+        DOUZE_INSTALL_TOKEN: 'stub-token',
       })
       expect(result.code).not.toBe(0)
       expect(result.out).toContain('needs confirm=true')
@@ -320,7 +320,7 @@ describe('AC-EJT-002 ejected execution', () => {
     eject({ recipe: headless, fixturesDir, out: join(EJECT_ROOT, 'headless') })
 
     const result = await run('headless', ['list_orders', '--format', 'json'], {
-      RECON_HEADLESS_SESSION: SESSION_COOKIE,
+      DOUZE_HEADLESS_SESSION: SESSION_COOKIE,
     })
     expect(result.code).toBe(0)
 
@@ -334,11 +334,11 @@ describe('AC-EJT-002 ejected execution', () => {
     ejectTo('relay')
     const result = await run('relay', ['list_orders'])
     expect(result.code).not.toBe(0)
-    expect(result.out).toContain('recond is not reachable and Headless Mode is not enabled')
+    expect(result.out).toContain('douzed is not reachable and Headless Mode is not enabled')
   }, 60_000)
 })
 
-/** Answers `/relay/:recipe/:tool` the way recond does, so the relay path can be driven offline. */
+/** Answers `/relay/:recipe/:tool` the way douzed does, so the relay path can be driven offline. */
 async function stubDaemon(
   seen: { path: string; token: string | null; body: unknown }[],
   failure?: { status: number; body: unknown },
@@ -347,7 +347,7 @@ async function stubDaemon(
     let raw = ''
     req.on('data', (chunk) => (raw += String(chunk)))
     req.on('end', () => {
-      seen.push({ path: req.url ?? '', token: req.headers['x-recon-token'] as string, body: JSON.parse(raw || '{}') })
+      seen.push({ path: req.url ?? '', token: req.headers['x-douze-token'] as string, body: JSON.parse(raw || '{}') })
       const answer = failure ?? {
         status: 200,
         body: {

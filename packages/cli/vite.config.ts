@@ -4,7 +4,7 @@ import { defineConfig } from 'vite'
 /**
  * The CLI ships as one file. AC-CON-001.3 — the `.mcpb` runs on the Node inside Claude Desktop
  * with no install step, so the bundle cannot rely on a `node_modules` tree being present; and
- * `recon --mcp` has to be a single path a config entry can point at.
+ * `douze --mcp` has to be a single path a config entry can point at.
  */
 export default defineConfig({
   build: {

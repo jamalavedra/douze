@@ -1,32 +1,43 @@
-# Recon — Implementation Task Tracker
+# Douze — Implementation Task Tracker
 
-Recon watches you use an authenticated dashboard for five minutes and turns the traffic into tools Claude Desktop, Claude Code, and the shell can call. Tool calls execute inside your signed-in browser via a relay, so no credential is ever extracted or stored. Recipes are versioned YAML interpreted at runtime, so a new target or an edited description reaches a running client in seconds with zero re-registration.
+Douze watches you use an authenticated dashboard for five minutes and turns the traffic into tools any MCP client — Claude Desktop, Claude Code, Cursor, VS Code, Windsurf — and the shell can call. Tool calls execute inside your signed-in browser via a relay, so no credential is ever extracted or stored. Recipes are versioned YAML interpreted at runtime, so a new target or an edited description reaches a running client in seconds with zero re-registration.
 
-```
-  Chrome ext ──ws──▶ recond ◀──http/loopback──┬── recon --mcp   (stdio, launched by Claude)
-                                              └── recon jira create-issue   (shell)
-
-       recon studio ──▶ recipes/*.yaml ──▶ recond   (dev-time only)
-```
-
-Golden path (PRD 5.2):
+> **File paths in the task list below are the layout this work was *planned* against.** Implementation
+> consolidated many of them (no `src/registry/`, `src/relay/`, `src/drift/` directories; one
+> `server.ts` in douzed; the review SPA is `packages/studio/src/app.ts` served by douzed). The
+> shipped layout is the package map in `README.md`; do not treat a path here as a file that exists.
 
 ```
-  recon start                                  # recond up, extension connects
-  recon bundle && open recon.mcpb              # once, ever — Claude Desktop
-  recon mcp add --agent claude-code            # once, ever — Claude Code
+  Chrome ext ──ws──▶ douzed ◀──http/loopback──┬── douze --mcp   (stdio, launched by any MCP client)
+                     │                        └── douze jira create-issue   (shell)
+                     └── review UI ──▶ recipes/*.yaml ──▶ douzed
+```
 
-  # click record in the extension, do the workflow, annotate, stop
-  recon studio                                 # infer, review, approve
+Consumer path — no terminal:
+
+```
+  load packages/extension/dist unpacked in chrome://extensions   # once, ever
+  double-click Douze.mcpb                                        # once, ever — Claude Desktop
+  douze mcp add --agent cursor|vscode|claude-code|windsurf       # once, ever — any other client
+
+  # click Watch this site, do the workflow, click Done
+  # the extension links to the daemon's review UI; approve there
   # → tools are live in Claude Desktop within seconds; no reinstall
-
-  recon doctor jira                            # later: has the target drifted?
-  recon eject jira --out ./jira-tools          # optional: an artifact you own
 ```
 
-**Progress: 33/147 tasks complete** (86 implementation, 48 verification)
+Developer commands:
 
-Monorepo: pnpm workspaces, TypeScript, Node 22 / Bun. Packages: `packages/shared`, `packages/extension`, `packages/recond`, `packages/studio`, `packages/cli`. Runtime built on the `incur` npm package (wevm): Zod schemas drive the CLI, `--mcp` exposes the same commands as MCP tools. E2E: Playwright driving Helium (`/Applications/Helium.app`) with the unpacked MV3 extension, against a local fixture SPA + fixture server in `e2e/fixtures/`.
+```
+  pnpm bundle                                  # build + emit ./Douze.mcpb
+  douze mcp add --agent claude-code            # once, ever — any MCP client
+  douze start | stop | status                  # the daemon, which otherwise runs inside `--mcp`
+  douze doctor jira                            # later: has the target drifted?
+  douze eject jira --out ./jira-tools          # optional: an artifact you own
+```
+
+**Progress: 142/147 tasks complete** (86 implementation, 48 verification)
+
+Monorepo: pnpm workspaces, TypeScript, Node 22 / Bun. Packages: `packages/shared`, `packages/extension`, `packages/douzed`, `packages/studio`, `packages/cli`. Runtime built on the `incur` npm package (wevm): Zod schemas drive the CLI, `--mcp` exposes the same commands as MCP tools. E2E: Playwright driving Helium (`/Applications/Helium.app`) with the unpacked MV3 extension, against a local fixture SPA + fixture server in `e2e/fixtures/`.
 
 ## Dependency graph
 
@@ -46,7 +57,7 @@ Concurrent after WO-003 lands: the **extension lane** (WO-001→002), **studio l
 
 ---
 
-## WO-003 — recond foundation: relay daemon, capture store, control CLI, HAR import
+## WO-003 — douzed foundation: relay daemon, capture store, control CLI, HAR import
 
 Build order #1 — everything depends on this substrate (shared types, daemon, storage, e2e harness), and HAR import unblocks the whole studio lane before the extension exists.
 
@@ -57,20 +68,20 @@ Build order #1 — everything depends on this substrate (shared types, daemon, s
 - [x] T-003.3 [P] — Capture types: `CaptureSession`, `Exchange` (headers, bodies, timing, provenance, `body_missing`/`background` flags), `AnnotationSpan` in `packages/shared/src/capture.ts`
 - [x] T-003.4 [P] — Redaction module: credential-header list (`authorization`, `cookie`, `set-cookie`, `x-api-key`, `x-csrf-token`, user additions), secret-field list (`password`, `token`, `secret`, `apiKey`, `refresh_token`, user additions), stable placeholders preserving type + length, in `packages/shared/src/redaction.ts`
 - [x] T-003.5 [P] — WS protocol types: `exchange.*` (extension→daemon) and `relay.*` (daemon→extension) message families in `packages/shared/src/protocol.ts`
-- [x] T-003.6 — Daemon process + lifecycle: entry point, PID/port file, single-instance detection with exit-and-message on second start, in `packages/recond/src/daemon.ts`
-- [x] T-003.7 — Hono app on loopback with per-install token middleware (token generated on first run, stored in config dir) in `packages/recond/src/http.ts`
-- [x] T-003.8 — Extension WebSocket endpoint: accept `ws://127.0.0.1:<port>`, heartbeat inside the 30-second MV3 idle window, connection-state tracking, in `packages/recond/src/ws.ts`
-- [x] T-003.9 — CaptureStore on SQLite: persist sessions/exchanges/annotation spans, enforce redaction invariant before write (reject any exchange with credential-shaped values), serve exchange queries, in `packages/recond/src/capture-store.ts`
-- [ ] T-003.10 — CLI scaffold on incur: `recon start|stop|status|sessions` commands in `packages/cli/src/index.ts` + `packages/cli/src/commands/daemon.ts`
-- [ ] T-003.11 — Daemon client with auto-start: detect recond down, spawn it, wait for reachability, proceed; recovery after daemon restart, in `packages/cli/src/daemon-client.ts`
-- [x] T-003.12 — HAR import: convert HAR entries to a Capture Session applying live-capture noise filtering + redaction, mark body-less entries `body_missing`, `recon import <file> --name <n>`, in `packages/recond/src/har-import.ts` + `packages/cli/src/commands/import.ts`
+- [x] T-003.6 — Daemon process + lifecycle: entry point, PID/port file, single-instance detection with exit-and-message on second start, in `packages/douzed/src/daemon.ts`
+- [x] T-003.7 — Hono app on loopback with per-install token middleware (token generated on first run, stored in config dir) in `packages/douzed/src/http.ts`
+- [x] T-003.8 — Extension WebSocket endpoint: accept `ws://127.0.0.1:<port>`, heartbeat inside the 30-second MV3 idle window, connection-state tracking, in `packages/douzed/src/ws.ts`
+- [x] T-003.9 — CaptureStore on SQLite: persist sessions/exchanges/annotation spans, enforce redaction invariant before write (reject any exchange with credential-shaped values), serve exchange queries, in `packages/douzed/src/capture-store.ts`
+- [x] T-003.10 — CLI scaffold on incur: `douze start|stop|status|sessions` commands in `packages/cli/src/index.ts` + `packages/cli/src/commands/daemon.ts`
+- [x] T-003.11 — Daemon client with auto-start: detect douzed down, spawn it, wait for reachability, proceed; recovery after daemon restart, in `packages/cli/src/daemon-client.ts`
+- [x] T-003.12 — HAR import: convert HAR entries to a Capture Session applying live-capture noise filtering + redaction, mark body-less entries `body_missing`, `douze import <file> --name <n>`, in `packages/douzed/src/har-import.ts` + `packages/cli/src/commands/import.ts`
 - [x] T-003.13 [P] — E2E harness: Playwright config launching Helium (`/Applications/Helium.app`) with the unpacked extension, fixture SPA (orders app with auth, analytics beacon, CSS asset, GraphQL endpoint, polling mode, page-state-token mode, delay mode), fixture server recording every request it receives, in `e2e/playwright.config.ts`, `e2e/fixtures/spa/`, `e2e/fixtures/server.ts`, plus `fixtures/orders.har`
 
 ### Verification
 
-- [x] V-COV_RUN_003.1 — Starting a second `recond` exits non-zero with a message naming the running instance; only one port bound (`e2e/daemon/lifecycle.spec.ts`)
-- [x] V-COV_RUN_003.2 — With recond stopped, a CLI command auto-starts it and completes; after killing recond, the next command recovers with no user action (`e2e/daemon/lifecycle.spec.ts`)
-- [x] V-COV_CAP_006.1 — `recon import fixtures/orders.har --name orders-har` yields a session with only JSON exchanges from the primary origin and `authorization` values as placeholders (`e2e/daemon/har-import.spec.ts`)
+- [x] V-COV_RUN_003.1 — Starting a second `douzed` exits non-zero with a message naming the running instance; only one port bound (`e2e/daemon/lifecycle.spec.ts`)
+- [x] V-COV_RUN_003.2 — With douzed stopped, a CLI command auto-starts it and completes; after killing douzed, the next command recovers with no user action (`e2e/daemon/lifecycle.spec.ts`)
+- [x] V-COV_CAP_006.1 — `douze import fixtures/orders.har --name orders-har` yields a session with only JSON exchanges from the primary origin and `authorization` values as placeholders (`e2e/daemon/har-import.spec.ts`)
 - [x] V-COV_CAP_006.2 — Importing a HAR whose entries lack response content marks every exchange `body_missing` and discards none (`e2e/daemon/har-import.spec.ts`)
 
 ---
@@ -81,20 +92,20 @@ Build order #2 — M0's first kill-question feeds from HAR sessions, no extensio
 
 ### Tasks
 
-- [ ] T-005.1 — Endpoint templating: collapse same-method exchanges differing in one path segment into `EndpointTemplate` with named parameter (from response `id`-like field, else singular preceding static segment), in `packages/studio/src/inference/templating.ts`
-- [ ] T-005.2 [P] — Schema inference: required iff present in every observation, open enums for <12 distinct string values over ≥3 observations, `sparse` + confidence ≤0.4 for single-observation tools, emit JSON Schema convertible to Zod without manual editing, in `packages/studio/src/inference/schema.ts`
-- [ ] T-005.3 [P] — GraphQL splitting: group by operation name, one candidate per operation, input schema from observed `variables`, store operation document, derive names for anonymous ops (marked `derived_name`), exclude 200-with-`errors` exchanges from schema inference, in `packages/studio/src/inference/graphql.ts`
-- [ ] T-005.4 [P] — Side-effect classification: GET/HEAD → `read`, POST/PUT/PATCH/DELETE → `write`, destructive-pattern match (`delete`, `remove`, `purge`, `cancel`, `refund`, `revoke`) → `destructive`, in `packages/studio/src/inference/side-effects.ts`
-- [ ] T-005.5 [P] — Primary Payload Path selection + pagination detection (page/cursor params, recorded pagination style) in `packages/studio/src/inference/payload.ts`
-- [ ] T-005.6 [P] — Confidence scoring from observation count, schema stability, side-effect certainty, in `packages/studio/src/inference/confidence.ts`
-- [ ] T-005.7 — Engine orchestrator: exchanges → scored `CandidateTool` records, every candidate traceable to ≥1 exchange, deterministic and replayable with no model calls, in `packages/studio/src/inference/engine.ts`
+- [x] T-005.1 — Endpoint templating: collapse same-method exchanges differing in one path segment into `EndpointTemplate` with named parameter (from response `id`-like field, else singular preceding static segment), in `packages/studio/src/inference/templating.ts`
+- [x] T-005.2 [P] — Schema inference: required iff present in every observation, open enums for <12 distinct string values over ≥3 observations, `sparse` + confidence ≤0.4 for single-observation tools, emit JSON Schema convertible to Zod without manual editing, in `packages/studio/src/inference/schema.ts`
+- [x] T-005.3 [P] — GraphQL splitting: group by operation name, one candidate per operation, input schema from observed `variables`, store operation document, derive names for anonymous ops (marked `derived_name`), exclude 200-with-`errors` exchanges from schema inference, in `packages/studio/src/inference/graphql.ts`
+- [x] T-005.4 [P] — Side-effect classification: GET/HEAD → `read`, POST/PUT/PATCH/DELETE → `write`, destructive-pattern match (`delete`, `remove`, `purge`, `cancel`, `refund`, `revoke`) → `destructive`, in `packages/studio/src/inference/side-effects.ts`
+- [x] T-005.5 [P] — Primary Payload Path selection + pagination detection (page/cursor params, recorded pagination style) in `packages/studio/src/inference/payload.ts`
+- [x] T-005.6 [P] — Confidence scoring from observation count, schema stability, side-effect certainty, in `packages/studio/src/inference/confidence.ts`
+- [x] T-005.7 — Engine orchestrator: exchanges → scored `CandidateTool` records, every candidate traceable to ≥1 exchange, deterministic and replayable with no model calls, in `packages/studio/src/inference/engine.ts`
 
 ### Verification
 
-- [ ] V-COV_INF_001.1 — GETs to `/orders/1042|1043|1044` collapse to exactly one candidate with path `/orders/{orderId}`, parameter named from the response `id` field (`e2e/studio/inference.spec.ts`)
-- [ ] V-COV_INF_001.2 — Three POSTs where `note` appears once yield `note` optional and always-present fields required (`e2e/studio/inference.spec.ts`)
-- [ ] V-COV_INF_004.1 — `/graphql` session with `GetIssue`, `CreateIssue`, `GetIssue` yields two candidates with variables-derived schemas (`e2e/studio/graphql-inference.spec.ts`)
-- [ ] V-COV_INF_004.2 — A `CreateIssue` returning HTTP 200 with populated `errors` did not contribute to the response contract (`e2e/studio/graphql-inference.spec.ts`)
+- [x] V-COV_INF_001.1 — GETs to `/orders/1042|1043|1044` collapse to exactly one candidate with path `/orders/{orderId}`, parameter named from the response `id` field (`e2e/studio/inference.spec.ts`)
+- [x] V-COV_INF_001.2 — Three POSTs where `note` appears once yield `note` optional and always-present fields required (`e2e/studio/inference.spec.ts`)
+- [x] V-COV_INF_004.1 — `/graphql` session with `GetIssue`, `CreateIssue`, `GetIssue` yields two candidates with variables-derived schemas (`e2e/studio/graphql-inference.spec.ts`)
+- [x] V-COV_INF_004.2 — A `CreateIssue` returning HTTP 200 with populated `errors` did not contribute to the response contract (`e2e/studio/graphql-inference.spec.ts`)
 
 ---
 
@@ -104,16 +115,16 @@ Build order #3 — M0's 90% selection-accuracy exit criterion lives here; needs 
 
 ### Tasks
 
-- [ ] T-006.1 — Naming: verb-object snake_case from method/path/annotation/provenance, within-recipe collision disambiguation from distinguishing parameters, in `packages/studio/src/descriptions/naming.ts`
-- [ ] T-006.2 — Model client: configurable endpoint with local-model override taking precedence over remote provider, in `packages/studio/src/descriptions/model-client.ts`
-- [ ] T-006.3 — DescriptionWriter: ≤3-sentence what/returns/when descriptions, Annotation Span notes prioritized over UI provenance, redaction assertion on every model input payload (fail closed if a credential-shaped value is present), in `packages/studio/src/descriptions/writer.ts`
-- [ ] T-006.4 [P] — Offline eval harness scoring tool-selection accuracy against a labeled natural-language task set for the reference recipe, in `packages/studio/eval/selection.ts` + `packages/studio/eval/tasks/reference.yaml`
+- [x] T-006.1 — Naming: verb-object snake_case from method/path/annotation/provenance, within-recipe collision disambiguation from distinguishing parameters, in `packages/studio/src/descriptions/naming.ts`
+- [x] T-006.2 — Model client: configurable endpoint with local-model override taking precedence over remote provider, in `packages/studio/src/descriptions/model-client.ts`
+- [x] T-006.3 — DescriptionWriter: ≤3-sentence what/returns/when descriptions, Annotation Span notes prioritized over UI provenance, redaction assertion on every model input payload (fail closed if a credential-shaped value is present), in `packages/studio/src/descriptions/writer.ts`
+- [x] T-006.4 [P] — Offline eval harness scoring tool-selection accuracy against a labeled natural-language task set for the reference recipe, in `packages/studio/eval/selection.ts` + `packages/studio/eval/tasks/reference.yaml`
 
 ### Verification
 
-- [ ] V-COV_INF_006.1 — Candidate with span note "transitions an issue to done" and provenance "Save" gets a description reflecting the transition intent, not the button label (`e2e/studio/descriptions.spec.ts`)
-- [ ] V-COV_INF_006.2 — With a recording mock model endpoint, no request to it contains the original credential value from the session (`e2e/studio/descriptions.spec.ts`)
-- [ ] V-COV_INF_006.3 — Eval harness over the labeled task set reports selection accuracy ≥90% (`e2e/studio/descriptions.spec.ts`)
+- [x] V-COV_INF_006.1 — Candidate with span note "transitions an issue to done" and provenance "Save" gets a description reflecting the transition intent, not the button label (`e2e/studio/descriptions.spec.ts`)
+- [x] V-COV_INF_006.2 — With a recording mock model endpoint, no request to it contains the original credential value from the session (`e2e/studio/descriptions.spec.ts`)
+- [x] V-COV_INF_006.3 — Eval harness over the labeled task set reports selection accuracy ≥90% (`e2e/studio/descriptions.spec.ts`)
 
 ---
 
@@ -123,12 +134,12 @@ Build order #4 — the install-once mechanism; needs only WO-003 + shared recipe
 
 ### Tasks
 
-- [ ] T-004.1 — Recipe YAML loader + validation against `packages/shared/src/recipe.ts`, per-recipe failure isolation (skip invalid, serve the rest, report by name), in `packages/recond/src/registry/loader.ts`
-- [ ] T-004.2 [P] — Versioned schema migrations: migrate older recipes in place, report every altered field, in `packages/recond/src/registry/migrations.ts`
-- [ ] T-004.3 — RecipeRegistry: load every `enabled` recipe, register approved tools into the ToolSurface, load `enabled: false` recipes for doctor only, in `packages/recond/src/registry/registry.ts`
-- [ ] T-004.4 — Directory watcher: reload a changed recipe within 5 seconds, retain the last valid version on failed reload, report the error without disturbing other recipes, in `packages/recond/src/registry/watcher.ts`
-- [ ] T-004.5 [P] — Fixture load-time validation: expose fixture-invalid tools as degraded (never silently omitted), naming the failing fixture, in `packages/recond/src/registry/fixture-check.ts`
-- [ ] T-004.6 — `GET /registry` route serving the current ToolSurface to runtime clients, in `packages/recond/src/routes/registry.ts`
+- [x] T-004.1 — Recipe YAML loader + validation against `packages/shared/src/recipe.ts`, per-recipe failure isolation (skip invalid, serve the rest, report by name), in `packages/douzed/src/registry/loader.ts`
+- [x] T-004.2 [P] — Versioned schema migrations: migrate older recipes in place, report every altered field, in `packages/douzed/src/registry/migrations.ts`
+- [x] T-004.3 — RecipeRegistry: load every `enabled` recipe, register approved tools into the ToolSurface, load `enabled: false` recipes for doctor only, in `packages/douzed/src/registry/registry.ts`
+- [x] T-004.4 — Directory watcher: reload a changed recipe within 5 seconds, retain the last valid version on failed reload, report the error without disturbing other recipes, in `packages/douzed/src/registry/watcher.ts`
+- [x] T-004.5 [P] — Fixture load-time validation: expose fixture-invalid tools as degraded (never silently omitted), naming the failing fixture, in `packages/douzed/src/registry/fixture-check.ts`
+- [x] T-004.6 — `GET /registry` route serving the current ToolSurface to runtime clients, in `packages/douzed/src/routes/registry.ts`
 
 ### Verification
 
@@ -145,18 +156,18 @@ Build order #5 — turns the registry into something Claude can call; the spike 
 
 ### Tasks
 
-- [ ] T-008.1 — **M0 spike (no deps, run first):** verify incur's MCP layer can re-register tools mid-session and emit `notifications/tools/list_changed`; if not, decide the thin-wrapper fallback that re-emits `tools/list` on reload; write findings + decision in `spike/incur-listchanged/README.md` (resolves Open Question Q1)
-- [ ] T-008.2 — JSON Schema → Zod converter used at load time, in `packages/cli/src/schema-to-zod.ts`
-- [ ] T-008.3 — ToolSurfaceBuilder: fetch surface from `GET /registry`, build incur command tree dynamically in a loop, `<recipe>_<tool>` MCP naming and `recon <recipe> <tool>` CLI naming, namespace keeps colliding tool names distinct without renaming, in `packages/cli/src/surface.ts`
-- [ ] T-008.4 — `recon --mcp` stdio server: dynamic registration, `listChanged` emission when the surface changes and the client declared the capability, documented restart fallback otherwise, in `packages/cli/src/mcp.ts`
-- [ ] T-008.5 [P] — RelayClient: argument validation, request-descriptor build, `POST /relay/:recipe/:tool` with install token, relay-failure → legible client error translation, in `packages/cli/src/relay-client.ts`
-- [ ] T-008.6 [P] — Result shaping: apply Primary Payload Path unless `raw`, truncate >32 KB with truncation notice + untrimmed size, TOON default CLI output with `--format json|yaml|md`, in `packages/cli/src/shape.ts`
+- [x] T-008.1 — **M0 spike (no deps, run first):** verify incur's MCP layer can re-register tools mid-session and emit `notifications/tools/list_changed`; if not, decide the thin-wrapper fallback that re-emits `tools/list` on reload; write findings + decision in `spike/incur-listchanged/README.md` (resolves Open Question Q1)
+- [x] T-008.2 — JSON Schema → Zod converter used at load time, in `packages/cli/src/schema-to-zod.ts`
+- [x] T-008.3 — ToolSurfaceBuilder: fetch surface from `GET /registry`, build incur command tree dynamically in a loop, `<recipe>_<tool>` MCP naming and `douze <recipe> <tool>` CLI naming, namespace keeps colliding tool names distinct without renaming, in `packages/cli/src/surface.ts`
+- [x] T-008.4 — `douze --mcp` stdio server: dynamic registration, `listChanged` emission when the surface changes and the client declared the capability, documented restart fallback otherwise, in `packages/cli/src/mcp.ts`
+- [x] T-008.5 [P] — RelayClient: argument validation, request-descriptor build, `POST /relay/:recipe/:tool` with install token, relay-failure → legible client error translation, in `packages/cli/src/relay-client.ts`
+- [x] T-008.6 [P] — Result shaping: apply Primary Payload Path unless `raw`, truncate >32 KB with truncation notice + untrimmed size, TOON default CLI output with `--format json|yaml|md`, in `packages/cli/src/shape.ts`
 
 ### Verification
 
-- [x] V-COV_RUN_004.1 — Two recipes each defining `list`: `tools/list` returns both namespaced; CLI exposes each as `recon <recipe> list`; MCP JSON Schema matches the Zod schema the CLI validates against (`e2e/runtime/surface.spec.ts`)
+- [x] V-COV_RUN_004.1 — Two recipes each defining `list`: `tools/list` returns both namespaced; CLI exposes each as `douze <recipe> list`; MCP JSON Schema matches the Zod schema the CLI validates against (`e2e/runtime/surface.spec.ts`)
 - [x] V-COV_RUN_004.2 — With a `listChanged`-declaring MCP client connected, adding an approved tool on disk sends `notifications/tools/list_changed` and the next `tools/list` includes it (`e2e/runtime/surface.spec.ts`)
-- [ ] V-COV_RUN_004.3 — A 40 KB response with a 1 KB Primary Payload Path returns the subtree; the same call with `raw` returns the full body; a >32 KB trimmed result states truncation and reports untrimmed size (`e2e/runtime/surface.spec.ts`)
+- [x] V-COV_RUN_004.3 — A 40 KB response with a 1 KB Primary Payload Path returns the subtree; the same call with `raw` returns the full body; a >32 KB trimmed result states truncation and reports untrimmed size (`e2e/runtime/surface.spec.ts`)
 
 ---
 
@@ -166,19 +177,19 @@ Build order #6 — the extension lane starts as soon as WO-003's WS endpoint exi
 
 ### Tasks
 
-- [ ] T-001.1 — MV3 scaffold: `manifest.json` (permissions: `scripting`, `webRequest`, `storage`, `offscreen`, `notifications`, optional `debugger`; per-target host permissions at record time) + Vite build, in `packages/extension/manifest.json`, `packages/extension/vite.config.ts`
-- [ ] T-001.2 — MAIN-world interceptor via `chrome.scripting.registerContentScripts({world: 'MAIN'})` wrapping `window.fetch` and `XMLHttpRequest`, capturing method, full URL, both header sets, both bodies, status; content-type/size only for non-UTF-8 or >2 MB bodies, in `packages/extension/src/interceptor.ts`
-- [ ] T-001.3 — Content-script bridge relaying interceptor messages to the service worker, in `packages/extension/src/bridge.ts`
-- [ ] T-001.4 — Service worker session lifecycle: start/stop, required non-empty session name, origin scoping to active tab + user allowlist, badge exchange count, retained-count report on stop, `chrome.storage` buffering, in `packages/extension/src/background.ts`
-- [ ] T-001.5 [P] — `chrome.webRequest` completeness oracle: anything it sees that the interceptor missed is recorded headers-only and marked `body_missing`, in `packages/extension/src/oracle.ts`
-- [ ] T-001.6 [P] — Noise filtering: bundled noise list (analytics, error reporting, session replay, ad, telemetry hosts), content-type allowlist (JSON, form-encoded, GraphQL, plain text), user-editable list applied to subsequent sessions with offered re-filter of existing sessions, in `packages/extension/src/noise.ts`
-- [ ] T-001.7 — Redaction in the service worker before any exchange leaves the extension, reusing `packages/shared/src/redaction.ts`, in `packages/extension/src/redact.ts`
-- [ ] T-001.8 — Popup UI: start/stop, session naming, live count, in `packages/extension/src/popup/`
-- [ ] T-001.9 — WS client dialing `ws://127.0.0.1:<port>`, heartbeat-aware, backoff reconnect, exchange delivery, in `packages/extension/src/ws-client.ts`
+- [x] T-001.1 — MV3 scaffold: `manifest.json` (permissions: `scripting`, `webRequest`, `storage`, `offscreen`, `notifications`, optional `debugger`; per-target host permissions at record time) + Vite build, in `packages/extension/manifest.json`, `packages/extension/vite.config.ts`
+- [x] T-001.2 — MAIN-world interceptor via `chrome.scripting.registerContentScripts({world: 'MAIN'})` wrapping `window.fetch` and `XMLHttpRequest`, capturing method, full URL, both header sets, both bodies, status; content-type/size only for non-UTF-8 or >2 MB bodies, in `packages/extension/src/interceptor.ts`
+- [x] T-001.3 — Content-script bridge relaying interceptor messages to the service worker, in `packages/extension/src/bridge.ts`
+- [x] T-001.4 — Service worker session lifecycle: start/stop, required non-empty session name, origin scoping to active tab + user allowlist, badge exchange count, retained-count report on stop, `chrome.storage` buffering, in `packages/extension/src/background.ts`
+- [x] T-001.5 [P] — `chrome.webRequest` completeness oracle: anything it sees that the interceptor missed is recorded headers-only and marked `body_missing`, in `packages/extension/src/oracle.ts`
+- [x] T-001.6 [P] — Noise filtering: bundled noise list (analytics, error reporting, session replay, ad, telemetry hosts), content-type allowlist (JSON, form-encoded, GraphQL, plain text), user-editable list applied to subsequent sessions with offered re-filter of existing sessions, in `packages/extension/src/noise.ts`
+- [x] T-001.7 — Redaction in the service worker before any exchange leaves the extension, reusing `packages/shared/src/redaction.ts`, in `packages/extension/src/redact.ts`
+- [x] T-001.8 — Popup UI: start/stop, session naming, live count, in `packages/extension/src/popup/`
+- [x] T-001.9 — WS client dialing `ws://127.0.0.1:<port>`, heartbeat-aware, backoff reconnect, exchange delivery, in `packages/extension/src/ws-client.ts`
 
 ### Verification
 
-- [x] V-COV_CAP_001.1 — Session "orders" on the fixture SPA: POST create + GET list show badge 2; recond receives 2 exchanges with non-empty request and response bodies (`e2e/capture/session-capture.spec.ts`)
+- [x] V-COV_CAP_001.1 — Session "orders" on the fixture SPA: POST create + GET list show badge 2; douzed receives 2 exchanges with non-empty request and response bodies (`e2e/capture/session-capture.spec.ts`)
 - [x] V-COV_CAP_001.2 — A third-party analytics request and a CSS asset request are both absent from the persisted session (`e2e/capture/session-capture.spec.ts`)
 - [x] V-COV_CAP_001.3 — An `authorization` header and a body `password` field persist as placeholders; the original values appear nowhere on disk (`e2e/capture/session-capture.spec.ts`)
 
@@ -190,20 +201,20 @@ Build order #7 — joins the extension (WO-001) and runtime (WO-008) lanes; this
 
 ### Tasks
 
-- [ ] T-009.1 — `POST /relay/:recipe/:tool` route: accept request descriptor + install token, never issue the target request from the daemon, in `packages/recond/src/routes/relay.ts`
-- [ ] T-009.2 — RelayBridge: forward descriptors over the extension WS, correlate requests to responses, timeouts under the MV3 5-minute cap, return status/headers/body for shaping, in `packages/recond/src/relay/bridge.ts`
-- [ ] T-009.3 — Call guards enforced in recond before any forward: per-tool rate limit with queue (not drop), `destructive` rejection without `confirm`, degraded rejection naming the detected change, in `packages/recond/src/relay/guards.ts`
-- [ ] T-009.4 [P] — Redacted audit log (tool name, parameters, status, duration) appended on every invocation, in `packages/recond/src/relay/audit.ts`
-- [ ] T-009.5 [P] — Failure classification: 401/403/login-redirect → `session_expired`, no retry; relay-unavailable states, in `packages/recond/src/relay/classify.ts`
-- [ ] T-009.6 — Extension relay handler: issue same-origin `fetch` with `credentials: 'include'` from an Executor Tab; create an offscreen tab on the target origin when none exists, in `packages/extension/src/relay-handler.ts` + `packages/extension/src/executor-tab.ts`
-- [ ] T-009.7 — Page-state credential reads per the recipe's auth descriptor (read from page context exactly as the app does, attach to the relayed request, never persist), in `packages/extension/src/page-credential.ts`
-- [ ] T-009.8 [P] — Expired-session browser notification linking to the target's login page when an open Executor Tab detects expiry, in `packages/extension/src/session-notify.ts`
+- [x] T-009.1 — `POST /relay/:recipe/:tool` route: accept request descriptor + install token, never issue the target request from the daemon, in `packages/douzed/src/routes/relay.ts`
+- [x] T-009.2 — RelayBridge: forward descriptors over the extension WS, correlate requests to responses, timeouts under the MV3 5-minute cap, return status/headers/body for shaping, in `packages/douzed/src/relay/bridge.ts`
+- [x] T-009.3 — Call guards enforced in douzed before any forward: per-tool rate limit with queue (not drop), `destructive` rejection without `confirm`, degraded rejection naming the detected change, in `packages/douzed/src/relay/guards.ts`
+- [x] T-009.4 [P] — Redacted audit log (tool name, parameters, status, duration) appended on every invocation, in `packages/douzed/src/relay/audit.ts`
+- [x] T-009.5 [P] — Failure classification: 401/403/login-redirect → `session_expired`, no retry; relay-unavailable states, in `packages/douzed/src/relay/classify.ts`
+- [x] T-009.6 — Extension relay handler: issue same-origin `fetch` with `credentials: 'include'` from an Executor Tab; create an offscreen tab on the target origin when none exists, in `packages/extension/src/relay-handler.ts` + `packages/extension/src/executor-tab.ts`
+- [x] T-009.7 — Page-state credential reads per the recipe's auth descriptor (read from page context exactly as the app does, attach to the relayed request, never persist), in `packages/extension/src/page-credential.ts`
+- [x] T-009.8 [P] — Expired-session browser notification linking to the target's login page when an open Executor Tab detects expiry, in `packages/extension/src/session-notify.ts`
 
 ### Verification
 
-- [ ] V-COV_EXE_001.1 — Signed in to the fixture app, a read tool call carries the session cookie to the fixture server and returns the trimmed payload (`e2e/relay/execution.spec.ts`)
-- [ ] V-COV_EXE_001.2 — With a page-state bearer token + CSRF header recipe, the fixture server receives both values and neither is persisted anywhere (`e2e/relay/execution.spec.ts`)
-- [ ] V-COV_EXE_002.1 — After server-side session invalidation, the call is classified `session_expired` and the fixture server recorded exactly one request (`e2e/relay/session-expiry.spec.ts`)
+- [x] V-COV_EXE_001.1 — Signed in to the fixture app, a read tool call carries the session cookie to the fixture server and returns the trimmed payload (`e2e/relay/execution.spec.ts`)
+- [x] V-COV_EXE_001.2 — With a page-state bearer token + CSRF header recipe, the fixture server receives both values and neither is persisted anywhere (`e2e/relay/execution.spec.ts`)
+- [x] V-COV_EXE_002.1 — After server-side session invalidation, the call is classified `session_expired` and the fixture server recorded exactly one request (`e2e/relay/session-expiry.spec.ts`)
 - [x] V-COV_EXE_003.1 — `delete_order` without `confirm` is rejected with zero requests recorded by the fixture server (`e2e/relay/guards.spec.ts`)
 - [x] V-COV_EXE_003.2 — A recipe-degraded tool returns a structured error naming the tool and detected change, with zero requests recorded (`e2e/relay/guards.spec.ts`)
 
@@ -215,20 +226,20 @@ Build order #8 — closes the studio lane into approved recipes; needs WO-005/00
 
 ### Tasks
 
-- [ ] T-007.1 — Studio server: Hono-served SPA on loopback + `recon studio` launch command, in `packages/studio/src/server.ts` + `packages/cli/src/commands/studio.ts`
-- [ ] T-007.2 — Review SPA: candidate list with name, description, side-effect label, confidence, observation count, annotation, UI provenance, redacted sample exchange, in `packages/studio/app/`
-- [ ] T-007.3 — Edit API: inline edits to name/description/schema written to the recipe and marked `user_edited`, in `packages/studio/src/api.ts`
-- [ ] T-007.4 — Promotion: bulk approve restricted to `read` candidates, individual approval required for `write`/`destructive`, required `confirm` parameter injected on destructive approval, unapproved candidates never exposed, in `packages/studio/src/promotion.ts`
-- [ ] T-007.5 — Merge engine for re-inference: keep `user_edited` values and store inferred alternatives as suggestions, retain absent tools marked `unverified` with last-observed date, report fixture-invalidating schema conflicts without overwriting until resolved, in `packages/studio/src/merge.ts`
-- [ ] T-007.6 [P] — Fixture writer: store ≥1 redacted fixture per approved tool, re-run redaction on write and fail if any credential-shaped value survives, in `packages/studio/src/fixtures.ts`
+- [x] T-007.1 — Review UI on loopback. **Shipped differently:** there is no studio server and no `douze studio` command. douzed serves the review page itself (`/review/:sessionId` in `packages/douzed/src/server.ts`, loading `packages/studio/src/app.ts` lazily per ADR-006), and the extension links straight to it — which is what removed the terminal from the consumer path.
+- [x] T-007.2 — Review SPA: candidate list with name, description, side-effect label, confidence, observation count, annotation, UI provenance, redacted sample exchange, in `packages/studio/src/app.ts`
+- [x] T-007.3 — Edit API: inline edits to name/description/schema written to the recipe and marked `user_edited`, in `packages/studio/src/api.ts`
+- [x] T-007.4 — Promotion: bulk approve restricted to `read` candidates, individual approval required for `write`/`destructive`, required `confirm` parameter injected on destructive approval, unapproved candidates never exposed, in `packages/studio/src/promotion.ts`
+- [x] T-007.5 — Merge engine for re-inference: keep `user_edited` values and store inferred alternatives as suggestions, retain absent tools marked `unverified` with last-observed date, report fixture-invalidating schema conflicts without overwriting until resolved, in `packages/studio/src/merge.ts`
+- [x] T-007.6 [P] — Fixture writer: store ≥1 redacted fixture per approved tool, re-run redaction on write and fail if any credential-shaped value survives, in `packages/studio/src/fixtures.ts`
 
 ### Verification
 
-- [ ] V-COV_REC_002.1 — "Approve all reads" on a mixed session approves only read candidates (`e2e/studio/review.spec.ts`)
-- [ ] V-COV_REC_002.2 — Individually approving `delete_order` writes a required `confirm` parameter into the recipe entry (`e2e/studio/review.spec.ts`)
-- [ ] V-COV_REC_002.3 — With recond running and a client connected, a saved description edit reaches the client's tool list within 30 seconds, no client restart (`e2e/studio/review.spec.ts`)
-- [ ] V-COV_REC_003.1 — After edit + re-record + re-inference, the edited description is unchanged and the inferred one is stored as a suggestion (`e2e/studio/recipe-merge.spec.ts`)
-- [ ] V-COV_REC_003.2 — Re-inference from a session missing an approved tool retains it, marked `unverified` with a last-observed date (`e2e/studio/recipe-merge.spec.ts`)
+- [x] V-COV_REC_002.1 — "Approve all reads" on a mixed session approves only read candidates (`e2e/studio/review.spec.ts`)
+- [x] V-COV_REC_002.2 — Individually approving `delete_order` writes a required `confirm` parameter into the recipe entry (`e2e/studio/review.spec.ts`)
+- [x] V-COV_REC_002.3 — With douzed running and a client connected, a saved description edit reaches the client's tool list within 30 seconds, no client restart (`e2e/studio/review.spec.ts`)
+- [x] V-COV_REC_003.1 — After edit + re-record + re-inference, the edited description is unchanged and the inferred one is stored as a suggestion (`e2e/studio/recipe-merge.spec.ts`)
+- [x] V-COV_REC_003.2 — Re-inference from a session missing an approved tool retains it, marked `unverified` with a last-observed date (`e2e/studio/recipe-merge.spec.ts`)
 
 ---
 
@@ -238,20 +249,20 @@ Build order #9 — completes the M1 end-to-end demo: bundle install, `mcp add`, 
 
 ### Tasks
 
-- [ ] T-010.1 — `recon bundle`: emit `.mcpb` zip with `manifest.json` (`user_config` form fields for relay URL + install token) and the MCP server entry point, using Claude Desktop's bundled Node on macOS/Windows, in `packages/cli/src/commands/bundle.ts` + `packages/cli/mcpb/manifest.json`
-- [ ] T-010.2 [P] — `recon mcp add --agent claude-code`: write a stdio entry invoking `recon --mcp`, report the scope written, reject reserved names (`workspace`, `claude-in-chrome`, `computer-use`, `Claude Preview`, `Claude Browser`) by suffixing, in `packages/cli/src/commands/mcp-add.ts`
-- [ ] T-010.3 [P] — `recon skills add`: install skill files describing enabled recipes' tools with worked examples drawn from fixtures, in `packages/cli/src/commands/skills.ts`
-- [ ] T-010.4 — Long-call survival: MCP progress notification at 60 s and every 60 s thereafter; configured ceiling cancels with a structured timeout naming tool + elapsed time, in `packages/cli/src/mcp.ts` (extends T-008.4/T-008.5)
-- [ ] T-010.5 — The four client-facing error states (relay not running + how to start; extension disconnected naming target; session expired naming target + sign-in instruction; never retry, never headless-fallback), in `packages/cli/src/errors.ts`
+- [x] T-010.1 — `douze bundle`: emit `.mcpb` zip with `manifest.json` and the MCP server entry point, using Claude Desktop's bundled Node on macOS/Windows, in `packages/cli/src/commands/bundle.ts`. **Shipped differently:** the manifest is generated in that file (there is no checked-in `mcpb/manifest.json`) and carries **no `user_config`** — the server finds the daemon itself, so installing is a double-click and nothing else. An e2e assertion pins the absence.
+- [x] T-010.2 [P] — `douze mcp add --agent claude-code`: write a stdio entry invoking `douze --mcp`, report the scope written, reject reserved names (`workspace`, `claude-in-chrome`, `computer-use`, `Claude Preview`, `Claude Browser`) by suffixing, in `packages/cli/src/commands/mcp-add.ts`
+- [x] T-010.3 [P] — `douze skills add`: install skill files describing enabled recipes' tools. **Shipped differently:** provided by incur's built-in `skills` command over the same command tree, so there is no `commands/skills.ts` of ours.
+- [x] T-010.4 — Long-call survival: MCP progress notification at 60 s and every 60 s thereafter; configured ceiling cancels with a structured timeout naming tool + elapsed time, in `packages/cli/src/mcp.ts` (extends T-008.4/T-008.5)
+- [x] T-010.5 — The four client-facing error states (relay not running + how to start; extension disconnected naming target; session expired naming target + sign-in instruction; never retry, never headless-fallback), in `packages/cli/src/errors.ts`
 
 ### Verification
 
-- [ ] V-COV_CON_001.1 — `recon bundle` → install `.mcpb` in a scratch Claude Desktop profile → settings form completed → server starts and `tools/list` returns the enabled recipes' tools (`e2e/connector/desktop.spec.ts`)
-- [ ] V-COV_CON_001.2 — Approving a tool in a new recipe makes it callable with no reinstall and no bundle rebuild (`e2e/connector/desktop.spec.ts`)
-- [ ] V-COV_CON_002.1 — `recon mcp add --agent claude-code` against a scratch config writes a stdio entry invoking `recon --mcp`, the reported scope matches the changed file, `claude mcp list` reports connected (`e2e/connector/claude-code.spec.ts`)
-- [ ] V-COV_CON_002.2 — Registration under `workspace` is suffixed and succeeds (`e2e/connector/claude-code.spec.ts`)
-- [ ] V-COV_CON_004.1 — recond stopped / extension disabled / session invalidated each produce their specified error text; no case retried or fell back to headless (`e2e/connector/failures.spec.ts`)
-- [ ] V-COV_CON_003.1 — A 7-minute-delayed read over MCP emits progress notifications at least once per minute and completes successfully (`e2e/connector/failures.spec.ts`)
+- [x] V-COV_CON_001.1 — `douze bundle` → unzip the `.mcpb` → run its declared entry point with nothing configured (no settings form exists) → `tools/list` returns the enabled recipes' tools (`e2e/connector/desktop.spec.ts`)
+- [x] V-COV_CON_001.2 — Approving a tool in a new recipe makes it callable with no reinstall and no bundle rebuild (`e2e/connector/desktop.spec.ts`)
+- [x] V-COV_CON_002.1 — `douze mcp add --agent claude-code` against a scratch config writes a stdio entry invoking `douze --mcp`, the reported scope matches the changed file, `claude mcp list` reports connected (`e2e/connector/claude-code.spec.ts`)
+- [x] V-COV_CON_002.2 — Registration under `workspace` is suffixed and succeeds (`e2e/connector/claude-code.spec.ts`)
+- [x] V-COV_CON_004.1 — douzed stopped / extension disabled / session invalidated each produce their specified error text; no case retried or fell back to headless (`e2e/connector/failures.spec.ts`)
+- [x] V-COV_CON_003.1 — A 7-minute-delayed read over MCP emits progress notifications at least once per minute and completes successfully (`e2e/connector/failures.spec.ts`)
 
 ---
 
@@ -261,19 +272,19 @@ Build order #10 — enriches description quality (M1 scope) but the golden-path 
 
 ### Tasks
 
-- [ ] T-002.1 — Gesture tracker content script: accessible name + role of the last activated interactive element, document title + route path, in `packages/extension/src/provenance.ts`
-- [ ] T-002.2 — Attribution in the service worker: 2-second window, `background` marking with no stale provenance for gesture-less requests, in `packages/extension/src/background.ts` (extends T-001.4)
-- [ ] T-002.3 — In-popup annotation: free-text note attached to every exchange since the previous note, persisted as an Annotation Span with start/end positions in the CaptureStore, in `packages/extension/src/popup/` + `packages/recond/src/capture-store.ts`
-- [ ] T-002.4 — Span-to-candidate propagation in inference: note attached to each candidate its span covers, prioritized over provenance for description generation, never required, in `packages/studio/src/inference/engine.ts` (extends T-005.7)
-- [ ] T-002.5 [P] — Per-session `chrome.debugger` opt-in: attach/detach, `Network.getResponseBody`, service-worker traffic capture, in `packages/extension/src/debugger-capture.ts`
-- [ ] T-002.6 — Dual-path reconciliation: an exchange captured by both interceptor and debugger is emitted at most once, in `packages/extension/src/dedupe.ts`
+- [x] T-002.1 — Gesture tracker content script: accessible name + role of the last activated interactive element, document title + route path, in `packages/extension/src/provenance.ts`
+- [x] T-002.2 — Attribution in the service worker: 2-second window, `background` marking with no stale provenance for gesture-less requests, in `packages/extension/src/background.ts` (extends T-001.4)
+- [x] T-002.3 — In-popup annotation: free-text note attached to every exchange since the previous note, persisted as an Annotation Span with start/end positions in the CaptureStore, in `packages/extension/src/popup/` + `packages/douzed/src/capture-store.ts`
+- [x] T-002.4 — Span-to-candidate propagation in inference: note attached to each candidate its span covers, prioritized over provenance for description generation, never required, in `packages/studio/src/inference/engine.ts` (extends T-005.7)
+- [x] T-002.5 [P] — Per-session `chrome.debugger` opt-in: attach/detach, `Network.getResponseBody`, service-worker traffic capture, in `packages/extension/src/debugger-capture.ts`
+- [x] T-002.6 — Dual-path reconciliation: an exchange captured by both interceptor and debugger is emitted at most once, in `packages/extension/src/dedupe.ts`
 
 ### Verification
 
-- [ ] V-COV_CAP_003.1 — Clicking "Create order" attaches provenance with accessible name "Create order" and the current route to the exchange (`e2e/capture/provenance.spec.ts`)
-- [ ] V-COV_CAP_003.2 — 5 seconds of polling with no interaction: every captured exchange is `background` with no provenance (`e2e/capture/provenance.spec.ts`)
-- [ ] V-COV_CAP_007.1 — A note attached between requests 2 and 3 lands on the candidate from exchange 3 and not the earlier candidates (`e2e/capture/annotation.spec.ts`)
-- [ ] V-COV_CAP_007.2 — An unannotated session still produces candidates; none is blocked on a missing annotation (`e2e/capture/annotation.spec.ts`)
+- [x] V-COV_CAP_003.1 — Clicking "Create order" attaches provenance with accessible name "Create order" and the current route to the exchange (`e2e/capture/provenance.spec.ts`)
+- [x] V-COV_CAP_003.2 — 5 seconds of polling with no interaction: every captured exchange is `background` with no provenance (`e2e/capture/provenance.spec.ts`)
+- [x] V-COV_CAP_007.1 — A note attached between requests 2 and 3 lands on the candidate from exchange 3 and not the earlier candidates (`e2e/capture/annotation.spec.ts`)
+- [x] V-COV_CAP_007.2 — An unannotated session still produces candidates; none is blocked on a missing annotation (`e2e/capture/annotation.spec.ts`)
 
 ---
 
@@ -283,19 +294,19 @@ Build order #11 — M2; needs the registry write path (WO-004) and replay throug
 
 ### Tasks
 
-- [x] T-011.1 — DriftWatcher scheduler: configured interval, silent skip when the browser relay is unavailable, in `packages/recond/src/drift/watcher.ts`
-- [x] T-011.2 — Fixture replay: `read` fixtures only — never `write` or `destructive` — through the relay, in `packages/recond/src/drift/replay.ts`
-- [x] T-011.3 — Five-way classification per tool: `ok` | `schema_widened` | `breaking` | `session_expired` | `gone`, in `packages/recond/src/drift/classify.ts`
-- [ ] T-011.4 — Degradation write-back into the recipe (propagates via hot reload; healthy tools in the same recipe unaffected), in `packages/recond/src/drift/degrade.ts`
-- [ ] T-011.5 [P] — Patch proposals: `schema_widened` → proposed recipe patch adding new optional fields, existing fields untouched; offer git branch commit when the recipe is in a repo, in `packages/recond/src/drift/patch.ts`
-- [ ] T-011.6 [P] — Webhook notification on any `breaking` or `gone` result, in `packages/recond/src/drift/notify.ts`
-- [ ] T-011.7 — `recon doctor [recipe]` on-demand command, in `packages/cli/src/commands/doctor.ts`
+- [x] T-011.1 — DriftWatcher scheduler: configured interval, silent skip when the browser relay is unavailable, in `packages/douzed/src/drift/watcher.ts`
+- [x] T-011.2 — Fixture replay: `read` fixtures only — never `write` or `destructive` — through the relay, in `packages/douzed/src/drift/replay.ts`
+- [x] T-011.3 — Five-way classification per tool: `ok` | `schema_widened` | `breaking` | `session_expired` | `gone`, in `packages/douzed/src/drift/classify.ts`
+- [x] T-011.4 — Degradation write-back into the recipe (propagates via hot reload; healthy tools in the same recipe unaffected), in `packages/douzed/src/drift/degrade.ts`
+- [x] T-011.5 [P] — Patch proposals: `schema_widened` → proposed recipe patch adding new optional fields, existing fields untouched; offer git branch commit when the recipe is in a repo, in `packages/douzed/src/drift/patch.ts`
+- [x] T-011.6 [P] — Webhook notification on any `breaking` or `gone` result, in `packages/douzed/src/drift/notify.ts`
+- [x] T-011.7 — `douze doctor [recipe]` on-demand command, in `packages/cli/src/commands/doctor.ts`
 
 ### Verification
 
-- [ ] V-COV_DRF_001.1 — `recon doctor` on a recipe with read/write/destructive tools: the fixture server received requests only for read tools (`e2e/drift/doctor.spec.ts`)
-- [ ] V-COV_DRF_001.2 — An added optional response field classifies `schema_widened` with a patch adding it as optional and no other change (`e2e/drift/doctor.spec.ts`)
-- [ ] V-COV_DRF_002.1 — Removing a required response field: recipe updated, running client reflects degradation without restart, affected tool fails before issuing a request, unaffected tool still succeeds (`e2e/drift/degradation.spec.ts`)
+- [x] V-COV_DRF_001.1 — `douze doctor` on a recipe with read/write/destructive tools: the fixture server received requests only for read tools (`e2e/drift/doctor.spec.ts`)
+- [x] V-COV_DRF_001.2 — An added optional response field classifies `schema_widened` with a patch adding it as optional and no other change (`e2e/drift/doctor.spec.ts`)
+- [x] V-COV_DRF_002.1 — Removing a required response field: recipe updated, running client reflects degradation without restart, affected tool fails before issuing a request, unaffected tool still succeeds (`e2e/drift/degradation.spec.ts`)
 
 ---
 
@@ -305,16 +316,16 @@ Build order #12 — M3; needs approved recipes (WO-007) and the runtime executio
 
 ### Tasks
 
-- [ ] T-012.1 — PackageEjector: emit a TypeScript incur package with one command per approved tool (path + required params → `args`, optional → `options`), `output` schema from the response contract, ≥1 `examples` entry from a fixture, in `packages/studio/src/eject/emitter.ts`
-- [ ] T-012.2 [P] — Emission templates: `incur` as the only runtime dependency, no Recon imports, per-file header naming source recipe + version, in `packages/studio/src/eject/templates/`
-- [ ] T-012.3 — Determinism: byte-identical output for repeated ejects of the same recipe (sorted keys, no timestamps), in `packages/studio/src/eject/emitter.ts`
-- [ ] T-012.4 — Ejected execution: relay-first when recond is reachable, headless fallback with degraded-path notice when configured, fixture-replay tests failing non-zero naming each failing tool, in `packages/studio/src/eject/templates/`
-- [ ] T-012.5 — `recon eject <recipe> --out <dir>` command, in `packages/cli/src/commands/eject.ts`
+- [x] T-012.1 — PackageEjector: emit a TypeScript incur package with one command per approved tool (path + required params → `args`, optional → `options`), `output` schema from the response contract, ≥1 `examples` entry from a fixture, in `packages/studio/src/eject/emitter.ts`
+- [x] T-012.2 [P] — Emission templates: `incur` as the only runtime dependency, no Douze imports, per-file header naming source recipe + version, in `packages/studio/src/eject/templates/`
+- [x] T-012.3 — Determinism: byte-identical output for repeated ejects of the same recipe (sorted keys, no timestamps), in `packages/studio/src/eject/emitter.ts`
+- [x] T-012.4 — Ejected execution: relay-first when douzed is reachable, headless fallback with degraded-path notice when configured, fixture-replay tests failing non-zero naming each failing tool, in `packages/studio/src/eject/templates/`
+- [x] T-012.5 — `douze eject <recipe> --out <dir>` command, in `packages/cli/src/commands/eject.ts`
 
 ### Verification
 
-- [ ] V-COV_EJT_001.1 — Two ejects are byte-identical; `package.json` declares `incur` as the only runtime dependency with no Recon import; a built read command's output matches the interpreted runtime for the same arguments (`e2e/eject/package.spec.ts`)
-- [ ] V-COV_EJT_001.2 — A fixture altered to contradict its schema makes the emitted tests exit non-zero naming the failing tool (`e2e/eject/package.spec.ts`)
+- [x] V-COV_EJT_001.1 — Two ejects are byte-identical; `package.json` declares `incur` as the only runtime dependency with no Douze import; a built read command's output matches the interpreted runtime for the same arguments (`e2e/eject/package.spec.ts`)
+- [x] V-COV_EJT_001.2 — A fixture altered to contradict its schema makes the emitted tests exit non-zero naming the failing tool (`e2e/eject/package.spec.ts`)
 
 ---
 
@@ -324,15 +335,15 @@ Build order #13 — M3; the explicitly degraded cron path, needing only the rela
 
 ### Tasks
 
-- [x] T-013.1 — Session export into the OS keychain on explicit per-target opt-in, with only a reference in configuration (never a session value), in `packages/recond/src/headless/keychain.ts` + `packages/recond/src/headless/config.ts`
-- [x] T-013.2 — Direct execution from recond: recipe-declared refresh endpoint applied on 401 with a single retry, in `packages/recond/src/headless/executor.ts`
-- [x] T-013.3 — Mandatory degraded-path notice on every headless invocation; on refresh failure, clear the keychain entry and report that browser relay is required, in `packages/recond/src/headless/executor.ts`
-- [ ] T-013.4 [P] — `recon headless enable|disable <target>` commands, in `packages/cli/src/commands/headless.ts`
+- [x] T-013.1 — Session export into the OS keychain on explicit per-target opt-in, with only a reference in configuration (never a session value), in `packages/douzed/src/headless/keychain.ts` + `packages/douzed/src/headless/config.ts`
+- [x] T-013.2 — Direct execution from douzed: recipe-declared refresh endpoint applied on 401 with a single retry, in `packages/douzed/src/headless/executor.ts`
+- [x] T-013.3 — Mandatory degraded-path notice on every headless invocation; on refresh failure, clear the keychain entry and report that browser relay is required, in `packages/douzed/src/headless/executor.ts`
+- [x] T-013.4 [P] — `douze headless enable|disable <target>` commands, in `packages/cli/src/commands/headless.ts`
 
 ### Verification
 
-- [ ] V-COV_EXE_004.1 — With headless enabled and the browser closed, a read tool succeeds with a degraded-path notice; config holds a keychain reference and no session value (`e2e/relay/headless.spec.ts`)
-- [ ] V-COV_EXE_004.2 — With the stored session and refresh endpoint invalidated, the call exits non-zero, requires browser relay, and the keychain entry is empty (`e2e/relay/headless.spec.ts`)
+- [x] V-COV_EXE_004.1 — With headless enabled and the browser closed, a read tool succeeds with a degraded-path notice; config holds a keychain reference and no session value (`e2e/relay/headless.spec.ts`)
+- [x] V-COV_EXE_004.2 — With the stored session and refresh endpoint invalidated, the call exits non-zero, requires browser relay, and the keychain entry is empty (`e2e/relay/headless.spec.ts`)
 
 ---
 
@@ -340,19 +351,113 @@ Build order #13 — M3; the explicitly degraded cron path, needing only the rela
 
 - [x] Q1 — **RESOLVED (verified)**: incur's `Mcp.serve()` does NOT support mid-session re-registration — `collectTools` snapshots once at connect. The escape hatch works and was executed end-to-end: `Cli.toCommands` (live Map) + `Mcp.collectTools` + `Mcp.callTool` + own `McpServer`, whose `registerTool()` handle fires `notifications/tools/list_changed` automatically. Original question: Does incur support re-registering tools mid-session and emitting `listChanged`? Spike in M0 (T-008.1). Fallback: a thin wrapper that re-emits `tools/list` on reload.
 - [ ] Q2 — How does Claude Desktop behave with a wide tool surface? Claude Code's tool search absorbs it; Desktop is unverified. Fallback: the `enabled` flag; next step, named profiles (ADR-007).
-- [ ] Q3 — Is a local model good enough to hold the 90% selection-accuracy bar, given description generation conflicts with local-first otherwise? Measure with the eval harness (T-006.4) against a local endpoint.
-- [ ] Q4 — Is relay latency acceptable for agent loops making many sequential calls? The 150 ms target is a guess until WO-009 measures it. Fallback: relay-call batching.
+- [x] Q3 — **PARTIALLY RESOLVED**: with a *remote* model (via the local `claude` CLI) real agent selection accuracy on the reference recipe is 100% (28/28), well clear of the 90% bar; the offline BM25 proxy scores 96.4%. A LOCAL model has not been benchmarked, so the local-first question is still open. Original:  Is a local model good enough to hold the 90% selection-accuracy bar, given description generation conflicts with local-first otherwise? Measure with the eval harness (T-006.4) against a local endpoint.
+- [x] Q4 — **RESOLVED (measured)**: relay overhead is **1.2 ms** median over a direct in-page fetch (relay 2.9 ms vs direct 1.7 ms, p95 6.1 ms) against the fixture app — the PRD's 150 ms target was a guess and the real figure is ~125x under it. All the extra hops are loopback or in-browser, so the *overhead* figure holds for a remote target too. Relay-call batching is not needed. Measured by `e2e/metrics.mjs`. Original:  Is relay latency acceptable for agent loops making many sequential calls? The 150 ms target is a guess until WO-009 measures it. Fallback: relay-call batching.
 - [ ] Q5 — Does MAIN-world interception hold up on real targets, or do CSP and page hardening push sessions onto the debugger path? Test three real targets before WO-001 locks the strategy. Fallback: the `chrome.debugger` opt-in path (ADR-002).
 - [ ] Q6 — Should recipes be portable between machines given environment-specific fixtures and base URLs? Leaning: per-target config overlays rather than environment-aware recipes.
 
 ---
 
+## Post-review gap found in use
+
+The PRD 5.2 golden path names `douze studio`, `douze doctor <recipe>`, and `douze eject <recipe>`.
+All three were BUILT and tested (review UI, DriftWatcher behind `POST /doctor/:recipe`,
+`eject()`), but none was wired as a CLI command — the acceptance tests exercise the underlying
+functions and the daemon endpoint, not those entry points, so a green suite hid it. `doctor` and
+`eject` are now wired in `packages/cli/src/commands/maintenance.ts`. `douze studio` was NOT wired
+and no longer needs to be: douzed serves the review page and the extension links to it, so the
+review path never touches a terminal. Verified end to end: import a HAR -> the review UI infers 3
+candidates -> bulk approve takes only the 2 reads and skips the write (AC-REC-002.3) -> recipe and
+fixtures written -> `douze eject` emits 6 files with `incur` as the only runtime dependency. `doctor` is deliberately CLI-only (`mcp: false`): a Doctor Run issues
+live requests and can rewrite a recipe, which is a maintenance decision, not an agent's call.
+
+## Review status (honest record)
+
+- **Core review (packages/shared, packages/douzed)** — completed by an adversarial reviewer. 21 findings; the 12 that mattered were fixed with regression tests (URL-query secret leak, form-encoded body leak, daemon crash on a refused WS message, doctor degrading recipes on transient failures, doctor hijacking the user's git HEAD, null-blind drift comparison, widened fields written at the wrong schema depth, HAR origin selection losing to CDNs, phantom annotation spans, unaudited secrets in the log, session-id mismatch, fixture re-parsing per relay call).
+- **Ponytail audit (all 5 packages)** — completed. Removed a 27-line re-export shim and a duplicate `DOUZE_TOKEN` config key that was also a live AC-EJT-002.1 bug.
+- **Final review (packages/cli, packages/studio, packages/extension, e2e)** — **DELIVERED** (late; an earlier note in this file said otherwise and was wrong). All 5 categories covered: all 18 e2e specs, all unit tests, all source in the three packages. Findings and disposition:
+  - **FIXED** AC-INF-004.4 violation — the GraphQL input schema was inferred from ALL exchanges including 200-with-errors failures, so a rejected call demoted the fields it omitted to optional and the tool advertised that an agent could reproduce exactly the request the server refused. The test that "covered" this was vacuous; it now discriminates and is mutation-verified.
+  - **FIXED** AC-RUN-004.2 boundary bug — `Buffer.subarray(cap).toString()` splits a UTF-8 sequence into a 3-byte U+FFFD, returning up to 2 bytes OVER the 32 KB cap while `returned_bytes` reported the violation as compliant. Both the CLI and the duplicated cut in emitted eject code now use a sequence-safe cut. Mutation-verified: reverting reproduces 32770 bytes.
+  - **FIXED** TR-6 gap in eject — fixtures were serialised into shippable generated source with no leak gate. `loadFixture` now runs `findSurvivingSecrets` and refuses.
+  - **FIXED** AC-CAP-002.3 data loss — the Reconciler counted ordinals per source but keyed claims source-blind; because the oracle sees a superset of MAIN-world traffic, an oracle-only exchange sharing a URL with page traffic was silently DROPPED (the code comment claimed the opposite failure mode). Now matches on the request's own `started_at`, with a regression test for the interleaving.
+  - **FIXED** AC-REC-003.1 — renaming a tool in review duplicated it on every re-inference and falsely marked the renamed one `unverified`, because merge matched on name. Now matches on request identity.
+  - **FIXED** relay traffic was captured into an active recording session (Douze inferring candidates from its own replays); the Executor Tab now never selects the recording tab.
+  - **FIXED** the extension's `finalize` documented "no unredacted payload crosses the loopback boundary" but skipped `redactUrl`.
+  - **FIXED (product)** cold auto-start ceiling was 15 s, which fails a slow first run on a real machine; now 45 s and configurable.
+  - **NOT FIXED, accepted:** rapid-click provenance can attach the later of two gestures when a second click lands between `fetch()` and request-body drain (MEDIUM-LOW); oracle/debugger drafts never set `tab_id` so AC-CAP-002.4 traffic is always `background` (LOW). Both are recorded here rather than silently carried.
+  - Verified-fine by the reviewer, do not re-investigate: JSON-Schema→Zod for every shape inference emits, interceptor SSE/streaming passthrough, relay not recursing through the patched fetch, `describe()` failing closed on the leak gate, and every e2e "target saw nothing" claim reading the fixture server's own log.
+
+## Found in live use (2026-08-06)
+
+The first real install on a real machine — the C-1 run below — found six defects that every
+green suite had missed, because all six live outside what the suite exercised.
+
+- **FIXED: the connector never started.** `serveMcp` awaited a daemon before connecting its
+  transport, and got that daemon by re-exec'ing `process.execPath`. Claude Desktop runs MCP
+  servers in an Electron UtilityProcess: `execPath` is the Claude binary, there is no Node to
+  spawn, and the `runAsNode` fuse is off, so the spawn launched the app. The wait timed out at
+  45 s, `initialize` was never answered, and the process exited — the extension reported that it
+  could not reach anything, and `~/.douze` was never created. douzed now runs **inside** the
+  `douze --mcp` process (`hostOrAdopt` in `packages/cli/src/daemon-client.ts`), later clients
+  adopt it over loopback, and the transport connects before the daemon is touched. Covered by
+  `e2e/connector/cold-start.spec.ts`, which sets `DOUZE_ENTRY` to a nonexistent path so any
+  return to re-exec fails the suite.
+  *Why the suite missed it:* `desktop.spec.ts` starts a daemon through the harness first, so the
+  cold-start path — the only path a real user takes — was never run.
+- **FIXED: recording a real dashboard retained nothing.** `shouldCapture` required the target
+  origin to be in the session's origin list. `dashboard.openfort.io` calls `api.openfort.io`, so
+  every request that mattered was dropped and two recordings produced zero exchanges. Live
+  capture now passes `origins: null`: the recorded tab already scoped the request (interceptor
+  registered on the granted origin, oracle filtered on the tab id, debugger attached to that
+  tab), and the noise list plus the content type remain. The popup asks Chrome for permission on
+  the origins actually seen when the session ends, because the relay replays inside a tab on the
+  **target** origin; an ungranted origin now fails with a sentence rather than a Chrome internal
+  error.
+  *Why the suite missed it:* every capture spec uses a fixture app that serves its own API, so
+  no test had ever recorded a site whose API lives on another host.
+
+- **FIXED: every ordinary API URL read as a credential.** `looksLikeCredential` judged a URL as
+  one string, and its generic heuristic is "40+ characters, mixed alphabet, no spaces, contains a
+  digit, entropy > 3.5" — which describes `https://api.example/v1/players?limit=20`, not a secret.
+  The write gate refused **30 of 31** exchanges from the live dashboard on that basis; the one
+  class that survived was GitHub raw URLs, which are 96 characters but contain no digit, so the
+  review page showed nothing but GitHub. A URL is now judged part by part (path segments and query
+  values, decoded), and `redactUrl` replaces a credential-shaped path segment as well as a query
+  value, so the gate and the redactor agree about URLs too. Proven from the user's own session:
+  `rg -o "credential at [^\"]*" ~/Library/Logs/Claude/mcp-server-douze.log`.
+- **FIXED: the daemon refused every exchange from a developer console, silently.** Redaction
+  removed values by *key name*; the write gate in `CaptureStore.appendExchange` detected them by
+  *value shape*. Openfort's API returns `{"publishableKey": "pk_test_…"}` — a name no list
+  contains — so redaction left it and the gate refused the exchange. Two more recordings retained
+  nothing while the extension counted every request, and the refusal went to a stderr that a
+  detached daemon discards, so it was invisible from every angle. `redactBody`, `redactHeaders`
+  and `redactFormBody` now apply the gate's own test (`looksLikeCredential`), as `redactUrl`
+  already did; the value becomes a length-preserving placeholder and the exchange is stored.
+  TR-6 is unchanged and asserted directly. The gate stays as defence in depth.
+  *Behaviour change, security-adjacent:* the store, the fixture writer and the description-model
+  gate used to REFUSE a credential under an innocuous key; they now redact it and proceed. The
+  audit log likewise keeps each argument with a placeholder instead of collapsing every argument
+  into "withheld".
+- **FIXED: `douze stop` could never stop a connected daemon.** `wss.close()` stops new upgrades
+  but leaves an established socket open, so `server.close()` waited on a connection that never
+  ends — with the extension attached, which is the normal state, the process hung and kept the
+  port while `stop` reported success. Every live socket is now terminated first, and
+  `CaptureStore.close()` is idempotent. Mutation-verified: without the terminate, the test hangs.
+- **FIXED: the review button did nothing.** The popup asked for permission on the origins the
+  session recorded and chained "open the review page" onto the answer. Chrome CLOSES a popup to
+  show a permission prompt, so the continuation never ran. The service worker owns that tab now,
+  and opens it whichever way the user answers.
+
+All five are the same shape of gap: the fixture is friendlier than the world, and a failure that
+only ever reached a discarded stderr may as well not have been reported. Worth remembering when
+reading a green run below.
+
 ## Cleanup & Review
 
-- [ ] C-1 — Live verification: record a session against https://dashboard.openfort.io/ in Helium, infer, review, approve, and complete a real read action from Claude Desktop and the CLI (Part 0 exit criterion, M1)
-- [ ] C-2 — Second-recipe check: add another recipe after C-1 and confirm its tools appear in Claude Desktop with zero reinstalls or reconnects (AC-CON-001.4)
-- [ ] C-3 — Success-metric pass: measure record-to-callable time (<15 min), relay overhead (<150 ms median), trimmed result size (<2 KB median), fixture replay pass rate (≥95%) against PRD 1.5
-- [ ] C-4 — Security sweep: grep the recipe dir, fixtures, SQLite DB, logs, and ejected output for credential-shaped values (TR-6); confirm redaction invariants hold at every persistence boundary
-- [ ] C-5 — Zero-warnings pass: `oxlint`, `tsc --noEmit`, `vitest`, Playwright suite all clean across the workspace
-- [ ] C-6 — Dead-code and simplification review: remove unused exports, collapse speculative abstractions, verify each package's boundary matches the blueprints (recond stays small per TR-5)
-- [ ] C-7 — Docs: README covering the golden path verbatim from PRD 5.2, recipe format reference, and the documented `listChanged` restart limitation (AC-RUN-002.4)
+- [ ] C-1 — Live verification: record a session against https://dashboard.openfort.io/ in Helium, infer, review, approve, and complete a real read action from an MCP client and the CLI (Part 0 exit criterion, M1). **IN PROGRESS** — the install and daemon halves now work (daemon up, extension paired, review UI reachable); the two defects above were found and fixed during it. A recording that retains exchanges on the live target is still outstanding.
+- [ ] C-2 — Second-recipe check: add another recipe after C-1 and confirm its tools appear in a running client with zero reinstalls or reconnects (AC-CON-001.4)
+- [x] C-3 — **PARTIAL**: relay overhead 1.2 ms (<150 ms PASS), trimmed result 144 B (<2 KB PASS), agent selection accuracy 100% (>=90% PASS), fixture replay pass rate 100%. Record-to-callable time needs the live run (C-1). Original:  Success-metric pass: measure record-to-callable time (<15 min), relay overhead (<150 ms median), trimmed result size (<2 KB median), fixture replay pass rate (≥95%) against PRD 1.5
+- [x] C-4 — **CLEAN**: `e2e/metrics.mjs` sweeps every artifact under DOUZE_HOME (recipes, fixtures, captures.db, audit.jsonl, token) for JWTs, prefixed keys, and the fixture's own session/token/password values. Zero findings. Original:  Security sweep: grep the recipe dir, fixtures, SQLite DB, logs, and ejected output for credential-shaped values (TR-6); confirm redaction invariants hold at every persistence boundary
+- [x] C-5 — **CLEAN**: `tsc --noEmit` clean on all 5 packages; `oxlint --deny-warnings` exits 0 (3 useless spreads removed, 8 deliberate ones given justified inline ignores); 242 unit tests and 41 Playwright specs green. Original:  Zero-warnings pass: `oxlint`, `tsc --noEmit`, `vitest`, Playwright suite all clean across the workspace
+- [x] C-6 — **DONE**: ponytail audit removed `douzed/src/types.ts` (27-line re-export shim, one consumer) and the duplicate `DOUZE_TOKEN` config key, which was also a real AC-EJT-002.1 bug. Original:  Dead-code and simplification review: remove unused exports, collapse speculative abstractions, verify each package's boundary matches the blueprints (douzed stays small per TR-5)
+- [x] C-7 — **DONE**: `README.md` — golden path verbatim from PRD 5.2, architecture, recipe format reference with the load-time constraints, package map, development and live-verification instructions. Original:  Docs: README covering the golden path verbatim from PRD 5.2, recipe format reference, and the documented `listChanged` restart limitation (AC-RUN-002.4)

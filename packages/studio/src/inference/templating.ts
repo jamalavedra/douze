@@ -1,4 +1,11 @@
-import type { Exchange } from '@recon/shared'
+import type { Exchange } from '@douze/shared'
+
+/**
+ * The Endpoint Template parameter a page-supplied path credential fills. One name, because a
+ * recipe targets one API and its project/tenant key appears in every path that carries one.
+ * Defined here rather than in `api.ts` to keep this module a leaf: `api → engine → templating`.
+ */
+export const PATH_CREDENTIAL_PARAM = 'project_key'
 
 /**
  * REQ-INF-001 — requests that differ only by identifier collapse into one Endpoint Template,
@@ -78,12 +85,37 @@ function firstDifference(a: string[], b: string[]): number | null {
 function toGroup(cluster: Cluster): EndpointGroup {
   const varying = cluster.varying ?? soleObservationParameter(cluster)
   if (varying === null) {
-    return { method: cluster.method, path: `/${cluster.segments.join('/')}`, params: [], exchanges: cluster.exchanges }
+    return { ...templated(cluster.segments), method: cluster.method, exchanges: cluster.exchanges }
   }
   const name = nameParameter(cluster, varying)
   const segments = cluster.segments.map((seg, i) => (i === varying ? `{${name}}` : seg))
-  return { method: cluster.method, path: `/${segments.join('/')}`, params: [name], exchanges: cluster.exchanges }
+  // `templated` returns no params by design — the path credential it inserts is filled by the
+  // page, not the caller, so it stays out of the input schema.
+  return {
+    method: cluster.method,
+    path: templated(segments).path,
+    params: [name],
+    exchanges: cluster.exchanges,
+  }
 }
+
+/**
+ * A redacted segment is not an address. A project key in the path is a credential by shape, so
+ * redaction replaced it — and a recipe carrying `/v1/project/apikey/«redacted:string:44»/origins`
+ * called a URL that exists nowhere, which the API answered "Invalid API key format".
+ *
+ * It becomes a parameter the PAGE fills at call time (see `authFrom` and the relay's
+ * `credentialContributions`), not one the caller supplies: an agent cannot know a project's key.
+ * The parameter is deliberately left out of `params`, which is what feeds the input schema.
+ */
+function templated(segments: string[]): { path: string; params: string[] } {
+  const replaced = segments.map((segment) => (isRedacted(segment) ? `{${PATH_CREDENTIAL_PARAM}}` : segment))
+  return { path: `/${replaced.join('/')}`, params: [] }
+}
+
+/** The placeholder as it survives a round trip through `new URL()`, which percent-encodes it. */
+const isRedacted = (segment: string): boolean =>
+  segment.includes('«redacted:') || segment.includes('%C2%ABredacted')
 
 /**
  * A single-observation endpoint has nothing to diff against, so `POST /orders/1044/cancel` would

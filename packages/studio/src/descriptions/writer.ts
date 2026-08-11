@@ -1,4 +1,4 @@
-import { findSurvivingSecrets, redactBody, redactHeaders, type SideEffect, type Tool } from '@recon/shared'
+import { findSurvivingSecrets, redactBody, redactHeaders, type SideEffect, type Tool } from '@douze/shared'
 import type { Candidate, JsonSchema } from '../types.js'
 import { addressesOneRecord, plural, singular } from '../inference/templating.js'
 import { objectFrom } from './naming.js'

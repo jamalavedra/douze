@@ -1,4 +1,4 @@
-import { Tool, type AnnotationSpan, type Exchange, type UiProvenance } from '@recon/shared'
+import { Tool, type AnnotationSpan, type Exchange, type UiProvenance } from '@douze/shared'
 import type { Candidate, JsonSchema } from '../types.js'
 import { describeSync, descriptionInput } from '../descriptions/writer.js'
 import { disambiguate, nameCandidate } from '../descriptions/naming.js'
@@ -97,12 +97,17 @@ function omitRequired(schema: JsonSchema): JsonSchema {
 
 function graphqlCandidate(op: ReturnType<typeof splitOperations>[number], spans: AnnotationSpan[]): Candidate {
   const { operation, document, path, exchanges } = op
-  // AC-INF-004.4 — a 200 carrying `errors` never contributes to the response contract.
+  /**
+   * AC-INF-004.4 — a 200 carrying `errors` is a FAILED exchange and contributes to no part of
+   * schema inference, input included. A rejected call is precisely the one whose variables are
+   * wrong: letting it through demotes every field it omitted to optional, so the tool would
+   * advertise that an agent may reproduce the exact request the server refused.
+   */
   const successful = exchanges.filter((e) => !hasGraphqlErrors(e))
   const contractSource = successful.length > 0 ? successful : []
 
   // AC-INF-004.2 — the input schema comes from the observed `variables` object.
-  const inputSchema = withRawParam(inferSchema(exchanges.map(graphqlVariables)))
+  const inputSchema = withRawParam(inferSchema(contractSource.map(graphqlVariables)))
   const responses = contractSource.map((e) => e.response_body)
   const payloadPath = graphqlPayloadPath(responses)
   const outputSchema = inferSchema(responses.map((body) => resolvePath(body, payloadPath)))

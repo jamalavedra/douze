@@ -1,5 +1,5 @@
-import { ReconError, type RelayResponse } from '@recon/shared'
-import type { SurfaceTool } from '@recon/recond'
+import { DouzeError, type RelayResponse } from '@douze/shared'
+import type { SurfaceTool } from '@douze/douzed'
 import { DaemonHttpError, type DaemonClient } from './daemon-client.js'
 import { fromDaemon, type DaemonErrorBody } from './errors.js'
 import { shapeResult, type Shaped } from './shape.js'
@@ -26,14 +26,14 @@ export interface CallOptions {
 
 /**
  * #RelayClient — builds the call, waits it out, and shapes the answer. It owns none of the
- * guards: rate limiting, destructive confirmation, and degradation all live in recond so they
+ * guards: rate limiting, destructive confirmation, and degradation all live in douzed so they
  * cannot be bypassed by calling the daemon directly (blueprint 3.3).
  */
 export class RelayClient {
   constructor(private readonly daemon: DaemonClient) {}
 
   async call(surface: SurfaceTool, args: Record<string, unknown>, options: CallOptions = {}): Promise<CallResult> {
-    const ceiling = options.ceilingMs ?? Number(process.env['RECON_CALL_CEILING_MS'] ?? DEFAULT_CEILING_MS)
+    const ceiling = options.ceilingMs ?? Number(process.env['DOUZE_CALL_CEILING_MS'] ?? DEFAULT_CEILING_MS)
     const started = Date.now()
     const ticker = options.onProgress
       ? setInterval(() => void options.onProgress?.(Date.now() - started), PROGRESS_INTERVAL_MS)
@@ -44,7 +44,7 @@ export class RelayClient {
         this.post(surface, args, ceiling),
         ceiling,
         () =>
-          new ReconError(
+          new DouzeError(
             'timeout',
             `Tool "${surface.qualified_name}" was cancelled after ${Math.round((Date.now() - started) / 1000)}s without returning; the configured ceiling is ${Math.round(ceiling / 1000)}s.`,
             { tool: surface.qualified_name, elapsed_ms: Date.now() - started, ceiling_ms: ceiling },
@@ -79,7 +79,7 @@ export class RelayClient {
   }
 }
 
-function withCeiling<T>(work: Promise<T>, ms: number, onTimeout: () => ReconError): Promise<T> {
+function withCeiling<T>(work: Promise<T>, ms: number, onTimeout: () => DouzeError): Promise<T> {
   let timer: NodeJS.Timeout
   return Promise.race([
     work.finally(() => clearTimeout(timer)),
