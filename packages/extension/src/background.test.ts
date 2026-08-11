@@ -1034,6 +1034,109 @@ describe('a call in flight when the socket drops (T-015.8)', () => {
   })
 })
 
+/**
+ * WO-016 — a hosted assistant's write was approved once, at review time, and could then be made
+ * silently and forever: the only notification a call could produce was `session_expired`, and the
+ * audit ring is seen by whoever opens a page. Not a per-call prompt — that is the control users
+ * switch off — but a signal that arrives while the loop is still running.
+ */
+describe('a change made by a hosted assistant (WO-016)', () => {
+  const WRITES = { 'attach:relay': { ...RELAY, allow_writes: true } }
+
+  it('notifies on a write it ran, collapses a burst of them, and stays quiet for reads', async () => {
+    const socket = await attach(WRITES, 'relay.test')
+    await approveShop()
+    const quiet = fake.notifications.length
+
+    socket.deliver(callFrame('w1', 'shop_create_order', { item: 'lamp' }))
+    await settle()
+    expect(resultFor(socket, 'w1')?.['error']).toBeUndefined()
+    expect(fake.notifications).toHaveLength(quiet + 1)
+    expect(fake.notifications.at(-1)?.message).toContain('shop_create_order')
+    expect(fake.notifications.at(-1)?.message).toContain('app.test')
+
+    // A loop is one notice a minute, not one per call: the rest are counted for the next one.
+    for (const id of ['w2', 'w3', 'w4']) socket.deliver(callFrame(id, 'shop_create_order', { item: 'lamp' }))
+    await settle()
+    expect(fake.notifications).toHaveLength(quiet + 1)
+
+    // Reading is what a hosted assistant does all day and is not what this exists for.
+    socket.deliver(callFrame('r1', 'shop_list_orders', {}))
+    await settle()
+    expect(resultFor(socket, 'r1')?.['error']).toBeUndefined()
+    expect(fake.notifications).toHaveLength(quiet + 1)
+  })
+
+  it('says nothing about a write it refused, so a lying host cannot fill the notification centre', async () => {
+    const socket = await attach({ 'attach:relay': RELAY }, 'relay.test')
+    await approveShop()
+    const quiet = fake.notifications.length
+
+    socket.deliver(callFrame('w1', 'shop_create_order', { item: 'lamp' }))
+    await settle()
+    expect(failure(socket, 'w1').code).toBe('trust_refused')
+    expect(fake.notifications).toHaveLength(quiet)
+  })
+})
+
+/**
+ * WO-016 — two reconnection behaviours that had no test at all: a dial that never attached must
+ * wait out its backoff, and a socket that has gone silent must be closed rather than left OPEN.
+ */
+describe('staying reachable across a bad host (T-015.8)', () => {
+  const relaySockets = (): FakeSocket[] => FakeSocket.opened.filter((socket) => socket.url.includes('relay.test'))
+
+  it('waits out its backoff before re-dialling a host that never attached', async () => {
+    // Only `Date` is faked, so `settle()` and every other real timer still run normally; the
+    // backoff is a `Date.now()` comparison, which is exactly what has to move.
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      await bootWorker({ 'attach:relay': RELAY })
+      expect(relaySockets()).toHaveLength(1)
+      // Never accepted, so this is a dial that failed rather than a host that dropped.
+      relaySockets()[0]?.drop()
+      await settle()
+
+      fake.onAlarm.emit({ name: 'douze-attach' })
+      await settle()
+      // The alarm fires every 30 s whatever happens; without the backoff this is a dial every tick
+      // at a host that is refusing the connection.
+      expect(relaySockets()).toHaveLength(1)
+
+      vi.setSystemTime(Date.now() + 31_000)
+      fake.onAlarm.emit({ name: 'douze-attach' })
+      await settle()
+      expect(relaySockets()).toHaveLength(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  /**
+   * A host that goes away without a FIN leaves the socket OPEN, `connect()` reads OPEN as healthy,
+   * and the extension is unreachable until Chrome evicts the worker — which is the state the
+   * watchdog exists to prevent and nothing tested. Driven with a 20 ms heartbeat rather than fake
+   * timers, so the real `setTimeout` in a real booted worker is what fires.
+   */
+  it('closes a socket that has gone silent, and dials a fresh one on the next alarm', async () => {
+    await bootWorker({ 'attach:relay': RELAY })
+    const socket = dialled('relay.test') as FakeSocket
+    socket.accept()
+    await settle()
+    socket.deliver({ type: 'welcome', heartbeat_ms: 20 })
+    await settle()
+    expect(socket.readyState).toBe(1)
+
+    // 2.5 heartbeats of nothing at all — no ping, no pong, no close.
+    await new Promise((resolve) => setTimeout(resolve, 120))
+    expect(socket.readyState).toBe(3)
+
+    fake.onAlarm.emit({ name: 'douze-attach' })
+    await settle()
+    expect(relaySockets().at(-1)).not.toBe(socket)
+  })
+})
+
 describe('a host that refuses the pairing (T-015.8/12)', () => {
   /**
    * A 1008 from a bridge port is the word of a peer that has proved nothing — binding one of

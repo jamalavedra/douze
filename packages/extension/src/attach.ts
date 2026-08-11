@@ -11,7 +11,7 @@ import {
   type RelayRequest,
   type RelayResponse,
 } from '@douze/shared'
-import { AuditLog, RateLimiter, attachedSurface, runToolCall, type AuditEntry } from './guards.js'
+import { AuditLog, RateLimiter, attachedSurface, runToolCall, siteOf, type AuditEntry } from './guards.js'
 import type { SurfaceTool } from './recipes.js'
 
 /**
@@ -42,6 +42,8 @@ const BACKOFF_MAX_MS = 240_000
 /** No frame at all for this many heartbeats and the socket is half-open rather than idle. */
 const SILENCE_FACTOR = 2.5
 const DEFAULT_HEARTBEAT_MS = 20_000
+/** WO-016 — the shortest gap between two "your assistant changed something" notifications. */
+const WRITE_NOTICE_MS = 60_000
 
 export const RELAY_KEY = 'attach:relay'
 export const BRIDGE_KEY = 'attach:bridge'
@@ -292,6 +294,10 @@ class Attachment {
         exposed: this.manager.expose[trust],
       },
     )
+    // WO-016 — only a call that actually ran, and only from a hosted assistant. A refusal changed
+    // nothing on the target, and notifying on one would hand any host that can reach this socket a
+    // way to fill the user's notification centre by asking for tools it knows will be refused.
+    if (trust === 'remote' && outcome.error === undefined) this.manager.noteRemoteWrite(name)
     if (this.socket !== socket || socket.readyState !== 1) return
     this.send(socket, { type: 'tool.result', id, ...outcome })
   }
@@ -377,6 +383,8 @@ class Manager {
    * costs a notification up to 30 seconds; deciding early cries wolf every single rotate.
    */
   private pendingRefusal: string | null = null
+  /** When the last remote-write notice went out, and how many writes have happened since. */
+  private writeNotice = { at: 0, since: 0 }
 
   constructor(private readonly deps: AttachDeps) {}
 
@@ -452,6 +460,39 @@ class Manager {
 
   pushSurface(): void {
     for (const attachment of this.attachments.values()) attachment.pushSurface()
+  }
+
+  /**
+   * WO-016 — a hosted assistant just changed something in one of the user's accounts, and until
+   * this nothing told them. Writes are approved once, at review time, and callable for as long as
+   * the link lives; the audit ring records every call and is seen only by someone who opens a page.
+   *
+   * Non-blocking on purpose. A confirmation prompt per call is the control that gets switched off
+   * in the first week, and a user who has turned it off is worse protected than one who sees a
+   * notification seconds after a write they did not expect — which is the point: not consent, but
+   * the chance to notice and pull the link before the loop runs a hundred more.
+   *
+   * **Collapsed by time, not by count**: the first write notifies at once and the next 60 seconds
+   * of them are counted instead, so an agent in a loop produces one notice a minute naming how many
+   * ran, and the fixed notification id means Chrome replaces the old one rather than stacking. The
+   * ceiling is honest: a burst that stops inside the window has its tail reported by the next write
+   * rather than by a timer, because a timer in a service worker does not survive eviction.
+   */
+  noteRemoteWrite(tool: string): void {
+    const entry = this.deps.surface().find((candidate) => candidate.qualified_name === tool)
+    if (!entry || entry.tool.side_effect === 'read') return
+    this.writeNotice.since += 1
+    const now = Date.now()
+    if (now - this.writeNotice.at < WRITE_NOTICE_MS) return
+    const collapsed = this.writeNotice.since - 1
+    this.writeNotice = { at: now, since: 0 }
+    this.deps.notify(
+      'douze-remote-write',
+      'Your hosted assistant changed something',
+      `It ran ${tool} on ${siteOf(entry.base_url)}` +
+        (collapsed === 0 ? '.' : `, and ${collapsed} more changes since the last notice.`) +
+        ' Open Douze to see every call it has made.',
+    )
   }
 
   async pinBridge(secret: string): Promise<void> {
