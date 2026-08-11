@@ -1,9 +1,9 @@
 import { test, expect, type Page } from '@playwright/test'
-import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { FixtureApp, Douzed, REPO, launchHelium, waitFor } from '../harness.js'
+import { FixtureApp, Douzed, McpClient, REPO, launchHelium, waitFor } from '../harness.js'
 
 /**
  * COV_CON_001 — the Claude Desktop connector, and the property that makes it a one-time act.
@@ -77,48 +77,6 @@ interface Manifest {
     mcp_config: { command: string; args: string[]; env?: Record<string, string> }
   }
   user_config?: unknown
-}
-
-/** A minimal JSON-RPC-over-stdio client, so the assertion is on the wire, not on an abstraction. */
-class McpClient {
-  private buffer = ''
-  private nextId = 1
-  private readonly pending = new Map<number, (value: unknown) => void>()
-  readonly notifications: string[] = []
-
-  constructor(readonly child: ChildProcess) {
-    this.child.stdout!.on('data', (chunk) => {
-      this.buffer += String(chunk)
-      for (const line of this.buffer.split('\n').slice(0, -1)) {
-        if (!line.trim()) continue
-        const message = JSON.parse(line) as { id?: number; method?: string; result?: unknown }
-        if (message.method) this.notifications.push(message.method)
-        else if (message.id !== undefined) this.pending.get(message.id)?.(message.result)
-      }
-      this.buffer = this.buffer.slice(this.buffer.lastIndexOf('\n') + 1)
-    })
-  }
-
-  request(method: string, params: Record<string, unknown> = {}): Promise<any> {
-    const id = this.nextId++
-    return new Promise((resolve) => {
-      this.pending.set(id, resolve)
-      this.child.stdin!.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`)
-    })
-  }
-
-  async initialize(): Promise<void> {
-    await this.request('initialize', {
-      protocolVersion: '2025-06-18',
-      capabilities: { tools: { listChanged: true } },
-      clientInfo: { name: 'e2e-desktop', version: '1.0.0' },
-    })
-    this.child.stdin!.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`)
-  }
-
-  kill(): void {
-    this.child.kill()
-  }
 }
 
 test.describe('COV_CON_001: Claude Desktop connector', () => {
@@ -271,7 +229,7 @@ test.describe('COV_CON_001: Claude Desktop connector', () => {
     expect(statSync(bundlePath).mtimeMs).toBe(bundleBefore.mtimeMs)
     expect(statSync(bundlePath).size).toBe(bundleBefore.size)
     // And the client was told rather than left to poll (AC-RUN-002.2).
-    expect(client.notifications).toContain('notifications/tools/list_changed')
+    expect(client.notified).toContain('notifications/tools/list_changed')
   })
 })
 

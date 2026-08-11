@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { beforeEach, describe, expect, it } from 'vitest'
 import { Recipe, parseRecipe, serializeRecipe } from '@douze/shared'
-import { StudioSession, baseUrlFrom, type StudioConfig } from './api.js'
+import { StudioSession, authFrom, baseUrlFrom, type StudioConfig } from './api.js'
 import { reviewPage } from './app.js'
 import { readFixtures, toFixture, writeFixture } from './fixtures.js'
 import { mergeRecipe } from './merge.js'
@@ -162,7 +162,12 @@ describe('REQ-REC-004 fixtures', () => {
   })
 
   // AC-REC-004.2
-  it('fails the write when a credential-shaped value survives redaction', () => {
+  /**
+   * Redaction now catches a credential by its shape as well as its key name, so the fixture is
+   * written with a placeholder instead of the write being refused outright. TR-6 is unchanged —
+   * the value never reaches disk — but a site that returns API keys can be recorded at all.
+   */
+  it('redacts a credential-shaped value under an innocuous key rather than refusing the write', () => {
     const exchange = makeExchanges([
       {
         url: '/api/handoff',
@@ -170,9 +175,17 @@ describe('REQ-REC-004 fixtures', () => {
       },
     ])[0]
     if (!exchange) throw new Error('no exchange')
-    expect(() => writeFixture(join(home, 'fixtures'), 'orders', toFixture('get_handoff', exchange))).toThrow(
-      /credential-shaped value/,
-    )
+    const path = writeFixture(join(home, 'fixtures'), 'orders', toFixture('get_handoff', exchange))
+    const written = readFileSync(join(home, 'fixtures', path), 'utf8')
+    expect(written).not.toContain('eyJhbGciOi')
+    expect(written).toContain('«redacted:')
+  })
+
+  /** The write gate is defence in depth and still refuses anything handed to it unredacted. */
+  it('refuses to write a fixture assembled without redaction', () => {
+    const raw = { tool: 'get_handoff', request: { method: 'GET', path: '/api/handoff', headers: {} },
+      response: { status: 200, body: { handoff: 'sk_live_9f8e7d6c5b4a39281706' } } }
+    expect(() => writeFixture(join(home, 'fixtures'), 'orders', raw as never)).toThrow(/credential-shaped value/)
     expect(existsSync(join(home, 'fixtures', 'orders', 'get_handoff.json'))).toBe(false)
   })
 
@@ -286,33 +299,187 @@ describe('the review page', () => {
   it('speaks plain English rather than the vocabulary of the recipe format', () => {
     const page = html()
     for (const copy of [
-      'What Claude can do on ',
-      'Douze watched you use this site and worked out what it could do for you.',
-      'Reads information',
-      'Makes changes',
-      'Deletes things',
+      'Choose what to keep',
+      'Everything that only reads is selected. Turn on anything that makes changes.',
+      'Look things up',
+      'Make changes',
+      'Remove things',
       'Only seen once',
       'Name is a guess',
       'Not checked yet',
-      'Claude will be able to do this on your real account.',
-      'Turn these on',
-      'Nothing selected',
-      'Open Claude Desktop and ask it. Nothing else to install.',
-      'Technical details',
+      'Changes your account.',
+      'Removes data. Asks first.',
+      'Select all',
+      'Clear',
+      'Keep ',
+      'skill',
+      'Details',
     ]) {
       expect(page).toContain(copy)
     }
     // The developer vocabulary the old screen used must not be back on the first screen.
     expect(page).not.toContain('Approve')
     expect(page).not.toContain('confidence')
+    // Nor may it name one client: the tools it turns on are for whichever MCP client is asking.
+    expect(page).not.toContain('Claude')
   })
 
-  it('carries a category word and a marker glyph, never colour alone', () => {
+  /**
+   * AC-REC-002.3 — the bulk API refuses to enable a write or a destructive tool, and the page must
+   * not route around it. Pre-selecting everything meant one click on the primary button approved a
+   * delete nobody had read.
+   */
+  it('seeds the selection with read-only skills, leaving the rest for a deliberate click', () => {
+    expect(html()).toContain('if (candidate.bulk_approvable) chosen.add(candidate.name)')
+  })
+
+  it('explains each consequence with words rather than colour alone', () => {
     const page = html()
-    expect(page).toMatch(/mark: '\\u00b7'/)
-    expect(page).toContain('--safe')
-    expect(page).toContain('--changes')
-    expect(page).toContain('--danger')
+    expect(page).toContain('Read-only.')
+    expect(page).toContain('Creates or updates data.')
+    expect(page).toContain('Always asks first.')
+  })
+
+  it('selects every inferred skill by default and offers clear/select-all controls', () => {
+    const page = html()
+    expect(page).toContain('for (const candidate of state.candidates) chosen.add(candidate.name)')
+    expect(page).toContain("byId('all').addEventListener")
+    expect(page).toContain("byId('none').addEventListener")
+  })
+
+  it('keeps motion subtle and respects reduced-motion preferences', () => {
+    const page = html()
+    expect(page).toContain('details[open] > :not(summary)')
+    expect(page).toContain('.primary:not(:disabled):hover')
+    expect(page).toContain('@media (prefers-reduced-motion: reduce)')
+  })
+
+  it('uses the shared 12 mark and cyan/red palette', () => {
+    const page = html()
+    expect(page).toContain('class="brand-icon"')
+    expect(page).toContain('data:image/png;base64,')
+    expect(page).toContain('--brand-blue: #00bce8')
+    expect(page).toContain('--brand-red: #f31b1b')
+  })
+})
+
+/**
+ * The recipe used to take the schema default — `cookie` — for every site, so a dashboard that
+ * authenticates with a bearer token produced tools that all failed with "you have been signed
+ * out" on their first call. The capture already knows better: the extension reports where the page
+ * kept each credential it sent.
+ */
+describe('auth derived from the capture (AC-EXE-001.3)', () => {
+  const captured = () =>
+    makeExchanges([
+      {
+        url: 'https://api.example.com/v1/players',
+        request_headers: { authorization: 'Bearer x', accept: 'application/json' },
+        response_body: { data: [{ id: 'p1' }] },
+      },
+    ]).map((e) => ({
+      ...e,
+      page_origin: 'https://dashboard.example.com',
+      credentials: [
+        { header: 'Authorization', expression: 'JSON.parse(localStorage.getItem("sb-auth")).access_token', prefix: 'Bearer ' },
+      ],
+    }))
+
+  it('emits a page_state source and the origin that must run the call', () => {
+    const auth = authFrom(captured())
+    expect(auth).toMatchObject({
+      mode: 'browser_relay',
+      page_origin: 'https://dashboard.example.com',
+      credential_source: [
+        {
+          kind: 'page_state',
+          header: 'Authorization',
+          prefix: 'Bearer ',
+          expression: 'JSON.parse(localStorage.getItem("sb-auth")).access_token',
+        },
+      ],
+    })
+  })
+
+  /**
+   * The trap that cost the live run: `mergeRecipe` builds on the existing recipe, so a recipe
+   * first written with `cookie` kept it through every re-recording, and every call kept failing.
+   */
+  it('updates the auth of a recipe that already exists', () => {
+    const config = { recipeName: 'again', baseUrl: 'https://api.example.com', paths: { recipes: join(home, 'recipes'), fixtures: join(home, 'fixtures') } }
+    // First save: a capture with no page-supplied credential, so the schema default stands.
+    const first = StudioSession.fromExchanges(config, {
+      exchanges: makeExchanges([{ url: 'https://api.example.com/v1/players', response_body: { data: [] } }]),
+      annotations: [],
+    })
+    first.approveReads()
+    expect(readFileSync(first.save().path, 'utf8')).toContain('kind: cookie')
+
+    // Recorded again, this time with the token located in the page.
+    const second = StudioSession.fromExchanges(config, { exchanges: captured(), annotations: [] })
+    second.approveReads()
+    const written = readFileSync(second.save().path, 'utf8')
+    expect(written).toContain('kind: page_state')
+    expect(written).toContain('page_origin: https://dashboard.example.com')
+    expect(written).not.toContain('kind: cookie')
+  })
+
+  it('leaves a cookie-authenticated capture on the schema default', () => {
+    expect(authFrom(makeExchanges([{ url: '/api/orders', response_body: { data: [] } }]))).toBeUndefined()
+  })
+
+  it('reaches the saved recipe, so the relay is told at call time', () => {
+    const session = StudioSession.fromExchanges(
+      { recipeName: 'derived', baseUrl: 'https://api.example.com', paths: { recipes: join(home, 'recipes'), fixtures: join(home, 'fixtures') } },
+      { exchanges: captured(), annotations: [] },
+    )
+    session.approveReads()
+    const written = readFileSync(session.save().path, 'utf8')
+    expect(written).toContain('page_state')
+    expect(written).toContain('page_origin: https://dashboard.example.com')
+    // A location, never a value — which is what lets it live in a committed file.
+    expect(written).not.toContain('Bearer x')
+  })
+})
+
+/**
+ * A redacted path segment becomes `{project_key}`, filled by the page rather than the caller — so
+ * a capture with no credential hint for it (every HAR import: they carry `credentials: []`) saved
+ * a tool the relay could only ever call as `/v1/project/apikey//origins`.
+ */
+describe('a path credential nothing can fill (AC-EXE-001.3)', () => {
+  const redactedPath = [
+    {
+      url: 'https://api.example.com/v1/project/apikey/«redacted:string:44»/origins',
+      response_body: { data: [{ id: 'o1' }] },
+    },
+  ]
+
+  const session = (extra: (e: ReturnType<typeof makeExchanges>[number]) => typeof e = (e) => e) =>
+    StudioSession.fromExchanges(
+      {
+        recipeName: 'keyless',
+        baseUrl: 'https://api.example.com',
+        paths: { recipes: join(home, 'recipes'), fixtures: join(home, 'fixtures') },
+      },
+      { exchanges: makeExchanges(redactedPath).map(extra), annotations: [] },
+    )
+
+  it('degrades the candidate and says why when the capture carries no hint', () => {
+    const [candidate] = session().candidates
+    expect(candidate?.tool.request.path).toContain('{project_key}')
+    expect(candidate?.tool.flags.degraded).toBe(true)
+    expect(candidate?.tool.flags.degraded_reason).toContain('project_key')
+  })
+
+  it('leaves it alone when the page was seen supplying the key', () => {
+    const [candidate] = session((e) => ({
+      ...e,
+      page_origin: 'https://dashboard.example.com',
+      credentials: [{ segment: 4, expression: 'localStorage.getItem("pk")', prefix: '' }],
+    })).candidates
+    expect(candidate?.tool.request.path).toContain('{project_key}')
+    expect(candidate?.tool.flags.degraded).toBe(false)
   })
 })
 

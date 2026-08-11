@@ -4,6 +4,7 @@ import { disambiguate, nameCandidate } from './descriptions/naming.js'
 import { createModelClient, modelFromEnv } from './descriptions/model-client.js'
 import { buildModelPayload, buildPrompt, describe as writeDescription, describeSync, descriptionInput, limitSentences } from './descriptions/writer.js'
 import { makeExchanges } from './testing.js'
+import { findSurvivingSecrets } from '@douze/shared'
 import type { ModelClient } from './descriptions/model-client.js'
 
 const sentences = (text: string) => text.split(/(?<=[.!?])\s+/).filter((s) => s.trim().length > 0)
@@ -171,7 +172,13 @@ describe('AC-INF-006.4 only redacted payloads reach a model', () => {
     expect(seen[0]).toContain('«redacted:')
   })
 
-  it('fails closed when a credential-shaped value survives key-based redaction', () => {
+  /**
+   * A credential under a key no list names is redacted by value shape before the payload is
+   * assembled, so the gate has nothing to refuse and the description still gets written. It used
+   * to throw — which is safe but useless: it meant a developer console, whose API returns keys by
+   * design, produced no descriptions at all.
+   */
+  it('redacts a credential-shaped value the key list misses, and still builds the payload', () => {
     const candidate = infer({
       exchanges: makeExchanges([
         {
@@ -183,7 +190,15 @@ describe('AC-INF-006.4 only redacted payloads reach a model', () => {
       ]),
     })[0]
     if (!candidate) throw new Error('no candidate')
-    expect(() => buildModelPayload(candidate)).toThrow(/credential-shaped value/)
+    const payload = buildModelPayload(candidate)
+    // TR-6 still holds: what a model sees carries the shape, never the value.
+    expect(JSON.stringify(payload)).not.toContain('eyJhbGciOi')
+    expect(JSON.stringify(payload)).toContain('«redacted:')
+  })
+
+  /** The gate is defence in depth, and still fires on anything that reaches it unredacted. */
+  it('refuses to send a payload that was never redacted', () => {
+    expect(findSurvivingSecrets({ handoff: 'sk_live_9f8e7d6c5b4a39281706' })).toEqual(['$.handoff'])
   })
 
   it('keeps the description when the model fails, rather than emitting nothing', async () => {

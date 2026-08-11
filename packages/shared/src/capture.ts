@@ -12,6 +12,19 @@ export const UiProvenance = z.object({
 /** AC-CAP-002.3 — how the exchange reached us, and whether its body is trustworthy. */
 export const CaptureSource = z.enum(['main_world', 'web_request', 'debugger', 'har'])
 
+/**
+ * AC-EXE-001.3 — how the page supplies a credential: read `expression` in the page, prefix it, and
+ * send it as `header`. Carries no secret, which is what lets it live in a committed recipe.
+ */
+export const CredentialHint = z.object({
+  /** The header the value was sent in, when it was sent as one. */
+  header: z.string().optional(),
+  /** The path segment index it occupied, when it was part of the URL instead. */
+  segment: z.number().int().nonnegative().optional(),
+  expression: z.string(),
+  prefix: z.string().default(''),
+})
+
 export const Exchange = z.object({
   id: z.string(),
   session_id: z.string(),
@@ -36,6 +49,17 @@ export const Exchange = z.object({
   background: z.boolean().default(false),
   provenance: UiProvenance.optional(),
   source: CaptureSource,
+  /**
+   * AC-EXE-001.3 — the origin of the PAGE that issued this request, which is not the target when a
+   * dashboard calls its API host. Execution needs it: the token lives in that origin's storage and
+   * the site's CORS is configured for requests coming from it.
+   */
+  page_origin: z.string().optional(),
+  /**
+   * Where the page kept the credentials it sent, discovered in the page at capture time. Locations
+   * only — a storage key and a header name, never a value.
+   */
+  credentials: z.array(CredentialHint).default([]),
 })
 
 /** REQ-CAP-007 — a note covering every exchange captured since the previous note. */
@@ -132,13 +156,24 @@ export function isInferableContentType(contentType: string | undefined): boolean
 /**
  * AC-CAP-004 — the single filter both live capture and HAR import apply, so the two paths
  * cannot drift apart (AC-CAP-006.1).
+ *
+ * `origins` is the *target* filter, and it is null for live capture. A dashboard almost never
+ * serves its own API: `dashboard.example.com` calls `api.example.com`, and requiring the target
+ * to be the page's origin dropped every request that mattered — a recording of a real site
+ * retained nothing at all. Live capture does not need this check, because it only ever sees
+ * requests the recorded tab itself made: the interceptor is registered on the granted origin, the
+ * oracle filters on the recording tab's id, and the debugger is attached to that one tab. The
+ * noise list and the content type are what remain.
+ *
+ * A HAR is different — it is a recording of the whole browser, with no tab to attribute a
+ * request to — so importing one still names the origins it may keep.
  */
 export function shouldCapture(
   candidate: { url: string; origin: string; response_content_type?: string | undefined },
-  origins: string[],
+  origins: readonly string[] | null,
   noise: NoiseConfig = defaultNoise(),
 ): boolean {
-  if (!origins.includes(candidate.origin)) return false
+  if (origins !== null && !origins.includes(candidate.origin)) return false
   if (isNoiseHost(candidate.url, noise)) return false
   return isInferableContentType(candidate.response_content_type)
 }

@@ -70,17 +70,21 @@ try {
   const popup = await context.newPage()
   await popup.goto(`chrome-extension://${extensionId}/popup.html`)
   await popup.waitForSelector('#disconnected:not([hidden])')
-  check('popup renders its heading', (await popup.textContent('#disconnected h1'))?.includes('Douze'), true)
-  // With no daemon there is nothing to pair with, so the popup asks for Claude Desktop and
-  // offers no controls at all — no port, no token, no start button. It names the connector too:
-  // a user who installed the extension first has Claude Desktop open already.
+  check('popup renders its brand', (await popup.textContent('.brand'))?.includes('Douze'), true)
+  check('popup renders the 12 mark', await popup.getAttribute('.brand img', 'src'), 'icon128.png')
+  // With no daemon there is nothing to pair with, so the popup asks the user to open the app they
+  // added Douze to, and offers no controls at all — no port, no token, no start button. It names
+  // the clients and the connector file, because a user who installed the extension first has one
+  // of those apps open already. It cannot name only Claude: the service runs in whichever client
+  // they installed it in.
   check(
-    'popup names Claude Desktop and the connector, rather than the daemon',
+    'popup names the app to open and the connector, rather than the daemon',
     [
-      (await popup.textContent('#disconnected'))?.includes("can't reach Claude Desktop"),
+      (await popup.textContent('#disconnected'))?.includes("can't reach its background service"),
+      (await popup.textContent('#disconnected'))?.includes('Cursor'),
       (await popup.textContent('#disconnected'))?.includes('Douze.mcpb'),
     ],
-    [true, true],
+    [true, true, true],
   )
   check('popup offers no way to start while unpaired', await popup.isVisible('#watch'), false)
   check('popup asks for no port or token', await popup.locator('#port, #token').count(), 0)

@@ -28,6 +28,121 @@ declare global {
   const queue: PageEvent[] = []
   let bridgeReady = false
 
+  /**
+   * REQ-EXE-001 / AC-EXE-001.3 — where the page keeps the credential it just sent.
+   *
+   * A dashboard that authenticates with a bearer token records perfectly and then fails on its
+   * first tool call: the recipe knows the header existed but not where its value comes from, and
+   * redaction has (correctly) removed the value itself. This runs in the page, where the value is
+   * still in hand, and reports the LOCATION only — a storage key, never the secret.
+   *
+   * Located once per distinct value: a dashboard sends the same token on every request, and
+   * scanning storage per request would be paid hundreds of times for one answer.
+   */
+  const located = new Map<string, string | null>()
+
+  function locate(value: string): string | null {
+    if (value.length < 16) return null
+    const cached = located.get(value)
+    if (cached !== undefined) return cached
+    const found = search(value)
+    located.set(value, found)
+    return found
+  }
+
+  function search(value: string): string | null {
+    for (const [name, store] of [
+      ['localStorage', window.localStorage],
+      ['sessionStorage', window.sessionStorage],
+    ] as const) {
+      let keys: string[]
+      try {
+        keys = Object.keys(store)
+      } catch {
+        continue // storage can throw outright when the page is sandboxed or cookies are blocked
+      }
+      for (const key of keys) {
+        let raw: string | null
+        try {
+          raw = store.getItem(key)
+        } catch {
+          continue
+        }
+        if (raw === null) continue
+        if (raw === value) return `${name}.getItem(${JSON.stringify(key)})`
+        // Supabase and most auth SDKs park the token inside a JSON blob under one key.
+        const field = fieldHolding(raw, value)
+        if (field) return `JSON.parse(${name}.getItem(${JSON.stringify(key)})).${field}`
+      }
+    }
+    return null
+  }
+
+  /** The dotted path of a string field equal to `value`, one object deep plus one nesting. */
+  function fieldHolding(raw: string, value: string): string | null {
+    if (!raw.startsWith('{') && !raw.startsWith('[')) return null
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(raw)
+    } catch {
+      return null
+    }
+    if (parsed === null || typeof parsed !== 'object') return null
+    for (const [key, entry] of Object.entries(parsed as Record<string, unknown>)) {
+      if (entry === value) return key
+      if (entry !== null && typeof entry === 'object') {
+        for (const [inner, deep] of Object.entries(entry as Record<string, unknown>)) {
+          if (deep === value) return `${key}.${inner}`
+        }
+      }
+    }
+    return null
+  }
+
+  /**
+   * The header carries a prefix as often as not (`Bearer ey…`), and the recipe stores the prefix
+   * separately so the relay can rebuild the header around a freshly read value.
+   */
+  /**
+   * A project key in the URL — `/v1/project/apikey/<key>/origins` — is a credential by shape, so
+   * redaction replaces it and the recipe would carry a placeholder no server recognises. Located
+   * here by segment index, so inference can turn that segment into a parameter the page fills.
+   */
+  function credentialsInPath(url: string): { segment: number; expression: string; prefix: string }[] {
+    const found: { segment: number; expression: string; prefix: string }[] = []
+    let parsed: URL
+    try {
+      parsed = new URL(url, window.location.href)
+    } catch {
+      return found
+    }
+    const segments = parsed.pathname.split('/')
+    for (const [index, segment] of segments.entries()) {
+      if (!segment) continue
+      const expression = locate(decodeURIComponent(segment))
+      if (expression) found.push({ segment: index, expression, prefix: '' })
+    }
+    return found
+  }
+
+  function credentialsIn(headers: Record<string, string>): { header: string; expression: string; prefix: string }[] {
+    const found: { header: string; expression: string; prefix: string }[] = []
+    for (const [header, value] of Object.entries(headers)) {
+      if (typeof value !== 'string' || !value) continue
+      const space = value.indexOf(' ')
+      const candidates: [string, string][] =
+        space > 0 && space < 12 ? [[value.slice(space + 1), value.slice(0, space + 1)], [value, '']] : [[value, '']]
+      for (const [token, prefix] of candidates) {
+        const expression = locate(token)
+        if (expression) {
+          found.push({ header, expression, prefix })
+          break
+        }
+      }
+    }
+    return found
+  }
+
   // Ordering between the MAIN and ISOLATED scripts at the same runAt is not guaranteed, so
   // buffer until the bridge announces itself rather than assuming it is already listening.
   function post(payload: PageEvent): void {
@@ -183,7 +298,10 @@ declare global {
       }
     })()
 
-    void bodyPromise.then((body) => post({ type: 'request', ...meta, body }))
+    const credentials = [...credentialsIn(meta.headers), ...credentialsInPath(meta.url)]
+    void bodyPromise.then((body) =>
+      post({ type: 'request', ...meta, body, ...(credentials.length ? { credentials } : {}) }),
+    )
 
     return nativeFetch.call(this as never, req).then(
       (res) => {
@@ -264,6 +382,7 @@ declare global {
   NativeXHR.prototype.send = function douzeSend(this: TrackedXhr, body?: Document | XMLHttpRequestBodyInit | null) {
     const state = this[STATE]
     if (state) {
+      const credentials = [...credentialsIn(state.headers), ...credentialsInPath(state.url)]
       post({
         type: 'request',
         kind: 'xhr',
@@ -271,6 +390,7 @@ declare global {
         url: state.url,
         method: state.method,
         headers: state.headers,
+        ...(credentials.length ? { credentials } : {}),
         body: describeXhrBody(body),
         t: state.t,
       })

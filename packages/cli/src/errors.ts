@@ -15,12 +15,12 @@ export interface DaemonErrorBody {
 }
 
 /**
- * This one surfaces inside the Claude chat window, to someone who did not install a daemon and
+ * This one surfaces inside the chat window, to someone who did not install a daemon and
  * has no terminal open. It names the one action that fixes it and nothing else — a second option
  * they cannot perform is not a fallback, it is a reason to stop reading.
  */
 const RELAY_UNREACHABLE_HINT =
-  "Douze's background service isn't running, so nothing can run right now. Quit Claude Desktop and open it again."
+  "Douze's background service isn't running, so nothing can run right now. Quit the app you added Douze to and open it again."
 
 /** The cause travels in the detail: "ECONNREFUSED 127.0.0.1:8787" is not a sentence for a reader. */
 export const relayUnreachable = (cause?: string): DouzeError =>

@@ -10,6 +10,7 @@ import {
 } from '@douze/shared'
 import { readFixtures, toFixture, writeFixture, type Fixture } from './fixtures.js'
 import { infer, type InferenceInput } from './inference/engine.js'
+import { PATH_CREDENTIAL_PARAM } from './inference/templating.js'
 import { mergeRecipe, setField, MERGEABLE_FIELDS, type MergeReport } from './merge.js'
 import { studioPaths, type StudioPaths } from './paths.js'
 import { approve, approveReads, unapprove, type BulkResult } from './promotion.js'
@@ -71,7 +72,14 @@ export class StudioSession {
   }
 
   static fromExchanges(config: StudioConfig, input: InferenceInput): StudioSession {
-    return new StudioSession(config, infer(input))
+    // AC-EXE-001.3 — the auth block is derived from the capture unless the caller pinned one. A
+    // recipe whose auth is the schema default (`cookie`) sends no credential at all, which is why
+    // a token-authenticated dashboard recorded, inferred and saved cleanly and then failed on its
+    // first call with "you have been signed out".
+    const auth = config.auth ?? authFrom(input.exchanges)
+    const candidates = infer(input)
+    degradeUnfillablePathCredentials(candidates, auth)
+    return new StudioSession(auth ? { ...config, auth } : config, candidates)
   }
 
   find(name: string): Candidate {
@@ -152,8 +160,20 @@ export class StudioSession {
       ? mergeRecipe(existing, fresh, { fixtures: this.fixturesByTool() })
       : { recipe: this.buildRecipe(fresh), preserved: [], retained: [], conflicts: [], added: fresh.map((t) => t.name) }
 
+    /**
+     * AC-EXE-001.3 — auth follows the capture, on every save and not just the first.
+     *
+     * `mergeRecipe` builds on the EXISTING recipe, which carries the auth block it was written
+     * with. Re-recording a site therefore never updated it: a recipe first saved with the schema
+     * default `cookie` kept sending no credential no matter how many times the site was recorded
+     * again, and every call failed with "you have been signed out". A capture that shows no
+     * page-supplied credential derives nothing and leaves whatever is there — including a
+     * hand-written block — alone.
+     */
+    const recipe = this.config.auth ? { ...report.recipe, auth: { ...report.recipe.auth, ...this.config.auth } } : report.recipe
+
     const path = join(this.paths.recipes, `${this.config.recipeName}.yaml`)
-    writeFileSync(path, serializeRecipe(Recipe.parse(report.recipe)), { mode: 0o600 })
+    writeFileSync(path, serializeRecipe(Recipe.parse(recipe)), { mode: 0o600 })
     return { ...report, path, fixtures: written }
   }
 
@@ -190,6 +210,71 @@ export class StudioSession {
 }
 
 /** The origin most exchanges came from, which is the target's base URL. */
+/**
+ * The auth block a capture implies: every distinct credential the page was seen supplying, plus
+ * the origin whose tab has to run the call for those credentials to be readable and for the
+ * target's CORS to accept it.
+ *
+ * Returns undefined when the capture shows no page-supplied credential — a cookie-authenticated
+ * site, where the schema default is already right.
+ */
+export function authFrom(exchanges: Exchange[]): Partial<Recipe['auth']> | undefined {
+  type Source = { kind: 'page_state'; expression: string; header?: string; param?: string; prefix: string }
+  const sources = new Map<string, Source>()
+  const pageOrigins = new Map<string, number>()
+
+  for (const exchange of exchanges) {
+    if (exchange.page_origin) pageOrigins.set(exchange.page_origin, (pageOrigins.get(exchange.page_origin) ?? 0) + 1)
+    for (const hint of exchange.credentials ?? []) {
+      // Keyed by destination: one Authorization per recipe, however many times it was observed,
+      // and one parameter per expression for the values that live in the URL.
+      if (hint.header) {
+        const key = `header:${hint.header.toLowerCase()}`
+        if (!sources.has(key)) {
+          sources.set(key, { kind: 'page_state', expression: hint.expression, header: hint.header, prefix: hint.prefix })
+        }
+      } else if (hint.segment !== undefined) {
+        const key = `param:${hint.expression}`
+        if (!sources.has(key)) {
+          sources.set(key, { kind: 'page_state', expression: hint.expression, param: PATH_CREDENTIAL_PARAM, prefix: '' })
+        }
+      }
+    }
+  }
+  if (sources.size === 0) return undefined
+
+  // The busiest page origin: a capture can touch more than one, and the one that issued most of
+  // the traffic is the one whose session the tools belong to.
+  const [busiest] = [...pageOrigins.entries()].sort((a, b) => b[1] - a[1])
+  return {
+    mode: 'browser_relay',
+    credential_source: [...sources.values()],
+    ...(busiest ? { page_origin: busiest[0] } : {}),
+  }
+}
+
+/**
+ * A redacted path segment becomes `{project_key}`, deliberately left out of the input schema
+ * because the page fills it at call time, not the caller. When the capture carries no credential
+ * hint to fill it — every HAR import does, they have no `credentials` at all — the saved tool is
+ * uncallable: the relay substitutes nothing and the request goes to `/v1/project/apikey//origins`.
+ * Marked degraded with the reason, which is the same channel a Doctor Run uses, rather than saved
+ * as though it worked.
+ */
+function degradeUnfillablePathCredentials(candidates: Candidate[], auth: Partial<Recipe['auth']> | undefined): void {
+  const fillable = (auth?.credential_source ?? []).some(
+    (source) => source.kind === 'page_state' && source.param === PATH_CREDENTIAL_PARAM,
+  )
+  if (fillable) return
+  for (const candidate of candidates) {
+    if (!candidate.tool.request.path.includes(`{${PATH_CREDENTIAL_PARAM}}`)) continue
+    candidate.tool.flags.degraded = true
+    candidate.tool.flags.degraded_reason =
+      `the ${PATH_CREDENTIAL_PARAM} in this path was redacted, and this capture shows no page ` +
+      `credential that could fill it — record the site again from the tab that uses it`
+  }
+}
+
 export function baseUrlFrom(exchanges: Exchange[]): string {
   const counts = new Map<string, number>()
   for (const exchange of exchanges) counts.set(exchange.origin, (counts.get(exchange.origin) ?? 0) + 1)

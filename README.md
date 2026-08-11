@@ -1,15 +1,16 @@
 # Douze
 
-**Use a website for five minutes. Afterwards, Claude can use it too.**
+**Use a website for five minutes. Afterwards, your AI assistant can use it too.**
 
 You already have accounts on things — an order dashboard, a support inbox, a billing console, an
-internal admin page. Claude can't touch any of them. Douze fixes that by watching you do the work
-once.
+internal admin page. Claude, Cursor, VS Code — none of them can touch any of it. Douze fixes that
+by watching you do the work once.
 
 Open the site you're signed into, click **Watch this site**, then do what you normally do: click
 around, open a few orders, file a ticket. Click **Done**. Douze shows you a list of the actions it
-saw — "list orders", "create ticket", "refund an order" — and you tick the ones Claude is allowed
-to do. From then on you can type *"refund order 1042"* into Claude and it happens, in your account.
+saw — "list orders", "create ticket", "refund an order" — and you tick the ones you want allowed.
+From then on you can type *"refund order 1042"* into your assistant and it happens, in your
+account.
 
 ## What Douze does not do
 
@@ -18,11 +19,11 @@ This is the part worth reading carefully.
 - **Nothing is scraped.** Douze doesn't read your screen or copy your data. It notices which
   buttons the site presses behind the scenes and remembers the shape of them.
 - **Your password is never involved.** You never type it into Douze. Douze never asks for one.
-- **No cookie or login is stored, copied, or sent anywhere.** Not to us, not to Claude, not to
+- **No cookie or login is stored, copied, or sent anywhere.** Not to us, not to the assistant, not to
   disk.
 - **Requests run inside the browser you're already signed into.** That's why no login is needed:
   the site sees an ordinary request from an ordinary tab, exactly as if you'd clicked the button
-  yourself. When you sign out, Claude loses access too.
+  yourself. When you sign out, the assistant loses access too.
 - **Everything stays on your computer.** What Douze learns is a file in your home folder. There is
   no account, no server, and no upload.
 - **Nothing runs without your say-so.** Actions are off until you turn them on, one at a time.
@@ -40,7 +41,10 @@ Go to the [latest release](https://github.com/OWNER/douze/releases/latest) and d
   `douze-extension`. Put it somewhere you won't delete it, like your Documents folder.
 - **`Douze.mcpb`**
 
-> **Maintainer:** no release has been tagged yet, so that link 404s and the two files don't exist
+(There is a third file, `douze-server.zip`. You only need it for apps other than Claude Desktop —
+see step 3.)
+
+> **Maintainer:** no release has been tagged yet, so that link 404s and the files don't exist
 > for anyone to download. Replace `OWNER` with the GitHub account this repo lives under, push a
 > `v*` tag to build them, then delete this note.
 
@@ -63,28 +67,48 @@ Double-click **`Douze.mcpb`**. Claude Desktop opens, shows you what it does, and
 There is nothing to fill in and nothing to copy. If a box asks you to type something, you have the
 wrong file.
 
+**Using something else?** Douze is an ordinary MCP server, so Cursor, VS Code, Claude Code and
+Windsurf can all use it. Download `douze-server.zip` from the same release, unzip it somewhere
+you won't delete, and run one line in a terminal:
+
+```sh
+node ~/Documents/douze-server/index.js mcp add --agent cursor
+```
+
+Swap `cursor` for `vscode`, `claude-code`, `claude-desktop`, or `windsurf`, then restart that app.
+Any other client: run the same command with its name and Douze prints the block to paste into its
+MCP settings. Douze can be added to several apps at once — they share one recording and one set of
+actions.
+
 ### 4. Teach it a site
 
 1. Open a site you're signed into and go to the page you actually use.
 2. Click the Douze icon, then **Watch this site**.
-3. Use the site normally for a few minutes. Do the thing you'd want Claude to do — look up an
+3. Use the site normally for a few minutes. Do the thing you'd want done for you — look up an
    order, file a ticket, whatever it is. Doing it twice or three times helps Douze get it right.
 4. Click **Done**. A review page opens.
-5. You'll see a plain-English list of what Douze saw. Turn on the ones you want Claude to be able
-   to do, and leave the rest off.
+5. You'll see a plain-English list of what Douze saw. Turn on the ones you want allowed, and
+   leave the rest off.
 
-Now ask Claude. The new abilities show up in a running conversation within a few seconds — you
+Now just ask. The new abilities show up in a running conversation within a few seconds — you
 don't have to restart anything.
 
 ## When something goes wrong
 
-- **Claude says it can't reach Douze.** Quit Claude Desktop and open it again.
+- **Douze says it can't reach its background service.** Quit the app you added Douze to and
+  open it again. Douze's service runs inside that app, so at least one of them has to be open.
 - **Nothing was recorded.** Douze only watches the tab you clicked **Watch this site** on. Make
-  sure you're on that tab, and that you clicked **Done** rather than closing the window.
-- **It worked last month and now it doesn't.** The site changed. Douze tells Claude the action is
+  sure you're on that tab, that you clicked **Done** rather than closing the window, and that the
+  site actually loaded something while you watched — clicking around a page it has already cached
+  may make no requests at all. Moving between pages forces fresh ones.
+- **It asks permission for a site you didn't name.** Expected. A dashboard almost never serves its
+  own data: `dashboard.example.com` asks `api.example.com`, and Douze has to be allowed to reach
+  that second address before it can do anything there. Say no and the actions are still recorded;
+  they just won't run.
+- **It worked last month and now it doesn't.** The site changed. Douze reports the action as
   broken instead of quietly returning the wrong thing. Record the site again to fix it.
-- **You want it to stop.** Turn actions off on the review page, or remove Douze from Claude
-  Desktop's connector list. Nothing of yours is left behind.
+- **You want it to stop.** Turn actions off on the review page, or remove Douze from the app's
+  connector list. Nothing of yours is left behind.
 
 ---
 
@@ -95,16 +119,22 @@ Everything below is about building and extending Douze, not using it.
 ## Architecture
 
 ```
-  Chrome ext ──ws──▶ douzed ◀──http/loopback──┬── douze --mcp   (stdio, launched by Claude)
+  Chrome ext ──ws──▶ douzed ◀──http/loopback──┬── douze --mcp   (stdio, launched by any MCP client)
                      │                        └── douze jira create-issue   (shell)
                      └── review UI (http://127.0.0.1:8787/review/:sessionId)
 ```
 
-`douzed` is the only always-on process. It binds a loopback port — 8787, or the next free one up to
-8791 if something else already holds it — holds the extension's WebSocket, owns the recipe registry,
-enforces every call guard, and serves the review UI. It is started by whichever client needs it
-first — normally the MCP server that Claude Desktop launches — and outlives that client. The
-extension probes the same range, so a busy 8787 (RStudio Server's default) doesn't strand it.
+`douzed` binds a loopback port — 8787, or the next free one up to 8791 if something else already
+holds it — holds the extension's WebSocket, owns the recipe registry, enforces every call guard,
+and serves the review UI. The extension probes the same range, so a busy 8787 (RStudio Server's
+default) doesn't strand it.
+
+It runs **inside the first `douze --mcp` process that needs it**; every later client probes the
+range and adopts that one, so several clients share one registry. It is not spawned as a detached
+child: an MCP client's "Node" is not always a node binary we can spawn — Claude Desktop runs
+connectors in an Electron UtilityProcess whose `execPath` is the Claude app itself — and re-exec
+there starts nothing at all. A terminal is the exception: `douze start` still detaches, because a
+one-shot command must not own the daemon's lifetime.
 
 `/pair` is how the extension gets the install token without anyone copying it by hand. It answers
 only a `chrome-extension://` origin — a web page can neither forge that header nor read the reply —
@@ -119,7 +149,27 @@ not code.
 
 Tools are **interpreted from recipes, not compiled into packages**. The MCP process registers tools
 dynamically at startup and re-registers them when a recipe changes, so an approved tool or an
-edited description reaches a running Claude session in seconds.
+edited description reaches a running session in seconds.
+
+### Redaction
+
+Two rules decide what may be written, and both run at every persistence boundary — the extension
+before an exchange leaves the browser, the capture store, the fixture writer, the audit log, and
+the payload sent to a description model:
+
+1. A **key** on the credential list — `authorization`, `cookie`, `password`, `api_key`, and the
+   rest — has its value replaced.
+2. A **value that looks like a credential** whatever it is called — a JWT, a `sk_`/`pk_`/`rk_`
+   prefixed key, a bearer prefix, a long high-entropy run — has its value replaced too.
+
+The second rule is not optional politeness. A developer console returns its own API keys under
+names like `publishableKey`, which no key list will ever contain; without it those values reach a
+write gate that refuses the whole exchange, and recording such a site silently retains nothing.
+Detection and removal share one test, so the gate and the redactor cannot disagree.
+
+The placeholder keeps the original type and length (`«redacted:string:28»`), so schema inference
+still sees a string of the right shape while the value itself is gone. `findSurvivingSecrets`
+remains as defence in depth for anything that reaches a boundary without being redacted first.
 
 ### The four properties
 
@@ -176,18 +226,20 @@ approved `destructive` tool must require a `confirm` parameter.
 
 ## CLI reference
 
-The consumer path uses none of these — the daemon starts itself and the review UI is a link. They
-exist for development and maintenance.
+The consumer path uses none of these — the client hosts the daemon and the review UI is a link.
+They exist for development and maintenance.
 
 ```sh
-douze start                          # start douzed in the background; reports one already running
+douze start                          # run douzed detached, so it outlives every client;
+                                     #   reports one already running
 douze stop                           # stop it
 douze status                         # daemon, extension, and tool-surface state
 douze sessions                       # list recorded capture sessions
 douze import <file.har> --name jira  # import a HAR as a capture session
 
 douze bundle                         # emit Douze.mcpb (see `pnpm bundle` below)
-douze mcp add --agent claude-code    # register with Claude Code
+douze mcp add --agent cursor         # register with cursor | vscode | claude-code |
+                                     #   claude-desktop | windsurf
 
 douze doctor jira                    # replay fixtures against the live target, report drift
 douze eject jira --out ./jira-tools  # emit a standalone incur package for one recipe
@@ -237,11 +289,12 @@ git tag v0.1.0 && git push origin v0.1.0
 |---|---|
 | `douze-extension.zip` | `packages/extension/dist`, zipped. Unzips to a `douze-extension` folder that Chrome loads unpacked. |
 | `Douze.mcpb` | The Claude Desktop connector bundle, from `pnpm bundle`. |
+| `douze-server.zip` | `packages/cli/dist`, zipped — the same MCP server, for clients that take a `{command, args}` config instead of a bundle. |
 
-To produce both locally without the CI round trip:
+To produce them locally without the CI round trip:
 
 ```sh
-pnpm release:local                    # pnpm build && pnpm bundle && pnpm pack:extension
+pnpm release:local                    # build, bundle, and zip both artifacts
 ```
 
 Both land at the repo root and are gitignored. Release notes are generated from the commits since
@@ -250,8 +303,8 @@ the previous tag; the workflow needs no secrets beyond the automatic `GITHUB_TOK
 ## Live verification
 
 ```sh
-node e2e/live/openfort.mjs            # read-only
-node e2e/live/openfort.mjs --writes   # also exercises approved write tools
+pnpm exec tsx e2e/live/openfort.mjs            # read-only
+pnpm exec tsx e2e/live/openfort.mjs --writes   # also exercises approved write tools
 ```
 
 Records a real session against a real authenticated dashboard, infers tools, approves reads, and

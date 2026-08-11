@@ -13,6 +13,16 @@ export interface CapturedBody {
   truncated?: boolean
 }
 
+/** AC-EXE-001.3 — where the page keeps a credential, discovered in the page, value never included. */
+export interface CredentialHint {
+  /** Sent as a header… */
+  header?: string
+  /** …or occupying this path segment index. */
+  segment?: number
+  expression: string
+  prefix: string
+}
+
 export interface RequestEvent {
   type: 'request'
   id: string
@@ -22,6 +32,8 @@ export interface RequestEvent {
   headers: Record<string, string>
   body: CapturedBody | null
   t: number
+  /** Present only when a header's value was found in the page's own storage. */
+  credentials?: CredentialHint[]
 }
 
 export interface ResponseEvent {
@@ -55,7 +67,6 @@ export type PageEvent = RequestEvent | ResponseEvent | FailureEvent | GestureEve
 
 export interface CaptureBatch {
   type: 'douze:capture'
-  frameUrl: string
   batch: PageEvent[]
 }
 
@@ -67,10 +78,17 @@ export type PopupCommand =
   | { type: 'douze:status' }
   /** AC-CAP-004.3 — additions to the bundled noise list, applied to subsequent sessions. */
   | { type: 'douze:noise'; hosts: string[] }
+  /**
+   * Open the review page for a finished session. The popup cannot do this itself: asking for a
+   * permission closes it, and a closed popup runs no continuation.
+   */
+  | { type: 'douze:review'; sessionId: string }
 
 export interface PopupStatus {
   session: { id: string; name: string; origins: string[] } | null
   count: number
+  /** Origins the running session has actually recorded traffic to — the relay's future targets. */
+  seenOrigins: string[]
   connected: boolean
   port: number
   token: string

@@ -276,7 +276,7 @@ export async function startDaemon(options: { port?: number } = {}): Promise<Daem
   })
 
   /**
-   * What Claude can already do on the origin the user is looking at — the extension popup's list.
+   * What is already set up on the origin the user is looking at — the extension popup's list.
    *
    * The popup reads this cross-origin, so it needs ACAO. Unlike /pair this stays behind the token
    * check, so the header only decides who may *read* an answer the caller already had to
@@ -360,9 +360,14 @@ export async function startDaemon(options: { port?: number } = {}): Promise<Daem
     socket.send(JSON.stringify({ type: 'welcome', heartbeat_ms: 20_000 }))
 
     socket.on('message', (raw) => {
-      // A throw in a ws listener becomes an uncaughtException and takes the daemon down. The
-      // leak gate in appendExchange throws BY DESIGN, so one refused write must never cost the
+      // A throw in a ws listener becomes an uncaughtException and takes the daemon down, and
+      // appendExchange throws by design on anything it cannot store — a malformed exchange, or a
+      // credential that reached the leak gate unredacted. One refused write must never cost the
       // relay (AC-RUN-003.1). Refuse the message, report it, keep serving.
+      //
+      // This line is the only trace a refusal leaves, and a detached daemon discards stderr —
+      // which is how a site whose every exchange was being refused looked identical to a site
+      // that made no requests at all. Worth remembering before trusting a silent capture.
       try {
         const parsed = ClientMessage.safeParse(JSON.parse(String(raw)))
         if (!parsed.success) {
@@ -381,7 +386,17 @@ export async function startDaemon(options: { port?: number } = {}): Promise<Daem
   // the default walks, and only reaches an ephemeral port once the whole range is held — at which
   // point the CLI and the connector still find it through douzed.json, but the extension cannot.
   const requested = options.port ?? (process.env['DOUZE_PORT'] ? Number(process.env['DOUZE_PORT']) : undefined)
-  const port = requested === undefined ? await listenInRange(server) : await listen(server, requested)
+  let port: number
+  try {
+    port = requested === undefined ? await listenInRange(server) : await listen(server, requested)
+  } catch (cause) {
+    // The MCP process hosts this and stays up afterwards, so a daemon that never bound must not
+    // leave a file watcher and an open database behind for the life of the client.
+    drift.stop()
+    await registry.stop()
+    store.close()
+    throw cause
+  }
   bound = port
   writeRuntime({ pid: process.pid, port, started_at: Date.now() })
 
@@ -394,8 +409,16 @@ export async function startDaemon(options: { port?: number } = {}): Promise<Daem
     close: async () => {
       drift.stop()
       await registry.stop()
+      // Every live socket, terminated by hand. `wss.close()` only stops new upgrades — an
+      // already-connected extension keeps its socket, `server.close()` waits for connections that
+      // will never end on their own, and the process hangs instead of exiting. `douze stop` then
+      // reports success while the daemon it "stopped" holds the port forever.
+      for (const client of wss.clients) client.terminate()
       wss.close()
       store.close()
+      // `server.close()` waits for every open connection, and an idle keep-alive one from the CLI
+      // or a review tab never closes on its own — so shutdown stalls until the client times out.
+      server.closeIdleConnections()
       await new Promise<void>((resolve) => server.close(() => resolve()))
     },
   }
@@ -469,13 +492,58 @@ const readBody = (req: import('node:http').IncomingMessage): Promise<Buffer> =>
     req.on('error', reject)
   })
 
-/** Walks the range the extension probes, then gives up on being findable rather than on running. */
+/**
+ * Walks the range the extension probes, then gives up on being findable rather than on running.
+ *
+ * A port held by another douzed ends the walk instead of pushing us one along it: two clients
+ * starting at the same instant both find nothing, both try 8787, and the loser would otherwise
+ * bind 8788 and run a second daemon with its own registry. Losing the bind means the winner is
+ * the daemon, and `hostOrAdopt` re-probes and talks to it.
+ *
+ * ponytail: a 250 ms probe, not a handshake. The winner's HTTP handler is attached before it
+ * binds, so it answers as soon as its loop is free; a slower answer falls through to the next
+ * port, which is the behaviour we had before. Make it a real handshake only if a duplicate
+ * daemon ever shows up in the wild.
+ */
 const listenInRange = async (server: import('node:http').Server): Promise<number> => {
   for (const candidate of PORT_RANGE) {
     const bound = await listen(server, candidate).catch(() => 0)
     if (bound > 0) return bound
+    if (await douzedOn(candidate)) throw new Error(`douzed is already running on port ${candidate}`)
   }
+  // Every port in the range is held by something that is not douzed. The daemon still runs, but
+  // the extension probes the range and nothing else, so it will never find this one — and that
+  // looks exactly like a broken install unless we say so.
+  process.stderr.write(
+    `douzed: ports ${PORT_RANGE[0]}-${PORT_RANGE.at(-1)} are all held by another process, so the ` +
+      `Chrome extension cannot find douzed. Free one of them, or start douzed with DOUZE_PORT set ` +
+      `to a port inside that range.\n`,
+  )
   return listen(server, 0)
+}
+
+/**
+ * Whether a *douzed* holds this port, as opposed to anything else that answers /health. RStudio
+ * Server defaults to 8787 and 200s on almost any path, and treating that as our own daemon aborted
+ * startup with "douzed is already running" on a port douzed had never touched. The body has to
+ * name itself, and a redirect is never followed: fetch follows by default, so an unrelated service
+ * bouncing /health to a login page that 200s would answer for it.
+ */
+const douzedOn = async (port: number): Promise<boolean> => {
+  try {
+    // The timeout is not optional: whatever holds the port may accept the connection and never
+    // answer — RStudio Server, a stalled process, a test squatting the range — and an unbounded
+    // fetch would hang the daemon's startup on it forever.
+    const res = await fetch(`http://127.0.0.1:${port}/health`, {
+      redirect: 'manual',
+      signal: AbortSignal.timeout(250),
+    })
+    if (!res.ok) return false
+    const body = (await res.json()) as Record<string, unknown>
+    return typeof body === 'object' && body !== null && 'ok' in body && 'extension_connected' in body
+  } catch {
+    return false
+  }
 }
 
 const listen = (server: import('node:http').Server, port: number): Promise<number> =>

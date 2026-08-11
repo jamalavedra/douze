@@ -56,6 +56,80 @@ export async function launchHelium(
   }
 }
 
+/** `douze --mcp` from source, the way every spec that is not testing the shipped bundle wants it. */
+export const spawnMcp = (home: string): ChildProcess =>
+  spawn(TSX, [join(REPO, 'packages/cli/src/bin.ts'), '--mcp'], {
+    env: { ...process.env, DOUZE_HOME: home },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  })
+
+/** A server-initiated message. `params` carries progress, which COV_CON_003 asserts on. */
+export interface Notification {
+  method: string
+  params?: { progressToken?: string | number; progress?: number; message?: string }
+}
+
+/**
+ * A minimal JSON-RPC-over-stdio MCP client, so connector assertions are on the wire rather than
+ * on an abstraction that could hide the handshake.
+ */
+export class McpClient {
+  private buffer = ''
+  private nextId = 1
+  private readonly pending = new Map<number, (value: unknown) => void>()
+  readonly notifications: Notification[] = []
+
+  constructor(readonly child: ChildProcess) {
+    this.child.stdout!.on('data', (chunk) => {
+      this.buffer += String(chunk)
+      for (const line of this.buffer.split('\n').slice(0, -1)) {
+        if (!line.trim()) continue
+        const message = JSON.parse(line) as { id?: number; result?: unknown } & Notification
+        if (message.method) this.notifications.push(message)
+        else if (message.id !== undefined) this.pending.get(message.id)?.(message.result)
+      }
+      this.buffer = this.buffer.slice(this.buffer.lastIndexOf('\n') + 1)
+    })
+  }
+
+  /** The methods seen, for a spec that only cares that a kind of notification arrived. */
+  get notified(): string[] {
+    return this.notifications.map((n) => n.method)
+  }
+
+  // oxlint-disable-next-line typescript/no-explicit-any -- a JSON-RPC result is whatever the method returns
+  request(method: string, params: Record<string, unknown> = {}): Promise<any> {
+    const id = this.nextId++
+    return new Promise((resolve) => {
+      this.pending.set(id, resolve)
+      this.child.stdin!.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`)
+    })
+  }
+
+  async initialize(): Promise<void> {
+    await this.request('initialize', {
+      protocolVersion: '2025-06-18',
+      capabilities: { tools: { listChanged: true } },
+      clientInfo: { name: 'e2e-connector', version: '1.0.0' },
+    })
+    this.child.stdin!.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`)
+  }
+
+  async tools(): Promise<string[]> {
+    return ((await this.request('tools/list')).tools as { name: string }[]).map((t) => t.name)
+  }
+
+  /** The description is where a degraded tool announces itself to a client (AC-RUN-001.5). */
+  async describe(name: string): Promise<string | undefined> {
+    const listed = (await this.request('tools/list')).tools as { name: string; description: string }[]
+    return listed.find((t) => t.name === name)?.description
+  }
+
+  kill(): void {
+    this.child.kill()
+  }
+}
+
 /** The fixture target app. Every spec asserts against what this server actually received. */
 export class FixtureApp {
   private process?: ChildProcess

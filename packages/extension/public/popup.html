@@ -4,17 +4,18 @@
     <meta charset="utf-8" />
     <title>Douze</title>
     <style>
-      /* Verbatim from the review page's :root — the popup and the review page are one product. */
+      /* The popup and review page share the same cyan/red brand palette. */
       :root {
         color-scheme: light dark;
-        --bg: light-dark(#ffffff, #16181c);
-        --fg: light-dark(#15171c, #f1f3f6);
-        --muted: light-dark(#565e6c, #a3abba);
-        --line: light-dark(#d9dce3, #363b45);
-        --accent: light-dark(#1a56c4, #86aaf7);
-        --safe: light-dark(#166a44, #6ec99c);
-        --changes: light-dark(#82500a, #e2a862);
-        --danger: light-dark(#a11f1f, #f28c8c);
+        --bg: light-dark(#ffffff, #080a0b);
+        --fg: light-dark(#080a0b, #ffffff);
+        --muted: light-dark(#596267, #aeb9bd);
+        --line: light-dark(#d8e5e8, #2a393e);
+        --accent: light-dark(#008bad, #56d9f5);
+        --brand-blue: #00bce8;
+        --safe: light-dark(#007d9e, #56d9f5);
+        --changes: light-dark(#d91b1b, #ff6b6b);
+        --danger: light-dark(#b70808, #ff6b6b);
       }
       * { box-sizing: border-box; }
       body {
@@ -26,6 +27,9 @@
         font: 13px/1.45 system-ui, sans-serif;
       }
       h1 { font-size: 15px; font-weight: 600; margin: 0 0 8px; }
+      .brand { align-items: center; display: flex; gap: 8px; margin-bottom: 14px; }
+      .brand img { height: 30px; object-fit: contain; width: 30px; }
+      .brand strong { font-size: 15px; }
       p { margin: 0 0 12px; }
       .lead { font-size: 13px; color: var(--muted); }
       .site { font-size: 17px; font-weight: 600; margin: 0 0 12px; word-break: break-all; }
@@ -50,8 +54,7 @@
         color: inherit;
         cursor: pointer;
       }
-      /* `--bg`, not white: the dark-mode accent is a light blue that white text disappears into. */
-      button.primary { border-color: transparent; background: var(--accent); color: var(--bg); font-weight: 600; }
+      button.primary { border-color: transparent; background: var(--brand-blue); color: #061014; font-weight: 600; }
       button.quiet { margin-top: 8px; padding: 4px 8px; width: auto; font-size: 11px; color: var(--muted); }
       :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
       .live { font-size: 11px; font-weight: 600; color: var(--danger); text-transform: uppercase; letter-spacing: 0.04em; }
@@ -79,22 +82,22 @@
   </head>
   <body>
     <main>
+      <header class="brand"><img src="icon128.png" alt="" /><strong>Douze</strong></header>
       <section id="disconnected" hidden>
-        <h1>Douze</h1>
         <p class="lead">
-          Douze can't reach Claude Desktop. Open Claude Desktop — and if you haven't added Douze to
-          it yet, install the Douze connector first (double-click Douze.mcpb).
+          Douze can't reach its background service. Open the app you added Douze to — Claude
+          Desktop, Cursor, VS Code — and try again. If you haven't added it to one yet, do that
+          first (in Claude Desktop, double-click Douze.mcpb).
         </p>
       </section>
 
       <section id="unsupported" hidden>
-        <h1>Douze</h1>
-        <p class="lead">Douze can't watch this page. Open the dashboard you want Claude to use, then click Douze again.</p>
+        <p class="lead">Douze can't watch this page. Open the dashboard you want to use, then click Douze again.</p>
       </section>
 
       <section id="ready" hidden>
         <p class="site" id="hostname"></p>
-        <label for="name">What should Claude call this site?</label>
+        <label for="name">What should this site be called?</label>
         <input id="name" type="text" autocomplete="off" />
         <button class="primary" id="watch">Watch this site</button>
         <!-- Chrome's own permission prompt fires on that click; this is the answer to it. -->

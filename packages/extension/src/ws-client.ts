@@ -19,11 +19,20 @@ export function backoffDelay(attempt: number, random: () => number = Math.random
 export class Outbox {
   private queue: ClientMessage[] = []
 
+  /**
+   * Called with the whole queue after every change. The queue lives in a service worker, which
+   * Chrome suspends whenever it goes idle — and a disconnected socket is exactly when it does —
+   * so the buffer has to be written somewhere that outlives the worker or the exchanges it was
+   * holding are gone with no trace.
+   */
+  onChange: (messages: ClientMessage[]) => void = () => {}
+
   constructor(private readonly limit = 2000) {}
 
   push(message: ClientMessage): void {
     this.queue.push(message)
     if (this.queue.length > this.limit) this.queue.splice(0, this.queue.length - this.limit)
+    this.onChange(this.snapshot())
   }
 
   /** Sends while `send` keeps succeeding; a refusal leaves the remainder queued in order. */
@@ -35,6 +44,7 @@ export class Outbox {
       this.queue.shift()
       sent += 1
     }
+    if (sent > 0) this.onChange(this.snapshot())
     return sent
   }
 
@@ -46,8 +56,11 @@ export class Outbox {
     return [...this.queue]
   }
 
+  /** What a respawned worker hands back: the persisted queue goes in front of anything new. */
   restore(messages: ClientMessage[]): void {
+    if (messages.length === 0) return
     this.queue = [...messages, ...this.queue].slice(-this.limit)
+    this.onChange(this.snapshot())
   }
 }
 

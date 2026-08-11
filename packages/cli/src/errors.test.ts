@@ -7,8 +7,10 @@ describe('error translation (REQ-CON-004)', () => {
     const error = relayUnreachable('connect ECONNREFUSED')
     const text = explain(error)
     expect(text).toMatch(/isn't running/)
-    // The reader is in a chat window: the fix has to be one they can perform from there.
-    expect(text).toMatch(/Quit Claude Desktop and open it again/)
+    // The reader is in a chat window: the fix has to be one they can perform from there, and it
+    // cannot name one client — Douze runs its service inside whichever one they installed it in.
+    expect(text).toMatch(/Quit the app you added Douze to and open it again/)
+    expect(text).not.toContain('Claude')
     expect(text).not.toContain('douze start')
     // The cause is still recoverable, just not in the sentence.
     expect(text).not.toContain('ECONNREFUSED')

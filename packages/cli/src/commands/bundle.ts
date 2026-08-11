@@ -60,7 +60,7 @@ function manifest(): Record<string, unknown> {
     name: 'douze',
     display_name: 'Douze',
     version: VERSION,
-    description: 'Use the websites you are already signed into as tools, without giving Claude your password.',
+    description: 'Use the websites you are already signed into as tools, without handing over your password.',
     author: { name: 'Douze' },
     server: {
       type: 'node',

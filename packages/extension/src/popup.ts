@@ -1,4 +1,4 @@
-import { reviewUrl, siteTools, type SiteTool } from './daemon.js'
+import { siteTools, type SiteTool } from './daemon.js'
 import type { PopupCommand, PopupStatus } from './messages.js'
 
 /**
@@ -56,7 +56,7 @@ let activeTab: chrome.tabs.Tab | undefined
 let activeOrigin = ''
 let activeHostname = ''
 /** The session that just stopped, so the review page can be opened after it is gone from status. */
-let finished: { id: string; name: string; count: number } | null = null
+let finished: { id: string; name: string; count: number; origins: string[] } | null = null
 
 const send = async (command: PopupCommand): Promise<PopupStatus & { error?: string }> =>
   (await chrome.runtime.sendMessage(command)) as PopupStatus & { error?: string }
@@ -77,7 +77,14 @@ function render(status: PopupStatus & { error?: string }): void {
   if (document.activeElement !== el.noise) el.noise.value = status.noiseHosts.join('\n')
 
   if (status.session) {
-    finished = { id: status.session.id, name: status.session.name, count: status.count }
+    // Captured while the session is live: once it stops, status carries none of it, and the
+    // origins are what the permission request on the next screen is made of.
+    finished = {
+      id: status.session.id,
+      name: status.session.name,
+      count: status.count,
+      origins: status.seenOrigins,
+    }
     el.watchingName.textContent = `Watching ${status.session.name}`
     el.count.textContent = countPhrase(status.count)
     return show('watching')
@@ -96,7 +103,7 @@ function renderFinished(status: PopupStatus): void {
   if (!session) return
   if (session.count === 0) {
     el.finishedText.textContent =
-      "Nothing was recorded. That usually means the site didn't load new data while Douze was watching — try again and click around the part you want Claude to handle."
+      "Nothing was recorded. That usually means the site didn't load new data while Douze was watching — try again and click around the part you want it to handle."
     el.finishedAction.textContent = 'Try again'
     el.finishedAction.onclick = (): void => {
       finished = null
@@ -106,9 +113,22 @@ function renderFinished(status: PopupStatus): void {
     return
   }
   el.finishedText.textContent = `Recorded ${session.count} things on ${session.name}.`
-  el.finishedAction.textContent = 'Set up what Claude can do →'
+  el.finishedAction.textContent = 'Set up what this site can do →'
   el.finishedAction.onclick = (): void => {
-    void chrome.tabs.create({ url: reviewUrl({ port: status.port, token: status.token }, session.id) })
+    // First statement, and nothing awaited before it: `permissions.request` needs the click that
+    // is running right now, and any await spends that gesture.
+    //
+    // The hosts a dashboard calls are rarely its own — `dashboard.example.com` asks
+    // `api.example.com` — and the relay replays inside a tab on the origin it is calling. Without
+    // this the actions would be recorded, approved, and then fail the first time they ran.
+    // Chrome prompts for nothing already granted, so a site that serves its own API sees no
+    // dialog at all.
+    void chrome.permissions.request({ origins: session.origins.map((origin) => `${origin}/*`) })
+    // Sent, not awaited, and never chained onto the line above: showing that prompt CLOSES this
+    // popup, so a continuation here would never run — which looked exactly like a dead button.
+    // The message is already on its way by then, and the worker opens the page whatever the
+    // user answers, because the recording is finished either way.
+    void chrome.runtime.sendMessage({ type: 'douze:review', sessionId: session.id })
   }
 }
 
@@ -119,10 +139,10 @@ const KIND_WORD: Record<SiteTool['side_effect'], string> = {
   destructive: 'Deletes things',
 }
 
-/** What Claude can already do here — shown quietly, so a repeat recording has context. */
+/** What is already set up here — shown quietly, so a repeat recording has context. */
 function renderTools(tools: SiteTool[]): void {
   el.toolsSummary.hidden = tools.length === 0
-  el.toolsSummary.textContent = `Claude can already do ${tools.length} things here`
+  el.toolsSummary.textContent = `${tools.length} things are already set up here`
   el.tools.replaceChildren(
     ...tools.slice(0, 5).map((tool) => {
       const item = document.createElement('li')
@@ -138,7 +158,14 @@ function renderTools(tools: SiteTool[]): void {
 
 el.watch.addEventListener('click', async () => {
   // First statement: any await before this consumes the user gesture and the request rejects.
-  const granted = await chrome.permissions.request({ origins: [`${activeOrigin}/*`] })
+  //
+  // `debugger` is optional and nothing else ever asks for it, so ticking the box used to start a
+  // session whose attach failed on a permission that had never been granted. It goes in this one
+  // request because a second one would need a second gesture, and there is only ever one click.
+  const granted = await chrome.permissions.request({
+    origins: [`${activeOrigin}/*`],
+    ...(el.useDebugger.checked ? { permissions: ['debugger'] } : {}),
+  })
   if (!granted) {
     return showError('Douze needs your permission to watch this site. Nothing is recorded until you allow it.')
   }

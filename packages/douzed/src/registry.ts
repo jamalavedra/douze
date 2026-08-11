@@ -13,6 +13,8 @@ export interface SurfaceTool {
   tool: Tool
   /** AC-EXE-001.3 — descriptor only; the extension resolves the actual value at call time. */
   credential_source: CredentialSource[]
+  /** The origin whose tab runs the call; absent means the target's own. */
+  page_origin?: string
   /** AC-RUN-001.5 — exposed but rejected at call time, with the reason named. */
   degraded: boolean
   degraded_reason?: string
@@ -26,6 +28,7 @@ export interface SurfaceToolLike {
   base_url: string
   tool: Pick<Tool, 'request'>
   credential_source?: CredentialSource[]
+  page_origin?: string
 }
 
 export interface RegistryState {
@@ -136,6 +139,7 @@ export class RecipeRegistry extends EventEmitter {
           base_url: recipe.target.base_url,
           tool,
           credential_source: recipe.auth.credential_source,
+          ...(recipe.auth.page_origin === undefined ? {} : { page_origin: recipe.auth.page_origin }),
           degraded: tool.flags.degraded || fixtureIssue !== null,
           ...(reason === undefined ? {} : { degraded_reason: reason }),
         })

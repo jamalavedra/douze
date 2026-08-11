@@ -25,7 +25,7 @@ export function register(cli: { command: (name: string, definition: unknown) => 
       if (process.env['DOUZE_FOREGROUND'] === '1') return runForeground(c.options.port, c.error)
 
       const running = readRuntime()
-      // Auto-start is the norm now — the connector starts the daemon when Claude Desktop
+      // Auto-start is the norm now — the MCP server hosts the daemon when its client
       // launches — so finding one already up is the expected outcome of asking for one, not a
       // failure. AC-RUN-003.2 still holds where it matters: `runForeground` refuses to bind a
       // second time, so this reports the first instance instead of racing it.

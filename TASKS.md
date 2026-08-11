@@ -1,9 +1,14 @@
 # Douze — Implementation Task Tracker
 
-Douze watches you use an authenticated dashboard for five minutes and turns the traffic into tools Claude Desktop, Claude Code, and the shell can call. Tool calls execute inside your signed-in browser via a relay, so no credential is ever extracted or stored. Recipes are versioned YAML interpreted at runtime, so a new target or an edited description reaches a running client in seconds with zero re-registration.
+Douze watches you use an authenticated dashboard for five minutes and turns the traffic into tools any MCP client — Claude Desktop, Claude Code, Cursor, VS Code, Windsurf — and the shell can call. Tool calls execute inside your signed-in browser via a relay, so no credential is ever extracted or stored. Recipes are versioned YAML interpreted at runtime, so a new target or an edited description reaches a running client in seconds with zero re-registration.
+
+> **File paths in the task list below are the layout this work was *planned* against.** Implementation
+> consolidated many of them (no `src/registry/`, `src/relay/`, `src/drift/` directories; one
+> `server.ts` in douzed; the review SPA is `packages/studio/src/app.ts` served by douzed). The
+> shipped layout is the package map in `README.md`; do not treat a path here as a file that exists.
 
 ```
-  Chrome ext ──ws──▶ douzed ◀──http/loopback──┬── douze --mcp   (stdio, launched by Claude)
+  Chrome ext ──ws──▶ douzed ◀──http/loopback──┬── douze --mcp   (stdio, launched by any MCP client)
                      │                        └── douze jira create-issue   (shell)
                      └── review UI ──▶ recipes/*.yaml ──▶ douzed
 ```
@@ -13,6 +18,7 @@ Consumer path — no terminal:
 ```
   load packages/extension/dist unpacked in chrome://extensions   # once, ever
   double-click Douze.mcpb                                        # once, ever — Claude Desktop
+  douze mcp add --agent cursor|vscode|claude-code|windsurf       # once, ever — any other client
 
   # click Watch this site, do the workflow, click Done
   # the extension links to the daemon's review UI; approve there
@@ -23,8 +29,8 @@ Developer commands:
 
 ```
   pnpm bundle                                  # build + emit ./Douze.mcpb
-  douze mcp add --agent claude-code            # once, ever — Claude Code
-  douze start | stop | status                  # the daemon, which otherwise auto-starts
+  douze mcp add --agent claude-code            # once, ever — any MCP client
+  douze start | stop | status                  # the daemon, which otherwise runs inside `--mcp`
   douze doctor jira                            # later: has the target drifted?
   douze eject jira --out ./jira-tools          # optional: an artifact you own
 ```
@@ -220,8 +226,8 @@ Build order #8 — closes the studio lane into approved recipes; needs WO-005/00
 
 ### Tasks
 
-- [x] T-007.1 — Studio server: Hono-served SPA on loopback + `douze studio` launch command, in `packages/studio/src/server.ts` + `packages/cli/src/commands/studio.ts`
-- [x] T-007.2 — Review SPA: candidate list with name, description, side-effect label, confidence, observation count, annotation, UI provenance, redacted sample exchange, in `packages/studio/app/`
+- [x] T-007.1 — Review UI on loopback. **Shipped differently:** there is no studio server and no `douze studio` command. douzed serves the review page itself (`/review/:sessionId` in `packages/douzed/src/server.ts`, loading `packages/studio/src/app.ts` lazily per ADR-006), and the extension links straight to it — which is what removed the terminal from the consumer path.
+- [x] T-007.2 — Review SPA: candidate list with name, description, side-effect label, confidence, observation count, annotation, UI provenance, redacted sample exchange, in `packages/studio/src/app.ts`
 - [x] T-007.3 — Edit API: inline edits to name/description/schema written to the recipe and marked `user_edited`, in `packages/studio/src/api.ts`
 - [x] T-007.4 — Promotion: bulk approve restricted to `read` candidates, individual approval required for `write`/`destructive`, required `confirm` parameter injected on destructive approval, unapproved candidates never exposed, in `packages/studio/src/promotion.ts`
 - [x] T-007.5 — Merge engine for re-inference: keep `user_edited` values and store inferred alternatives as suggestions, retain absent tools marked `unverified` with last-observed date, report fixture-invalidating schema conflicts without overwriting until resolved, in `packages/studio/src/merge.ts`
@@ -243,15 +249,15 @@ Build order #9 — completes the M1 end-to-end demo: bundle install, `mcp add`, 
 
 ### Tasks
 
-- [x] T-010.1 — `douze bundle`: emit `.mcpb` zip with `manifest.json` (`user_config` form fields for relay URL + install token) and the MCP server entry point, using Claude Desktop's bundled Node on macOS/Windows, in `packages/cli/src/commands/bundle.ts` + `packages/cli/mcpb/manifest.json`
+- [x] T-010.1 — `douze bundle`: emit `.mcpb` zip with `manifest.json` and the MCP server entry point, using Claude Desktop's bundled Node on macOS/Windows, in `packages/cli/src/commands/bundle.ts`. **Shipped differently:** the manifest is generated in that file (there is no checked-in `mcpb/manifest.json`) and carries **no `user_config`** — the server finds the daemon itself, so installing is a double-click and nothing else. An e2e assertion pins the absence.
 - [x] T-010.2 [P] — `douze mcp add --agent claude-code`: write a stdio entry invoking `douze --mcp`, report the scope written, reject reserved names (`workspace`, `claude-in-chrome`, `computer-use`, `Claude Preview`, `Claude Browser`) by suffixing, in `packages/cli/src/commands/mcp-add.ts`
-- [x] T-010.3 [P] — `douze skills add`: install skill files describing enabled recipes' tools with worked examples drawn from fixtures, in `packages/cli/src/commands/skills.ts`
+- [x] T-010.3 [P] — `douze skills add`: install skill files describing enabled recipes' tools. **Shipped differently:** provided by incur's built-in `skills` command over the same command tree, so there is no `commands/skills.ts` of ours.
 - [x] T-010.4 — Long-call survival: MCP progress notification at 60 s and every 60 s thereafter; configured ceiling cancels with a structured timeout naming tool + elapsed time, in `packages/cli/src/mcp.ts` (extends T-008.4/T-008.5)
 - [x] T-010.5 — The four client-facing error states (relay not running + how to start; extension disconnected naming target; session expired naming target + sign-in instruction; never retry, never headless-fallback), in `packages/cli/src/errors.ts`
 
 ### Verification
 
-- [x] V-COV_CON_001.1 — `douze bundle` → install `.mcpb` in a scratch Claude Desktop profile → settings form completed → server starts and `tools/list` returns the enabled recipes' tools (`e2e/connector/desktop.spec.ts`)
+- [x] V-COV_CON_001.1 — `douze bundle` → unzip the `.mcpb` → run its declared entry point with nothing configured (no settings form exists) → `tools/list` returns the enabled recipes' tools (`e2e/connector/desktop.spec.ts`)
 - [x] V-COV_CON_001.2 — Approving a tool in a new recipe makes it callable with no reinstall and no bundle rebuild (`e2e/connector/desktop.spec.ts`)
 - [x] V-COV_CON_002.1 — `douze mcp add --agent claude-code` against a scratch config writes a stdio entry invoking `douze --mcp`, the reported scope matches the changed file, `claude mcp list` reports connected (`e2e/connector/claude-code.spec.ts`)
 - [x] V-COV_CON_002.2 — Registration under `workspace` is suffixed and succeeds (`e2e/connector/claude-code.spec.ts`)
@@ -355,13 +361,14 @@ Build order #13 — M3; the explicitly degraded cron path, needing only the rela
 ## Post-review gap found in use
 
 The PRD 5.2 golden path names `douze studio`, `douze doctor <recipe>`, and `douze eject <recipe>`.
-All three were BUILT and tested (studio server, DriftWatcher behind `POST /doctor/:recipe`,
+All three were BUILT and tested (review UI, DriftWatcher behind `POST /doctor/:recipe`,
 `eject()`), but none was wired as a CLI command — the acceptance tests exercise the underlying
-functions and the daemon endpoint, not those entry points, so a green suite hid it. Now wired in
-`packages/cli/src/commands/studio.ts` and verified end to end: import a HAR -> `douze studio`
-infers 3 candidates and serves the review UI -> bulk approve takes only the 2 reads and skips the
-write (AC-REC-002.3) -> recipe and fixtures written -> `douze eject` emits 6 files with `incur` as
-the only runtime dependency. `doctor` is deliberately CLI-only (`mcp: false`): a Doctor Run issues
+functions and the daemon endpoint, not those entry points, so a green suite hid it. `doctor` and
+`eject` are now wired in `packages/cli/src/commands/maintenance.ts`. `douze studio` was NOT wired
+and no longer needs to be: douzed serves the review page and the extension links to it, so the
+review path never touches a terminal. Verified end to end: import a HAR -> the review UI infers 3
+candidates -> bulk approve takes only the 2 reads and skips the write (AC-REC-002.3) -> recipe and
+fixtures written -> `douze eject` emits 6 files with `incur` as the only runtime dependency. `doctor` is deliberately CLI-only (`mcp: false`): a Doctor Run issues
 live requests and can rewrite a recipe, which is a maintenance decision, not an agent's call.
 
 ## Review status (honest record)
@@ -380,10 +387,75 @@ live requests and can rewrite a recipe, which is a maintenance decision, not an 
   - **NOT FIXED, accepted:** rapid-click provenance can attach the later of two gestures when a second click lands between `fetch()` and request-body drain (MEDIUM-LOW); oracle/debugger drafts never set `tab_id` so AC-CAP-002.4 traffic is always `background` (LOW). Both are recorded here rather than silently carried.
   - Verified-fine by the reviewer, do not re-investigate: JSON-Schema→Zod for every shape inference emits, interceptor SSE/streaming passthrough, relay not recursing through the patched fetch, `describe()` failing closed on the leak gate, and every e2e "target saw nothing" claim reading the fixture server's own log.
 
+## Found in live use (2026-08-06)
+
+The first real install on a real machine — the C-1 run below — found six defects that every
+green suite had missed, because all six live outside what the suite exercised.
+
+- **FIXED: the connector never started.** `serveMcp` awaited a daemon before connecting its
+  transport, and got that daemon by re-exec'ing `process.execPath`. Claude Desktop runs MCP
+  servers in an Electron UtilityProcess: `execPath` is the Claude binary, there is no Node to
+  spawn, and the `runAsNode` fuse is off, so the spawn launched the app. The wait timed out at
+  45 s, `initialize` was never answered, and the process exited — the extension reported that it
+  could not reach anything, and `~/.douze` was never created. douzed now runs **inside** the
+  `douze --mcp` process (`hostOrAdopt` in `packages/cli/src/daemon-client.ts`), later clients
+  adopt it over loopback, and the transport connects before the daemon is touched. Covered by
+  `e2e/connector/cold-start.spec.ts`, which sets `DOUZE_ENTRY` to a nonexistent path so any
+  return to re-exec fails the suite.
+  *Why the suite missed it:* `desktop.spec.ts` starts a daemon through the harness first, so the
+  cold-start path — the only path a real user takes — was never run.
+- **FIXED: recording a real dashboard retained nothing.** `shouldCapture` required the target
+  origin to be in the session's origin list. `dashboard.openfort.io` calls `api.openfort.io`, so
+  every request that mattered was dropped and two recordings produced zero exchanges. Live
+  capture now passes `origins: null`: the recorded tab already scoped the request (interceptor
+  registered on the granted origin, oracle filtered on the tab id, debugger attached to that
+  tab), and the noise list plus the content type remain. The popup asks Chrome for permission on
+  the origins actually seen when the session ends, because the relay replays inside a tab on the
+  **target** origin; an ungranted origin now fails with a sentence rather than a Chrome internal
+  error.
+  *Why the suite missed it:* every capture spec uses a fixture app that serves its own API, so
+  no test had ever recorded a site whose API lives on another host.
+
+- **FIXED: every ordinary API URL read as a credential.** `looksLikeCredential` judged a URL as
+  one string, and its generic heuristic is "40+ characters, mixed alphabet, no spaces, contains a
+  digit, entropy > 3.5" — which describes `https://api.example/v1/players?limit=20`, not a secret.
+  The write gate refused **30 of 31** exchanges from the live dashboard on that basis; the one
+  class that survived was GitHub raw URLs, which are 96 characters but contain no digit, so the
+  review page showed nothing but GitHub. A URL is now judged part by part (path segments and query
+  values, decoded), and `redactUrl` replaces a credential-shaped path segment as well as a query
+  value, so the gate and the redactor agree about URLs too. Proven from the user's own session:
+  `rg -o "credential at [^\"]*" ~/Library/Logs/Claude/mcp-server-douze.log`.
+- **FIXED: the daemon refused every exchange from a developer console, silently.** Redaction
+  removed values by *key name*; the write gate in `CaptureStore.appendExchange` detected them by
+  *value shape*. Openfort's API returns `{"publishableKey": "pk_test_…"}` — a name no list
+  contains — so redaction left it and the gate refused the exchange. Two more recordings retained
+  nothing while the extension counted every request, and the refusal went to a stderr that a
+  detached daemon discards, so it was invisible from every angle. `redactBody`, `redactHeaders`
+  and `redactFormBody` now apply the gate's own test (`looksLikeCredential`), as `redactUrl`
+  already did; the value becomes a length-preserving placeholder and the exchange is stored.
+  TR-6 is unchanged and asserted directly. The gate stays as defence in depth.
+  *Behaviour change, security-adjacent:* the store, the fixture writer and the description-model
+  gate used to REFUSE a credential under an innocuous key; they now redact it and proceed. The
+  audit log likewise keeps each argument with a placeholder instead of collapsing every argument
+  into "withheld".
+- **FIXED: `douze stop` could never stop a connected daemon.** `wss.close()` stops new upgrades
+  but leaves an established socket open, so `server.close()` waited on a connection that never
+  ends — with the extension attached, which is the normal state, the process hung and kept the
+  port while `stop` reported success. Every live socket is now terminated first, and
+  `CaptureStore.close()` is idempotent. Mutation-verified: without the terminate, the test hangs.
+- **FIXED: the review button did nothing.** The popup asked for permission on the origins the
+  session recorded and chained "open the review page" onto the answer. Chrome CLOSES a popup to
+  show a permission prompt, so the continuation never ran. The service worker owns that tab now,
+  and opens it whichever way the user answers.
+
+All five are the same shape of gap: the fixture is friendlier than the world, and a failure that
+only ever reached a discarded stderr may as well not have been reported. Worth remembering when
+reading a green run below.
+
 ## Cleanup & Review
 
-- [ ] C-1 — Live verification: record a session against https://dashboard.openfort.io/ in Helium, infer, review, approve, and complete a real read action from Claude Desktop and the CLI (Part 0 exit criterion, M1)
-- [ ] C-2 — Second-recipe check: add another recipe after C-1 and confirm its tools appear in Claude Desktop with zero reinstalls or reconnects (AC-CON-001.4)
+- [ ] C-1 — Live verification: record a session against https://dashboard.openfort.io/ in Helium, infer, review, approve, and complete a real read action from an MCP client and the CLI (Part 0 exit criterion, M1). **IN PROGRESS** — the install and daemon halves now work (daemon up, extension paired, review UI reachable); the two defects above were found and fixed during it. A recording that retains exchanges on the live target is still outstanding.
+- [ ] C-2 — Second-recipe check: add another recipe after C-1 and confirm its tools appear in a running client with zero reinstalls or reconnects (AC-CON-001.4)
 - [x] C-3 — **PARTIAL**: relay overhead 1.2 ms (<150 ms PASS), trimmed result 144 B (<2 KB PASS), agent selection accuracy 100% (>=90% PASS), fixture replay pass rate 100%. Record-to-callable time needs the live run (C-1). Original:  Success-metric pass: measure record-to-callable time (<15 min), relay overhead (<150 ms median), trimmed result size (<2 KB median), fixture replay pass rate (≥95%) against PRD 1.5
 - [x] C-4 — **CLEAN**: `e2e/metrics.mjs` sweeps every artifact under DOUZE_HOME (recipes, fixtures, captures.db, audit.jsonl, token) for JWTs, prefixed keys, and the fixture's own session/token/password values. Zero findings. Original:  Security sweep: grep the recipe dir, fixtures, SQLite DB, logs, and ejected output for credential-shaped values (TR-6); confirm redaction invariants hold at every persistence boundary
 - [x] C-5 — **CLEAN**: `tsc --noEmit` clean on all 5 packages; `oxlint --deny-warnings` exits 0 (3 useless spreads removed, 8 deliberate ones given justified inline ignores); 242 unit tests and 41 Playwright specs green. Original:  Zero-warnings pass: `oxlint`, `tsc --noEmit`, `vitest`, Playwright suite all clean across the workspace

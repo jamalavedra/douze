@@ -20,8 +20,18 @@ export const CredentialSource = z.discriminatedUnion('kind', [
     kind: z.literal('page_state'),
     /** Expression evaluated in the page's MAIN world, e.g. `localStorage.getItem('token')`. */
     expression: z.string(),
-    /** Header the value is attached to, e.g. `authorization`. */
-    header: z.string(),
+    /** Header the value is attached to, e.g. `authorization`. Absent when it fills `param`. */
+    header: z.string().optional(),
+    /**
+     * Endpoint Template parameter the value fills, e.g. `{projectKey}` in
+     * `/v1/project/apikey/{projectKey}/origins`.
+     *
+     * A project key in the path is a credential by shape, so redaction replaces it — and a recipe
+     * carrying the placeholder called a URL that does not exist, which the API answered with
+     * "Invalid API key format". The caller cannot supply it either: an agent has no idea what the
+     * project's key is. The page does, and it is read at call time exactly like a header.
+     */
+    param: z.string().optional(),
     /** Optional literal prefix, e.g. `Bearer `. */
     prefix: z.string().default(''),
   }),
@@ -30,6 +40,12 @@ export const CredentialSource = z.discriminatedUnion('kind', [
 export const AuthDescriptor = z.object({
   mode: z.enum(['browser_relay', 'headless']).default('browser_relay'),
   credential_source: z.array(CredentialSource).default([{ kind: 'cookie' }]),
+  /**
+   * AC-EXE-001.3 — the origin whose tab executes the call. Absent means the target's own origin,
+   * which is right for a site that serves its own API. A dashboard calling an API host needs its
+   * own page: that is where the token lives and the origin the target's CORS expects.
+   */
+  page_origin: z.string().optional(),
   /** AC-EXE-004.2 — headless refresh endpoint, applied once on 401. */
   refresh_endpoint: z.string().optional(),
   /** AC-EXE-004.1 — keychain reference only, never a session value. */

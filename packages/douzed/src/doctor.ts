@@ -122,6 +122,7 @@ export class DriftWatcher {
       base_url: recipe.target.base_url,
       tool,
       credential_source: recipe.auth.credential_source,
+      ...(recipe.auth.page_origin === undefined ? {} : { page_origin: recipe.auth.page_origin }),
       degraded: false,
     }
 

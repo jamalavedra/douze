@@ -1,6 +1,6 @@
 /**
  * The daemon's HTTP side: pairing (so the user never sees a port or a token) and the read-only
- * lookup the popup uses to say what Claude can already do on a site. Imports nothing, so the
+ * lookup the popup uses to say what is already set up on a site. Imports nothing, so the
  * popup bundle stays free of the shared schema package.
  *
  * `/pair` needs no token but only answers a `chrome-extension://` origin, echoing it back in
@@ -20,7 +20,7 @@ export interface SiteTool {
 }
 
 /**
- * Pairing is not a one-time setup step: the token changes whenever Claude Desktop restarts the
+ * Pairing is not a one-time setup step: the token changes whenever an MCP client restarts the
  * daemon, so we re-pair whenever we have no token or the socket is down.
  */
 export const needsPairing = (state: { token: string; connected: boolean }): boolean =>
@@ -53,7 +53,7 @@ export const PORT_RANGE = [8787, 8788, 8789, 8790, 8791]
 /**
  * The stored port first, then the rest of the ladder — anything else already on 8787 (RStudio
  * Server binds it by default) pushes the daemon along it, and probing is the only way the extension
- * finds out. Without this the popup says it can't reach Claude Desktop forever while the daemon is
+ * finds out. Without this the popup says it can't reach the service forever while the daemon is
  * perfectly healthy one port over.
  *
  * A stored port outside the ladder is a deliberate pin — an e2e run on an ephemeral port — and is

@@ -103,7 +103,7 @@ export class RelayBridge {
   /** Guards that must fire before any network request is issued (AC-EXE-003.2 and .4). */
   private guard(surface: SurfaceTool, args: Record<string, unknown>): void {
     if (surface.degraded) {
-      // Claude reads this out to whoever asked, so it is written for them: what happened, that
+      // The assistant reads this out to whoever asked, so it is written for them: what happened, that
       // nothing ran, and the one thing that fixes it. The developer's route back — the reason and
       // the doctor command — travels in the detail, where a person is not made to read it.
       throw new DouzeError(
@@ -260,7 +260,17 @@ export function buildRequest(
   delete remaining['confirm']
   delete remaining['raw']
 
-  const resolvedPath = path.replace(/\{(\w+)\}/g, (_, name: string) => {
+  // Parameters the PAGE fills, not the caller: the extension substitutes them after reading the
+  // value out of page state. Left in the URL untouched here — resolving them to nothing produced
+  // `/v1/project/apikey//origins`, which is a 404 wearing a different hat.
+  const pageFilled = new Set(
+    (surface.credential_source ?? []).flatMap((source) =>
+      source.kind === 'page_state' && source.param ? [source.param] : [],
+    ),
+  )
+
+  const resolvedPath = path.replace(/\{(\w+)\}/g, (whole, name: string) => {
+    if (pageFilled.has(name)) return whole
     const value = remaining[name]
     delete remaining[name]
     return encodeURIComponent(String(value ?? ''))
@@ -288,6 +298,7 @@ export function buildRequest(
     headers: { ...headers, ...(body === undefined ? {} : { 'content-type': 'application/json' }) },
     ...(body === undefined ? {} : { body }),
     credential_source: surface.credential_source ?? [],
+    ...(surface.page_origin === undefined ? {} : { execute_origin: surface.page_origin }),
     timeout_ms,
   }
 }

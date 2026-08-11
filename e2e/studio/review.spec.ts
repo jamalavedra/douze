@@ -1,8 +1,7 @@
 import { test, expect } from '@playwright/test'
-import { spawn, type ChildProcess } from 'node:child_process'
 import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { Douzed, REPO, TSX } from '../harness.js'
+import { Douzed, McpClient, spawnMcp } from '../harness.js'
 
 /**
  * COV_REC_002.3 — the property that makes review the tuning surface rather than a one-time gate:
@@ -28,53 +27,6 @@ tools:
       path: /api/orders
 `
 
-/** A minimal JSON-RPC-over-stdio client, so the assertion is on the wire, not on an abstraction. */
-class McpClient {
-  private readonly child: ChildProcess
-  private buffer = ''
-  private nextId = 1
-  private readonly pending = new Map<number, (value: unknown) => void>()
-  readonly notifications: string[] = []
-
-  constructor(home: string) {
-    this.child = spawn(TSX, [join(REPO, 'packages/cli/src/bin.ts'), '--mcp'], {
-      env: { ...process.env, DOUZE_HOME: home },
-      stdio: ['pipe', 'pipe', 'pipe'],
-    })
-    this.child.stdout!.on('data', (chunk) => {
-      this.buffer += String(chunk)
-      for (const line of this.buffer.split('\n').slice(0, -1)) {
-        if (!line.trim()) continue
-        const message = JSON.parse(line) as { id?: number; method?: string; result?: unknown }
-        if (message.method) this.notifications.push(message.method)
-        else if (message.id !== undefined) this.pending.get(message.id)?.(message.result)
-      }
-      this.buffer = this.buffer.slice(this.buffer.lastIndexOf('\n') + 1)
-    })
-  }
-
-  request(method: string, params: Record<string, unknown> = {}): Promise<any> {
-    const id = this.nextId++
-    return new Promise((resolve) => {
-      this.pending.set(id, resolve)
-      this.child.stdin!.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`)
-    })
-  }
-
-  async initialize(): Promise<void> {
-    await this.request('initialize', {
-      protocolVersion: '2025-06-18',
-      capabilities: { tools: { listChanged: true } },
-      clientInfo: { name: 'e2e', version: '1.0.0' },
-    })
-    this.child.stdin!.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`)
-  }
-
-  kill(): void {
-    this.child.kill()
-  }
-}
-
 test.describe('COV_REC_002: Promotion gating and live propagation', () => {
   let douzed: Douzed
   let client: McpClient
@@ -84,7 +36,7 @@ test.describe('COV_REC_002: Promotion gating and live propagation', () => {
     writeFileSync(join(douzed.recipesDir, 'orders.yaml'), RECIPE)
     writeFileSync(join(douzed.fixturesDir, 'list_orders.json'), '{"data":{"orders":[]}}')
     await douzed.start()
-    client = new McpClient(douzed.home)
+    client = new McpClient(spawnMcp(douzed.home))
     await client.initialize()
   })
 
@@ -117,7 +69,7 @@ test.describe('COV_REC_002: Promotion gating and live propagation', () => {
 
     expect(Date.now() - started).toBeLessThan(30_000)
     expect(client.notifications.length).toBeGreaterThan(notificationsBefore)
-    expect(client.notifications).toContain('notifications/tools/list_changed')
+    expect(client.notified).toContain('notifications/tools/list_changed')
   })
 
   test('@COV_REC_002.5 should not expose an unapproved candidate', async () => {

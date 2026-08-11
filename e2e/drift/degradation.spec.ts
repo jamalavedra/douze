@@ -1,9 +1,8 @@
 import { test, expect, type Page } from '@playwright/test'
-import { spawn, type ChildProcess } from 'node:child_process'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
-import { FixtureApp, Douzed, REPO, launchHelium, waitFor, TSX } from '../harness.js'
+import { FixtureApp, Douzed, McpClient, REPO, launchHelium, spawnMcp, waitFor } from '../harness.js'
 
 /**
  * COV_DRF_002 — REQ-DRF-002 in one run. #DriftWatcher owns no client-facing mechanism of its
@@ -70,58 +69,6 @@ tools:
 const ORDERS_FIXTURE = '{"data":{"orders":[{"id":1042,"item":"widget","qty":2,"status":"open"}]},"meta":{"total":2}}'
 const POLL_FIXTURE = '{"data":{"tick":1}}'
 
-/** A minimal JSON-RPC-over-stdio client, so the assertion is on the wire, not on an abstraction. */
-class McpClient {
-  private readonly child: ChildProcess
-  private buffer = ''
-  private nextId = 1
-  private readonly pending = new Map<number, (value: unknown) => void>()
-  readonly notifications: string[] = []
-
-  constructor(home: string) {
-    this.child = spawn(TSX, [join(REPO, 'packages/cli/src/bin.ts'), '--mcp'], {
-      env: { ...process.env, DOUZE_HOME: home },
-      stdio: ['pipe', 'pipe', 'pipe'],
-    })
-    this.child.stdout!.on('data', (chunk) => {
-      this.buffer += String(chunk)
-      for (const line of this.buffer.split('\n').slice(0, -1)) {
-        if (!line.trim()) continue
-        const message = JSON.parse(line) as { id?: number; method?: string; result?: unknown }
-        if (message.method) this.notifications.push(message.method)
-        else if (message.id !== undefined) this.pending.get(message.id)?.(message.result)
-      }
-      this.buffer = this.buffer.slice(this.buffer.lastIndexOf('\n') + 1)
-    })
-  }
-
-  request(method: string, params: Record<string, unknown> = {}): Promise<any> {
-    const id = this.nextId++
-    return new Promise((resolve) => {
-      this.pending.set(id, resolve)
-      this.child.stdin!.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`)
-    })
-  }
-
-  async initialize(): Promise<void> {
-    await this.request('initialize', {
-      protocolVersion: '2025-06-18',
-      capabilities: { tools: { listChanged: true } },
-      clientInfo: { name: 'e2e', version: '1.0.0' },
-    })
-    this.child.stdin!.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`)
-  }
-
-  /** The description is where a degraded tool announces itself to a client (AC-RUN-001.5). */
-  async describe(name: string): Promise<string | undefined> {
-    const listed = await this.request('tools/list')
-    return listed.tools.find((t: { name: string }) => t.name === name)?.description
-  }
-
-  kill(): void {
-    this.child.kill()
-  }
-}
 
 test.describe('COV_DRF_002: Degradation propagation', () => {
   let app: FixtureApp
@@ -180,7 +127,7 @@ test.describe('COV_DRF_002: Degradation propagation', () => {
 
     // The client connects BEFORE the run. AC-DRF-002.1 is about a client that never restarted,
     // so it has to have been listening the whole time.
-    client = new McpClient(douzed.home)
+    client = new McpClient(spawnMcp(douzed.home))
     await client.initialize()
     expect(await client.describe('orders_list_orders')).toBe('Lists every order.')
     const notificationsBefore = client.notifications.length
@@ -208,7 +155,7 @@ test.describe('COV_DRF_002: Degradation propagation', () => {
       .toContain('Currently degraded and will refuse to run')
     expect(await client.describe('orders_list_orders')).toContain('$.data.orders[].status')
     expect(client.notifications.length).toBeGreaterThan(notificationsBefore)
-    expect(client.notifications).toContain('notifications/tools/list_changed')
+    expect(client.notified).toContain('notifications/tools/list_changed')
     // AC-DRF-002.3 — the healthy tool's description was not touched by any of this.
     expect(await client.describe('orders_poll_status')).toBe('Reports the current server tick.')
 

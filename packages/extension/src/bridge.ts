@@ -36,7 +36,7 @@ import type { CaptureBatch, GestureEvent, PageEvent } from './messages.js'
     flushing = false
     if (!BUFFER.length) return
     const batch = BUFFER.splice(0, 200)
-    const message: CaptureBatch = { type: 'douze:capture', frameUrl: location.href, batch }
+    const message: CaptureBatch = { type: 'douze:capture', batch }
     try {
       await chrome.runtime.sendMessage(message)
     } catch {

@@ -82,13 +82,11 @@ export class CaptureStore {
       response_body: redactBody(input.response_body),
     })
 
-    const leaked = findSurvivingSecrets({
-      url: exchange.url,
-      request_headers: exchange.request_headers,
-      response_headers: exchange.response_headers,
-      request_body: exchange.request_body,
-      response_body: exchange.response_body,
-    })
+    // The whole document, because the whole document is what is written. Scanning url, headers
+    // and bodies alone left `credentials[]` unread — those hints are supplied by the extension and
+    // are meant to hold a storage key, but an expression carrying the value itself would have been
+    // persisted verbatim by the JSON.stringify below.
+    const leaked = findSurvivingSecrets(exchange)
     if (leaked.length > 0) {
       throw new Error(`refusing to persist exchange ${exchange.id}: credential at ${leaked.join(', ')}`)
     }
@@ -168,7 +166,12 @@ export class CaptureStore {
     return this.sessions().find((s) => s.id === id) ?? null
   }
 
+  /** Idempotent: a signal handler and an explicit `daemon.close()` can both land on the same store. */
   close(): void {
+    if (this.closed) return
+    this.closed = true
     this.db.close()
   }
+
+  private closed = false
 }

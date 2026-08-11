@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync, existsSync
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createServer, request } from 'node:http'
-import { DEFAULT_PORT, DouzeError, PORT_RANGE } from '@douze/shared'
+import { DEFAULT_PORT, DouzeError, PORT_RANGE, findSurvivingSecrets } from '@douze/shared'
 import { startDaemon, type Daemon } from './server.js'
 import { CaptureStore } from './capture-store.js'
 import { installToken } from './paths.js'
@@ -87,6 +87,29 @@ describe('daemon lifecycle (REQ-RUN-003)', () => {
     await expect(startDaemon({ port: 0 })).rejects.toThrow(/already running/)
   })
 
+  /**
+   * `douze stop` reported success and the daemon kept the port: `wss.close()` leaves an
+   * already-connected socket open, so `server.close()` waited on a connection that never ends.
+   * With the extension attached — the normal state — the process could not be stopped at all.
+   */
+  it('closes even while an extension holds its WebSocket (AC-RUN-003.1)', { timeout: 15_000 }, async () => {
+    await restart(async () => {
+      const fresh = await startDaemon({ port: 0 })
+      const socket = new WebSocket(`ws://127.0.0.1:${fresh.port}/ws?token=${encodeURIComponent(token)}`)
+      await new Promise<void>((resolve, reject) => {
+        socket.addEventListener('open', () => resolve())
+        socket.addEventListener('error', () => reject(new Error('socket never opened')))
+      })
+
+      // The assertion is that this returns at all. A hang here is the bug.
+      await fresh.close()
+      await expect(fetch(`http://127.0.0.1:${fresh.port}/health`)).rejects.toThrow()
+
+      // `restart` closes what this returns, and closing twice must stay harmless.
+      return fresh
+    })
+  })
+
   it('rejects a loopback request without the install token (AC-EXE-001.1)', async () => {
     const res = await fetch(`http://127.0.0.1:${daemon.port}/registry`)
     expect(res.status).toBe(401)
@@ -107,6 +130,9 @@ describe('daemon lifecycle (REQ-RUN-003)', () => {
     // RStudio Server's default is 8787 too, and an ephemeral port would put douzed somewhere the
     // extension never looks — so the next port in the range, not just any free one.
     skip(!(await portIsFree(PORT_RANGE[1])), `something else is already listening on ${PORT_RANGE[1]}`)
+    // A douzed already in the range is not a port this test can squat: the walk stops on one by
+    // design rather than running a second daemon beside it, which is the next test's subject.
+    skip(await douzedInRange(), 'a douzed is already running in the port range on this machine')
     const release = await hold([DEFAULT_PORT])
     try {
       await restart(async () => {
@@ -119,20 +145,99 @@ describe('daemon lifecycle (REQ-RUN-003)', () => {
     }
   })
 
-  it('falls back to an ephemeral port rather than refusing to run when the whole range is taken', async () => {
-    const release = await hold(PORT_RANGE)
+  // Every port in the range is probed before it is given up on, so the degenerate case where
+  // all five are held by something that is not douzed costs five probes on top of a boot.
+  it(
+    'falls back to an ephemeral port rather than refusing to run when the whole range is taken',
+    { timeout: 15_000 },
+    async ({ skip }) => {
+      skip(await douzedInRange(), 'a douzed is already running in the port range on this machine')
+      const release = await hold(PORT_RANGE)
     try {
-      await restart(async () => {
-        const last = await startDaemon()
-        expect(PORT_RANGE).not.toContain(last.port)
-        expect(last.port).toBeGreaterThan(0)
-        return last
-      })
-    } finally {
-      await release()
-    }
+        await restart(async () => {
+          const last = await startDaemon()
+          expect(PORT_RANGE).not.toContain(last.port)
+          expect(last.port).toBeGreaterThan(0)
+          return last
+        })
+      } finally {
+        await release()
+      }
+    },
+  )
+
+  /**
+   * RStudio Server's default is 8787 too, and it 200s on almost any path. Reading a bare 200 as
+   * "a douzed already has this port" aborted startup on a port douzed had never touched — so the
+   * body has to name itself, and a redirect to something that 200s does not count either.
+   */
+  const impostors: [string, import('node:http').RequestListener][] = [
+    [
+      'answers /health with its own JSON',
+      (_req, res) => {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end('{"status":"ok"}')
+      },
+    ],
+    [
+      'redirects /health to a page that 200s',
+      (req, res) => {
+        if (req.url === '/health') {
+          res.writeHead(302, { location: '/login' })
+          res.end()
+          return
+        }
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end('{"ok":true,"extension_connected":false}')
+      },
+    ],
+  ]
+
+  for (const [what, handler] of impostors) {
+    it(`walks past a foreign service that ${what}`, async ({ skip }) => {
+      skip(!(await portIsFree(DEFAULT_PORT)), `something else is already listening on ${DEFAULT_PORT}`)
+      skip(!(await portIsFree(PORT_RANGE[1])), `something else is already listening on ${PORT_RANGE[1]}`)
+      skip(await douzedInRange(), 'a douzed is already running in the port range on this machine')
+
+      const impostor = createServer(handler)
+      await new Promise<void>((resolve) => impostor.listen(DEFAULT_PORT, '127.0.0.1', () => resolve()))
+      try {
+        await restart(async () => {
+          const moved = await startDaemon()
+          expect(moved.port).toBe(PORT_RANGE[1])
+          return moved
+        })
+      } finally {
+        impostor.closeAllConnections()
+        await new Promise((resolve) => impostor.close(resolve))
+      }
+    })
+  }
+
+  it('stops the walk on a port another douzed holds, rather than running a second one', async ({ skip }) => {
+    // Two clients can start at the same instant and both try 8787. The loser must not step to
+    // 8788 and stand up a second registry the extension will never see.
+    skip(await douzedInRange(), 'a douzed is already running in the port range on this machine')
+    await restart(async () => {
+      const first = await startDaemon()
+      rmSync(join(home, 'douzed.json'), { force: true })
+      await expect(startDaemon()).rejects.toThrow(new RegExp(`already running on port ${first.port}`))
+      return first
+    })
   })
 })
+
+/** Whether a real douzed answers anywhere in the range — this machine's own, usually. */
+const douzedInRange = async (): Promise<boolean> => {
+  for (const port of PORT_RANGE) {
+    try {
+      if ((await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(250) })).ok) return true
+    } catch {
+      // nothing there, or not a douzed
+    }
+  }
+  return false
+}
 
 /**
  * Squats every named port. A port already held by something outside this suite is just as
@@ -322,7 +427,7 @@ describe('review served by douzed (REQ-REC-002)', () => {
     const res = await api(`/review/${id}`)
     expect(res.status).toBe(200)
     const html = await res.text()
-    expect(html).toContain('What Claude can do')
+    expect(html).toContain('Review your skills')
     expect(html).toContain(token)
   })
 
@@ -506,16 +611,71 @@ describe('capture store (REQ-CAP-005)', () => {
     }
     // A credential under a *known* key is redacted and stored fine.
     expect(() => store.appendExchange({ ...base, request_headers: { authorization: 'Bearer xyz' } } as never)).not.toThrow()
-    // One hiding under an innocuous key is caught by the shape gate and refused.
+
+    // One hiding under an innocuous key is redacted by shape and stored too. It used to be
+    // REFUSED, which cost the whole exchange — and a developer console, whose responses carry
+    // API keys by design, recorded nothing while the extension counted every request.
+    const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcdefghijklmno'
+    const stored = store.appendExchange({
+      ...base,
+      id: 'e2',
+      position: 1,
+      request_headers: { 'x-trace': jwt },
+      response_body: { publishableKey: 'pk_test_4f9a2b7c1d8e3f6a0b5c' },
+    } as never)
+
+    // TR-6 is what actually matters, and it holds: neither value reaches the database.
+    expect(JSON.stringify(stored)).not.toContain(jwt)
+    expect(JSON.stringify(stored)).not.toContain('pk_test_')
+    expect(stored.request_headers['x-trace']).toMatch(/^«redacted:/)
+    expect(findSurvivingSecrets(stored)).toEqual([])
+    store.close()
+  })
+
+  /**
+   * `credentials[]` is supplied by the extension and is meant to hold a storage key, not a value.
+   * The gate used to read only the url, headers and bodies, while the row written is the whole
+   * document — so a hint carrying the token itself went to disk unread.
+   */
+  it('refuses an exchange whose credential hint carries the value (TR-6)', () => {
+    const store = new CaptureStore(':memory:')
+    const session = store.startSession({ name: 's', origins: ['https://app.test'] })
+    const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r-wW1gFWFOEjXk'
+    const exchange = {
+      id: 'e1',
+      session_id: session.id,
+      position: 0,
+      started_at: Date.now(),
+      duration_ms: 5,
+      method: 'GET',
+      url: 'https://app.test/api/x',
+      origin: 'https://app.test',
+      status: 200,
+      source: 'main_world' as const,
+    }
+
     expect(() =>
       store.appendExchange({
-        ...base,
-        id: 'e2',
-        position: 1,
-        request_headers: { 'x-trace': 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcdefghijklmno' },
+        ...exchange,
+        credentials: [{ header: 'authorization', expression: jwt, prefix: 'Bearer ' }],
       } as never),
-    ).toThrow(/credential/)
+    ).toThrow(/credential at/)
+
+    // An ordinary hint — a storage lookup, no value — still stores.
+    expect(() =>
+      store.appendExchange({
+        ...exchange,
+        credentials: [
+          { header: 'authorization', expression: "localStorage.getItem('access_token')", prefix: 'Bearer ' },
+        ],
+      } as never),
+    ).not.toThrow()
     store.close()
+  })
+
+  /** The write gate stays as defence in depth: anything reaching it unredacted is still refused. */
+  it('still detects a credential in a document that skipped redaction (TR-6)', () => {
+    expect(findSurvivingSecrets({ trace: 'sk_live_9f8e7d6c5b4a39281706' })).toEqual(['$.trace'])
   })
 
   it('scopes an annotation span to the exchanges since the previous note (AC-CAP-007.2)', () => {
@@ -639,7 +799,9 @@ describe('doctor replay safety (AC-DRF-001.1)', () => {
 
 describe('review findings — daemon robustness', () => {
   it('survives a refused exchange instead of crashing (#4)', async () => {
-    // appendExchange throws by design on a credential-shaped value; the daemon must stay up.
+    // appendExchange throws by design on anything it cannot store — here a malformed exchange,
+    // since a credential-shaped value is now redacted rather than refused. What is under test is
+    // unchanged: a throw inside the WebSocket handler must not take the daemon down.
     expect(() =>
       daemon.store.appendExchange({
         id: 'bad',
@@ -647,14 +809,11 @@ describe('review findings — daemon robustness', () => {
         position: 0,
         started_at: Date.now(),
         duration_ms: 1,
-        method: 'GET',
-        url: 'https://app.test/x',
-        origin: 'https://app.test',
+        // no method, no url: Exchange.parse rejects it
         status: 200,
-        response_body: { trace_ref: 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcdefghijklmno' },
         source: 'main_world',
       } as never),
-    ).toThrow(/credential/)
+    ).toThrow()
     // The daemon is still serving.
     expect((await (await api('/health')).json()).ok).toBe(true)
   })
@@ -700,7 +859,11 @@ describe('review findings — daemon robustness', () => {
       body: JSON.stringify({ args: { note: 'sk_live_abcdef0123456789ABCDEF' } }),
     })
     const audit = readFileSync(join(home, 'audit.jsonl'), 'utf8')
+    // The property that matters: the key is not in the log.
     expect(audit).not.toContain('sk_live_abcdef0123456789ABCDEF')
-    expect(audit).toContain('withheld')
+    // It is replaced in place rather than collapsing every argument into a summary line, so the
+    // trace still says which tool was called with an argument of what shape.
+    expect(audit).toContain('«redacted:')
+    expect(audit).toContain('list_orders')
   })
 })

@@ -15,7 +15,7 @@ import type {
   PopupStatus,
   RequestEvent,
 } from './messages.js'
-import { needsPairing, pairAny } from './daemon.js'
+import { needsPairing, pairAny, reviewUrl } from './daemon.js'
 import { DebuggerCapture } from './debugger-capture.js'
 import { installOracle } from './oracle.js'
 import { RECONCILE_GRACE_MS, Reconciler, admits, decodeBody, finalize, type ExchangeDraft } from './pipeline.js'
@@ -41,6 +41,12 @@ interface Recording {
   position: number
   annotatedThrough: number
   count: number
+  /**
+   * Every origin the page actually talked to — usually its API host rather than its own. The
+   * popup asks Chrome for permission on these when the session ends, because the relay replays
+   * inside a tab on the *target* origin and cannot touch one that was never granted.
+   */
+  seenOrigins: string[]
 }
 
 let recording: Recording | null = null
@@ -61,6 +67,16 @@ const socket = new DaemonSocket({
   version: VERSION,
   onMessage: (message) => void onServerMessage(message),
 })
+
+/**
+ * T-001.4 — the buffer outlives the worker. Chrome suspends an idle service worker after 30
+ * seconds, and a socket that is down is precisely when nothing keeps it awake, so a memory-only
+ * outbox dropped every exchange captured while douzed was stopped — silently, and exactly in the
+ * case it exists to cover.
+ */
+socket.outbox.onChange = (messages) => {
+  void chrome.storage.session.set({ outbox: messages })
+}
 
 // --- state ----------------------------------------------------------------
 
@@ -126,8 +142,10 @@ async function pairNow(): Promise<void> {
 /** Session state lives in `chrome.storage.session`: module globals die with the worker. */
 const hydrated = (async () => {
   await loadSettings()
-  const session = await chrome.storage.session.get('recording')
+  const session = await chrome.storage.session.get(['recording', 'outbox'])
   recording = (session['recording'] as Recording | undefined) ?? null
+  const buffered = session['outbox']
+  if (Array.isArray(buffered)) socket.outbox.restore(buffered as ClientMessage[])
   void ensurePaired()
   await paintBadge()
 })()
@@ -141,8 +159,8 @@ async function persist(): Promise<void> {
 async function paintBadge(): Promise<void> {
   painted = recording ? String(recording.count) : ''
   await chrome.action.setBadgeText({ text: painted })
-  // The review page's accent. A flat value, not `light-dark()`: this API takes one colour.
-  await chrome.action.setBadgeBackgroundColor({ color: '#1a56c4' })
+  // The review page's brand blue. This API takes one flat colour, not `light-dark()`.
+  await chrome.action.setBadgeBackgroundColor({ color: '#00bce8' })
 }
 /** The last text handed to `setBadgeText`, so a test can assert what the badge shows. */
 let painted = ''
@@ -151,7 +169,7 @@ let painted = ''
 
 function emit(draft: ExchangeDraft): void {
   if (!recording) return
-  if (!admits(draft, recording.session.origins, noise)) return
+  if (!admits(draft, noise)) return
   const gesture = draft.gesture ?? (draft.tab_id === undefined ? undefined : lastGesture.get(draft.tab_id))
   const exchange = finalize(
     draft,
@@ -160,6 +178,9 @@ function emit(draft: ExchangeDraft): void {
   )
   recording.position += 1
   recording.count += 1
+  if (exchange.origin && !recording.seenOrigins.includes(exchange.origin)) {
+    recording.seenOrigins.push(exchange.origin)
+  }
   socket.send({ type: 'exchange.append', exchange })
   void persist()
   void paintBadge()
@@ -173,7 +194,12 @@ function route(draft: ExchangeDraft): void {
   }, RECONCILE_GRACE_MS + 50)
 }
 
-function ingest(batch: PageEvent[], tabId: number): void {
+const headerValue = (headers: Record<string, string>, name: string): string | undefined => {
+  const match = Object.keys(headers).find((key) => key.toLowerCase() === name)
+  return match === undefined ? undefined : headers[match]
+}
+
+function ingest(batch: PageEvent[], tabId: number, pageOrigin?: string): void {
   for (const event of batch) {
     if (event.type === 'gesture') {
       lastGesture.set(tabId, event)
@@ -196,13 +222,21 @@ function ingest(batch: PageEvent[], tabId: number): void {
     if (event.type === 'error' || !pending) continue
     const { event: request, gesture } = pending
 
-    const requestBody = decodeBody(request.body, request.headers['content-type'])
-    const contentType = event.headers['content-type']
+    // Case-insensitively, because a header name is: the page sends `Content-Type`, and looking
+    // for the lower-case spelling found nothing — so a JSON request body was never parsed, stayed
+    // a string, and inference saw no fields to turn into tool parameters. Every write tool came
+    // out with no arguments at all, replaying one frozen captured body.
+    const requestBody = decodeBody(request.body, headerValue(request.headers, 'content-type'))
+    const contentType = headerValue(event.headers, 'content-type')
     const responseBody = decodeBody(event.body, contentType)
     // For a body we cut short, the header is the honest size; ours is only what we kept.
     const declaredSize = Number(event.headers['content-length'])
     const size = Number.isFinite(declaredSize) && declaredSize > 0 ? declaredSize : responseBody.size
     route({
+      // The frame's own origin, established by the message handler before ingest is reached, so a
+      // page cannot claim to be somebody else.
+      ...(pageOrigin === undefined ? {} : { page_origin: pageOrigin }),
+      ...(request.credentials?.length ? { credentials: request.credentials } : {}),
       method: request.method,
       url: event.url || request.url,
       started_at: request.t,
@@ -263,7 +297,9 @@ async function resolveTab(origin: string, tabId?: number): Promise<number> {
 }
 
 /** AC-CAP-001.1 / .2 — a named session scoped to the origins the user granted. */
-async function startSession(command: Extract<PopupCommand, { type: 'douze:start' }>): Promise<PopupStatus> {
+async function startSession(
+  command: Extract<PopupCommand, { type: 'douze:start' }>,
+): Promise<PopupStatus & { error?: string }> {
   const [primary] = command.origins
   if (!primary) throw new Error('a session needs at least one origin')
   const tabId = await resolveTab(primary, command.tabId)
@@ -275,20 +311,39 @@ async function startSession(command: Extract<PopupCommand, { type: 'douze:start'
     started_at: Date.now(),
     debugger_enabled: command.useDebugger,
   }
-  recording = { session, tabId, position: 0, annotatedThrough: 0, count: 0 }
+  recording = { session, tabId, position: 0, annotatedThrough: 0, count: 0, seenOrigins: [] }
   await persist()
   await registerScripts(session.origins)
   socket.send({ type: 'exchange.session.start', session })
   // Registration does not affect an already-loaded tab, and document_start injection is the
   // whole point — patch `fetch` before page scripts capture a reference to it. Both branches
   // reload, so a caller never has to; `attach` reloads to make bodies retrievable at all.
-  if (command.useDebugger) await debuggerCapture.attach(tabId).catch(() => {})
-  else await chrome.tabs.reload(tabId)
+  //
+  // A swallowed attach failure took the reload with it: the session ran with no interceptor in
+  // the page and no debugger either, recorded nothing, and said nothing. The reload happens
+  // whatever attach does, and the reason reaches the popup.
+  let attachError: string | undefined
+  if (command.useDebugger) {
+    try {
+      await debuggerCapture.attach(tabId)
+    } catch (error) {
+      attachError = `Douze couldn't attach the debugger (${(error as Error)?.message ?? error}), so it's watching the ordinary way instead.`
+      await chrome.tabs.reload(tabId)
+    }
+  } else {
+    await chrome.tabs.reload(tabId)
+  }
   await paintBadge()
-  return status()
+  return { ...status(), ...(attachError === undefined ? {} : { error: attachError }) }
 }
 
-/** AC-CAP-001.4 — stopping reports the count retained after filtering. */
+/**
+ * AC-CAP-001.4 — stopping reports the count retained after filtering.
+ *
+ * ponytail: a draft still inside the reconciler's RECONCILE_GRACE_MS window is dropped, so the
+ * last request or two of a session can be lost if the user presses Done the instant it fires.
+ * Drain the reconciler here if that ever costs anyone a tool.
+ */
 async function stopSession(): Promise<PopupStatus> {
   if (recording) {
     socket.send({ type: 'exchange.session.stop', session_id: recording.session.id, retained: recording.count })
@@ -318,11 +373,23 @@ function annotate(note: string): void {
   void persist()
 }
 
+/**
+ * The review page, opened from here rather than from the popup.
+ *
+ * The popup asks for permission on the origins the session recorded, and Chrome closes a popup
+ * to show that prompt — so anything the popup queued behind the answer never ran, and pressing
+ * the button appeared to do nothing at all. The worker outlives the prompt.
+ */
+async function openReview(sessionId: string): Promise<void> {
+  await chrome.tabs.create({ url: reviewUrl({ port: settings.port, token: settings.token }, sessionId) })
+}
+
 const status = (): PopupStatus => ({
   session: recording
     ? { id: recording.session.id, name: recording.session.name, origins: recording.session.origins }
     : null,
   count: recording?.count ?? 0,
+  seenOrigins: recording?.seenOrigins ?? [],
   connected: socket.connected,
   port: settings.port,
   token: settings.token,
@@ -359,7 +426,7 @@ function notifyExpired(origin: string, loginUrl: string): void {
     type: 'basic',
     iconUrl: chrome.runtime.getURL('icon128.png'),
     title: `Signed out of ${site}`,
-    message: `You've been signed out of ${site}, so Claude can't act there. Click to sign in again.`,
+    message: `You've been signed out of ${site}, so Douze can't act there. Click to sign in again.`,
   })
 }
 
@@ -373,7 +440,7 @@ chrome.runtime.onMessage.addListener((message: CaptureBatch | PopupCommand, send
     if (tabId === undefined) return undefined
     void hydrated.then(() => {
       if (!recording || !recording.session.origins.includes(sender.origin ?? '')) return
-      ingest(message.batch.slice(0, 200), tabId)
+      ingest(message.batch.slice(0, 200), tabId, sender.origin)
     })
     return undefined
   }
@@ -387,6 +454,10 @@ chrome.runtime.onMessage.addListener((message: CaptureBatch | PopupCommand, send
       }
       if (message.type === 'douze:noise') {
         await chrome.storage.local.set({ noise_hosts: message.hosts })
+        return status()
+      }
+      if (message.type === 'douze:review') {
+        await openReview(message.sessionId)
         return status()
       }
       return status()

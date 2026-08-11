@@ -28,6 +28,8 @@ export const RelayRequest = z.object({
   body: z.unknown().optional(),
   /** AC-EXE-001.3 — read these from page state exactly as the app does. */
   credential_source: z.array(CredentialSource).default([]),
+  /** The origin whose tab runs the request; absent means the target's own (see AuthDescriptor). */
+  execute_origin: z.string().optional(),
   timeout_ms: z.number().int().positive().default(120_000),
 })
 

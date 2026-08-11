@@ -109,6 +109,7 @@ export function importHar(
       ...(missing ? { body_missing_reason: 'har_no_content' as const } : {}),
       background: false,
       source: 'har',
+      credentials: [],
     }
 
     store.appendExchange(exchange)

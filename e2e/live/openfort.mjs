@@ -4,8 +4,8 @@
  * This is Part 0 of the PRD, executed for real: use the dashboard by hand, then have a tool call
  * run against the live account through the signed-in browser. Nothing here is mocked.
  *
- *   node e2e/live/openfort.mjs            # record + infer + approve + call (read-only)
- *   node e2e/live/openfort.mjs --writes   # also exercise an approved write tool
+ *   pnpm exec tsx e2e/live/openfort.mjs            # record + infer + approve + call (read-only)
+ *   pnpm exec tsx e2e/live/openfort.mjs --writes   # also exercise an approved write tool
  *
  * The browser profile is persistent (DOUZE_E2E_PROFILE, default ~/.douze-e2e-profile) because
  * signing in is a manual act that must survive between runs. On the first run the script pauses
@@ -21,6 +21,16 @@ const REPO = resolve(import.meta.dirname, '../..')
 const HELIUM = '/Applications/Helium.app/Contents/MacOS/Helium'
 const TARGET = 'https://dashboard.openfort.io'
 const ORIGIN = new URL(TARGET).origin
+/**
+ * The hosts the dashboard's own JavaScript calls. A dashboard almost never serves its own data,
+ * and the relay replays inside a tab on the origin it is CALLING — so recording works without
+ * these, and step 10 then fails on a tool it just recorded. The popup asks a real user for these
+ * when a session ends; this build bakes them in, because there is nobody to click Allow here.
+ */
+const API_ORIGINS = (process.env.DOUZE_LIVE_API_ORIGINS ?? 'https://api.openfort.io')
+  .split(',')
+  .map((o) => o.trim())
+  .filter(Boolean)
 const PROFILE = process.env.DOUZE_E2E_PROFILE ?? join(homedir(), '.douze-e2e-profile')
 const HOME = process.env.DOUZE_HOME ?? join(homedir(), '.douze-live')
 const WRITES = process.argv.includes('--writes')
@@ -42,13 +52,13 @@ async function pause(message, until, timeoutMs = 300_000) {
   return false
 }
 
-step(1, 'Build the extension with the Openfort origin granted')
+step(1, 'Build the extension with the Openfort origins granted')
 mkdirSync(HOME, { recursive: true })
 mkdirSync(join(HOME, 'recipes'), { recursive: true })
 mkdirSync(join(HOME, 'fixtures'), { recursive: true })
 execFileSync('pnpm', ['--filter', '@douze/extension', 'build'], {
   cwd: REPO,
-  env: { ...process.env, DOUZE_TEST_ORIGIN: ORIGIN },
+  env: { ...process.env, DOUZE_TEST_ORIGIN: [ORIGIN, ...API_ORIGINS].join(',') },
   stdio: 'inherit',
 })
 
@@ -153,9 +163,14 @@ if (exchanges.length === 0) {
 }
 
 step(7, 'Infer candidate tools from the session')
-const { StudioSession } = await import(join(REPO, 'packages/studio/src/api.ts'))
+const { StudioSession, baseUrlFrom } = await import(join(REPO, 'packages/studio/src/api.ts'))
+// Derived from what was captured, not from the page's own origin: the requests worth turning into
+// tools go to the API host, and a recipe based at the dashboard would point every one of them at
+// the wrong address. This is the same call the review UI makes.
+const baseUrl = baseUrlFrom(exchanges)
+log(`   base url inferred from the capture: ${baseUrl}`)
 const studio = StudioSession.fromExchanges(
-  { recipeName: 'openfort', baseUrl: ORIGIN, paths: { recipes: join(HOME, 'recipes'), fixtures: join(HOME, 'fixtures') } },
+  { recipeName: 'openfort', baseUrl, paths: { recipes: join(HOME, 'recipes'), fixtures: join(HOME, 'fixtures') } },
   { exchanges, annotations: detail.annotations ?? [] },
 )
 log(`   ${studio.candidates.length} candidates:`)

@@ -1,9 +1,9 @@
 import { test, expect, type Page } from '@playwright/test'
-import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { chmodSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { FixtureApp, Douzed, REPO, TSX, launchHelium, waitFor } from '../harness.js'
+import { FixtureApp, Douzed, McpClient, REPO, TSX, launchHelium, spawnMcp, waitFor } from '../harness.js'
 
 /**
  * COV_CON_002 — one command registers Douze with Claude Code, and COV_CON_003 — a long call
@@ -53,9 +53,9 @@ const runDouze = (args: string[], options: { cwd: string; env?: Record<string, s
     child.on('close', (code) => resolve({ code: code ?? 1, out }))
   })
 
-/** `Registered "<name>" at <scope> scope in <path>` — the claim the file has to back up. */
+/** `Registered "<name>" with <agent> at <scope> scope in <path>` — the claim the file backs up. */
 function reported(output: string): { name: string; scope: string; path: string } {
-  const match = /Registered "([^"]+)" at (\w+) scope in (.+)/.exec(output)
+  const match = /Registered "([^"]+)" with [\w-]+ at (\w+) scope in (.+)/.exec(output)
   if (!match) throw new Error(`no registration line in output:\n${output}`)
   return { name: match[1] as string, scope: match[2] as string, path: (match[3] as string).trim() }
 }
@@ -74,11 +74,17 @@ test.describe('COV_CON_002: Claude Code registration', () => {
     const projectReport = reported(projectRun.out)
     expect(projectReport).toMatchObject({ name: 'douze', scope: 'project', path: join(project, '.mcp.json') })
 
-    // AC-CON-002.1 — a stdio entry invoking `douze --mcp`, in the file the output named.
+    // AC-CON-002.1 — a stdio entry invoking this Node against this entry point, in the file the
+    // output named. Absolute, both of them: a client spawns servers with no shell PATH, and there
+    // is no `douze` binary on a machine that installed Douze from a zip.
     const projectConfig = JSON.parse(readFileSync(projectReport.path, 'utf8')) as {
-      mcpServers: Record<string, unknown>
+      mcpServers: Record<string, { type: string; command: string; args: string[] }>
     }
-    expect(projectConfig.mcpServers['douze']).toEqual({ type: 'stdio', command: 'douze', args: ['--mcp'] })
+    expect(projectConfig.mcpServers['douze']).toMatchObject({
+      type: 'stdio',
+      args: [expect.stringMatching(/^\/.*\.(ts|js)$/), '--mcp'],
+    })
+    expect(projectConfig.mcpServers['douze']!.command.startsWith('/')).toBe(true)
 
     // --- user scope: the redirect is proven before it is trusted ------------------------------
     const probed = execFileSync(process.execPath, ['-p', 'require("os").homedir()'], {
@@ -102,7 +108,10 @@ test.describe('COV_CON_002: Claude Code registration', () => {
     expect(realConfigHasDouze()).toBe(false)
 
     const userConfig = JSON.parse(readFileSync(userReport.path, 'utf8')) as { mcpServers: Record<string, unknown> }
-    expect(userConfig.mcpServers['douze']).toEqual({ type: 'stdio', command: 'douze', args: ['--mcp'] })
+    expect(userConfig.mcpServers['douze']).toMatchObject({
+      type: 'stdio',
+      args: [expect.stringMatching(/^\/.*\.(ts|js)$/), '--mcp'],
+    })
     // Project scope is a different file; writing user scope must not have touched it.
     expect(JSON.parse(readFileSync(join(project, '.mcp.json'), 'utf8')).mcpServers.douze).toBeDefined()
   })
@@ -118,13 +127,16 @@ test.describe('COV_CON_002: Claude Code registration', () => {
 
     // AC-CON-002.3 — reserved means renamed-and-registered, not refused.
     expect(run.code).toBe(0)
-    expect(run.out).toMatch(/"workspace" is reserved by Claude Code/)
+    expect(run.out).toMatch(/"workspace" is a reserved name/)
 
     const report = reported(run.out)
     expect(report.name).toBe('workspace-douze')
 
     const config = JSON.parse(readFileSync(report.path, 'utf8')) as { mcpServers: Record<string, unknown> }
-    expect(config.mcpServers['workspace-douze']).toEqual({ type: 'stdio', command: 'douze', args: ['--mcp'] })
+    expect(config.mcpServers['workspace-douze']).toMatchObject({
+      type: 'stdio',
+      args: [expect.stringMatching(/^\/.*\.(ts|js)$/), '--mcp'],
+    })
     expect(config.mcpServers['workspace']).toBeUndefined()
   })
 
@@ -212,58 +224,6 @@ tools:
       primary_payload_path: $.data.orders
 `
 
-interface Notification {
-  method: string
-  params?: { progressToken?: string | number; progress?: number; message?: string }
-}
-
-/** A minimal JSON-RPC-over-stdio client, so the assertion is on the wire, not on an abstraction. */
-class McpClient {
-  private readonly child: ChildProcess
-  private buffer = ''
-  private nextId = 1
-  private readonly pending = new Map<number, (value: unknown) => void>()
-  readonly notifications: Notification[] = []
-
-  constructor(home: string) {
-    this.child = spawn(TSX, [join(REPO, 'packages/cli/src/bin.ts'), '--mcp'], {
-      env: { ...process.env, DOUZE_HOME: home },
-      stdio: ['pipe', 'pipe', 'pipe'],
-    })
-    this.child.stdout!.on('data', (chunk) => {
-      this.buffer += String(chunk)
-      for (const line of this.buffer.split('\n').slice(0, -1)) {
-        if (!line.trim()) continue
-        const message = JSON.parse(line) as { id?: number; method?: string; result?: unknown } & Notification
-        if (message.method) this.notifications.push(message)
-        else if (message.id !== undefined) this.pending.get(message.id)?.(message.result)
-      }
-      this.buffer = this.buffer.slice(this.buffer.lastIndexOf('\n') + 1)
-    })
-  }
-
-  request(method: string, params: Record<string, unknown> = {}): Promise<any> {
-    const id = this.nextId++
-    return new Promise((resolve) => {
-      this.pending.set(id, resolve)
-      this.child.stdin!.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`)
-    })
-  }
-
-  async initialize(): Promise<void> {
-    await this.request('initialize', {
-      protocolVersion: '2025-06-18',
-      capabilities: { tools: { listChanged: true } },
-      clientInfo: { name: 'e2e', version: '1.0.0' },
-    })
-    this.child.stdin!.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`)
-  }
-
-  kill(): void {
-    this.child.kill()
-  }
-}
-
 test.describe('COV_CON_003: Long-running calls', () => {
   let app: FixtureApp
   let douzed: Douzed
@@ -317,7 +277,7 @@ test.describe('COV_CON_003: Long-running calls', () => {
     await app.reset()
     await app.set('delayMs', DELAY_MS)
 
-    client = new McpClient(douzed.home)
+    client = new McpClient(spawnMcp(douzed.home))
     await client.initialize()
     await expect
       .poll(async () => (await client.request('tools/list')).tools.map((t: { name: string }) => t.name), {

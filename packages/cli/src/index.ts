@@ -1,11 +1,11 @@
 import { Cli } from 'incur'
-import { DaemonClient } from './daemon-client.js'
+import { DaemonClient, hostDaemonInProcess } from './daemon-client.js'
 import { serveMcp } from './mcp.js'
 import { RelayClient } from './relay-client.js'
 import { ToolSurfaceBuilder } from './surface.js'
 import { register as registerDaemon } from './commands/daemon.js'
 import { register as registerBundle } from './commands/bundle.js'
-import { addToClaudeCode, parseMcpAdd } from './commands/mcp-add.js'
+import { AGENTS, addToAgent, isAgent, parseMcpAdd, snippet, type Scope } from './commands/mcp-add.js'
 import { register as registerMaintenance } from './commands/maintenance.js'
 
 const VERSION = '0.1.0'
@@ -35,19 +35,11 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   // needs the opposite, so the flag is intercepted and served by the dynamic wrapper in mcp.ts.
   if (argv.includes('--mcp')) return runMcp()
 
-  // AC-CON-002.1/.3 — Claude Code registration needs to report the scope it wrote and to handle
-  // reserved names; incur's built-in does neither. Other agents still fall through to it.
-  const mcpAdd = isClaudeCodeMcpAdd(argv)
-  if (mcpAdd) {
-    const result = addToClaudeCode(mcpAdd)
-    process.stdout.write(
-      `${result.requested ? `"${result.requested}" is reserved by Claude Code; registered as "${result.name}".\n` : ''}` +
-        `Registered "${result.name}" at ${result.scope} scope in ${result.path}\n` +
-        `  ${result.command} ${result.args.join(' ')}\n` +
-        `Verify with: claude mcp list\n`,
-    )
-    return
-  }
+  // AC-CON-002.1/.3 — registration reports the scope it wrote and handles reserved names, for
+  // every client Douze knows where to write. incur's built-in does neither, and writes a `douze`
+  // command that does not exist on a machine that installed Douze from a zip.
+  const mcpAdd = parseMcpAddArgv(argv)
+  if (mcpAdd) return runMcpAdd(mcpAdd)
 
   const cli = createCli()
   if (needsSurface(argv)) await attachSurface(cli, argv)
@@ -61,6 +53,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
  * the only non-recipe tools, which is what lets an agent diagnose REQ-CON-004 from inside a chat.
  */
 async function runMcp(): Promise<void> {
+  // This process runs douzed itself when nothing else is. It cannot re-exec one: the Node an MCP
+  // client runs us on is not always a node binary we can spawn (see `hostOrAdopt`). Declared for
+  // the whole process, because `status` and `sessions` build their own client when called.
+  hostDaemonInProcess()
   const daemon = new DaemonClient()
   const cli = createCli()
   const builder = new ToolSurfaceBuilder(cli, new RelayClient(daemon))
@@ -95,11 +91,37 @@ const isPassive = (argv: string[]): boolean =>
 
 const needsSurface = (argv: string[]): boolean => !SURFACE_FREE.has(argv[0] ?? '')
 
-function isClaudeCodeMcpAdd(argv: string[]): ReturnType<typeof parseMcpAdd> | null {
+function parseMcpAddArgv(argv: string[]): ReturnType<typeof parseMcpAdd> | null {
   const start = argv[0] === 'douze' ? 1 : 0
   if (argv[start] !== 'mcp' || argv[start + 1] !== 'add') return null
-  const parsed = parseMcpAdd(argv.slice(start + 2))
-  if (parsed.agent !== undefined && parsed.agent !== 'claude-code') return null
-  return parsed
+  return parseMcpAdd(argv.slice(start + 2))
+}
+
+/**
+ * A client we cannot write config for still gets a working answer: the block to paste, with the
+ * absolute paths already filled in. Naming the clients we do know is the only useful next step.
+ */
+function runMcpAdd(parsed: ReturnType<typeof parseMcpAdd>): void {
+  const agent = parsed.agent ?? 'claude-code'
+  if (!isAgent(agent)) {
+    const block = snippet(parsed.name, parsed.command)
+    process.stdout.write(
+      `Douze does not write ${agent}'s config. Paste this into its MCP settings:\n\n${block}\n\n` +
+        `Clients Douze registers itself with: ${AGENTS.join(', ')}\n`,
+    )
+    return
+  }
+  const result = addToAgent({
+    agent,
+    ...(parsed.name === undefined ? {} : { name: parsed.name }),
+    ...(parsed.scope === undefined ? {} : { scope: parsed.scope as Scope }),
+    ...(parsed.command === undefined ? {} : { command: parsed.command }),
+  })
+  process.stdout.write(
+    `${result.requested ? `Claude Code reserves "${result.requested}"; registered as "${result.name}" instead.\n` : ''}` +
+      `Registered "${result.name}" with ${result.agent} at ${result.scope} scope in ${result.path}\n` +
+      `  ${result.command} ${result.args.join(' ')}\n` +
+      `Restart ${result.agent} to pick it up.\n`,
+  )
 }
 

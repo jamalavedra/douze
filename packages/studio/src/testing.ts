@@ -23,6 +23,7 @@ export function makeExchange(draft: ExchangeDraft): Exchange {
   return {
     id: `ex-${position}-${url.pathname}`,
     session_id: 'test-session',
+    credentials: [],
     position,
     started_at: Date.parse('2026-07-14T12:00:00Z') + position * 1000,
     duration_ms: 10,

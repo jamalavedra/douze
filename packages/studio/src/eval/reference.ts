@@ -31,6 +31,7 @@ function exchange(draft: Draft): Exchange {
       : { accessible_name: draft.provenance, role: 'button', route: draft.route ?? '/orders', title: 'Shop admin' }
   return {
     id: `ex-${position}`,
+    credentials: [],
     session_id: 'reference-orders',
     position: position++,
     started_at: clock,

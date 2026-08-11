@@ -16,6 +16,18 @@ import type { ToolSurfaceBuilder } from './surface.js'
  */
 const POLL_MS = Number(process.env['DOUZE_REGISTRY_POLL_MS'] ?? 2000)
 
+/**
+ * How long the handshake waits for the first tool list before going ahead without it. Long
+ * enough for a daemon this process has to start itself (a few hundred milliseconds), short
+ * enough that a client never sees a server that looks dead.
+ */
+const FIRST_REFRESH_MS = 3000
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => {
+    setTimeout(resolve, ms).unref?.()
+  })
+
 export interface McpOptions {
   builder: ToolSurfaceBuilder
   daemon: DaemonClient
@@ -122,7 +134,12 @@ export async function serveMcp(options: McpOptions): Promise<McpHandle> {
     return result.changed
   }
 
-  await refresh()
+  // The daemon-free commands — `status`, `sessions` — are registered before the transport comes
+  // up, and they have to be: the SDK refuses `registerCapabilities` once a transport is attached,
+  // so the first `registerTool` must land while the server is still offline or every later one
+  // throws. It also means `tools/list` is never empty, so a client whose daemon is still starting
+  // can still ask Douze what state it is in.
+  sync()
 
   // AC-RUN-002.4 — a client that ignores listChanged still gets the current surface here, at
   // startup, because the surface is rebuilt from the registry rather than cached from install.
@@ -130,6 +147,21 @@ export async function serveMcp(options: McpOptions): Promise<McpHandle> {
     void refresh().catch(() => undefined)
   }, options.pollMs ?? POLL_MS)
   poll.unref?.()
+
+  // The recipe tools, if the daemon can produce them promptly — a client typically asks for
+  // `tools/list` the instant it is initialized, and answering that with the real list beats
+  // answering it empty and correcting it a moment later.
+  //
+  // Bounded, and never fatal. Waiting on the daemon *before connecting the transport* is what
+  // used to kill the connector: a start that could not succeed left `initialize` unanswered
+  // until the client gave up (COV_CON_005). Past this deadline the handshake wins and the tools
+  // arrive on the poll, through the same listChanged path a hot reload uses.
+  const first = refresh().catch((error: unknown) => {
+    // stderr is the only channel a stdio server has, and every MCP client logs it.
+    process.stderr.write(`douze: no tools yet — ${(error as Error).message}\n`)
+    return false
+  })
+  await Promise.race([first, sleep(FIRST_REFRESH_MS)])
 
   const transport = new StdioServerTransport(options.input as never, options.output as never)
   await server.connect(transport)

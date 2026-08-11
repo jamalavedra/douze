@@ -10,7 +10,7 @@ import {
   redactUrl,
   shouldCapture,
 } from '@douze/shared'
-import type { CapturedBody, GestureEvent } from './messages.js'
+import type { CapturedBody, CredentialHint, GestureEvent } from './messages.js'
 
 /** AC-CAP-003.1 — a gesture older than this did not cause the request. */
 export const PROVENANCE_WINDOW_MS = 2000
@@ -72,6 +72,9 @@ export function attribute(
 
 /** Everything known about one observed request, before session context is applied. */
 export interface ExchangeDraft {
+  /** AC-EXE-001.3 — the page that issued the request, and where its credentials live. */
+  page_origin?: string | undefined
+  credentials?: CredentialHint[] | undefined
   method: string
   url: string
   started_at: number
@@ -113,12 +116,16 @@ const originOf = (url: string): string => {
 
 /**
  * AC-CAP-004 — the shared filter decides inclusion, so live capture and HAR import cannot
- * drift apart. Returns null when the draft is noise, off-origin, or not an inferable type.
+ * drift apart. False when the draft is noise or not an inferable type.
+ *
+ * No origin list: every caller has already established that the recorded tab made this request,
+ * and the target is frequently a different host than the page — the API subdomain the dashboard
+ * talks to is the whole point of recording it (see `shouldCapture`).
  */
-export function admits(draft: ExchangeDraft, origins: string[], noise: NoiseConfig = defaultNoise()): boolean {
+export function admits(draft: ExchangeDraft, noise: NoiseConfig = defaultNoise()): boolean {
   return shouldCapture(
     { url: draft.url, origin: originOf(draft.url), response_content_type: draft.response_content_type },
-    origins,
+    null,
     noise,
   )
 }
@@ -152,6 +159,10 @@ export function finalize(draft: ExchangeDraft, ctx: SessionContext, id: string):
     background: 'background' in provenance,
     ...('provenance' in provenance ? { provenance: provenance.provenance } : {}),
     source: draft.source,
+    ...(draft.page_origin === undefined ? {} : { page_origin: draft.page_origin }),
+    // Locations, not values: a storage key and a header name pass redaction untouched, which is
+    // the point — the recipe has to say where the credential comes from without carrying one.
+    credentials: draft.credentials ?? [],
   }
 }
 

@@ -17,6 +17,7 @@ const exchange = (id: string): Exchange => ({
   body_missing: false,
   background: true,
   source: 'main_world',
+  credentials: [],
 })
 
 describe('socketUrl', () => {
@@ -59,6 +60,45 @@ describe('Outbox', () => {
     expect(outbox.size).toBe(1)
     const [remaining] = outbox.snapshot()
     expect(remaining?.type === 'exchange.append' && remaining.exchange.id).toBe('b')
+  })
+
+  /**
+   * The queue lives in a service worker Chrome suspends after 30 seconds idle, and a socket that
+   * is down is exactly when nothing keeps the worker awake. Memory-only, the buffer that exists to
+   * survive a stopped daemon was the first thing lost to one.
+   */
+  it('resumes a queue buffered by a worker Chrome has since suspended', () => {
+    const before = new Outbox()
+    let persisted: ClientMessage[] = []
+    before.onChange = (messages) => {
+      persisted = messages
+    }
+    before.push({ type: 'exchange.append', exchange: exchange('a') })
+    before.push({ type: 'exchange.append', exchange: exchange('b') })
+    expect(persisted).toHaveLength(2)
+
+    // The worker dies and Chrome respawns it; all the new one has is what was written.
+    const after = new Outbox()
+    after.restore(JSON.parse(JSON.stringify(persisted)) as ClientMessage[])
+    after.push({ type: 'exchange.append', exchange: exchange('c') })
+
+    const sent: ClientMessage[] = []
+    expect(after.drain((m) => (sent.push(m), true))).toBe(3)
+    expect(sent.map((m) => (m.type === 'exchange.append' ? m.exchange.id : ''))).toEqual(['a', 'b', 'c'])
+    expect(persisted).toHaveLength(2)
+  })
+
+  it('rewrites what it persists as it drains, so a delivered exchange is not replayed', () => {
+    const outbox = new Outbox()
+    let persisted: ClientMessage[] = []
+    outbox.onChange = (messages) => {
+      persisted = messages
+    }
+    outbox.push({ type: 'exchange.append', exchange: exchange('a') })
+    outbox.push({ type: 'exchange.append', exchange: exchange('b') })
+    let accepted = 0
+    outbox.drain(() => accepted++ < 1)
+    expect(persisted.map((m) => (m.type === 'exchange.append' ? m.exchange.id : ''))).toEqual(['b'])
   })
 
   it('drops the oldest entries rather than growing without bound', () => {

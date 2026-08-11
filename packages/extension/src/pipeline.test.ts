@@ -83,29 +83,36 @@ describe('attribute (AC-CAP-003)', () => {
 })
 
 describe('admits (AC-CAP-004)', () => {
-  const origins = ['https://app.example']
-
   it('keeps a JSON exchange on the recorded origin', () => {
-    expect(admits(draft(), origins)).toBe(true)
+    expect(admits(draft())).toBe(true)
   })
 
   it('drops a third-party analytics request (AC-CAP-004.1)', () => {
-    expect(admits(draft({ url: 'https://www.google-analytics.com/collect' }), origins)).toBe(false)
+    expect(admits(draft({ url: 'https://www.google-analytics.com/collect' }))).toBe(false)
   })
 
   it('drops a CSS asset (AC-CAP-004.2)', () => {
     const css = draft({ url: 'https://app.example/app.css', response_content_type: 'text/css' })
-    expect(admits(css, origins)).toBe(false)
+    expect(admits(css)).toBe(false)
   })
 
-  it('drops an exchange from an origin the session does not cover (AC-CAP-001.1)', () => {
-    expect(admits(draft({ url: 'https://other.example/api/orders' }), origins)).toBe(false)
+  /**
+   * The case that made a real dashboard record nothing at all: `dashboard.example` serves the
+   * page and `api.example` answers every call it makes. Only the recorded tab's requests reach
+   * here, so a different host is the API, not somebody else's traffic.
+   */
+  it('keeps the API call a page makes to another host (AC-CAP-001.1)', () => {
+    expect(admits(draft({ url: 'https://api.example/v1/orders' }))).toBe(true)
+  })
+
+  it('still drops noise on another host', () => {
+    expect(admits(draft({ url: 'https://cdn.segment.com/v1/track' }))).toBe(false)
   })
 
   it('honours a user addition to the noise list (AC-CAP-004.3)', () => {
     const beacon = draft({ url: 'https://app.example/metrics/collect' })
-    expect(admits(beacon, origins)).toBe(true)
-    expect(admits(beacon, origins, { hosts: [...NOISE_HOSTS, 'app.example'] })).toBe(false)
+    expect(admits(beacon)).toBe(true)
+    expect(admits(beacon, { hosts: [...NOISE_HOSTS, 'app.example'] })).toBe(false)
   })
 })
 

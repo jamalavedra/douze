@@ -91,7 +91,7 @@ test.describe('COV_CON_004: Legible failure', () => {
     // only recourse a chat user has. (It no longer offers `douze start` as a second option: see
     // RELAY_UNREACHABLE_HINT in packages/cli/src/errors.ts.)
     expect(unreachable).toMatch(/isn't running/i)
-    expect(unreachable).toMatch(/Claude Desktop/i)
+    expect(unreachable).toMatch(/Quit the app you added Douze to/i)
     expect(unreachable).not.toMatch(/headless/i)
     expect(await targetHits()).toBe(0)
 

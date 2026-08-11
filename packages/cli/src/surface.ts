@@ -145,7 +145,7 @@ export class ToolSurfaceBuilder {
 }
 
 /**
- * Claude Desktop selects on the description alone (ADR-008), so the side effect and the
+ * A chat client selects on the description alone (ADR-008), so the side effect and the
  * degradation reason belong in the text rather than only in annotations a client may ignore.
  */
 function describe(surface: SurfaceTool): string {
