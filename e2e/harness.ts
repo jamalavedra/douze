@@ -283,7 +283,8 @@ export class RelayServer {
   /**
    * Mints an endpoint. This is the half of T-015.10 the connect page's "share with a hosted
    * assistant" button will do before it writes the pairing into extension storage; the button is
-   * not wired yet, so the suite calls the relay route it will call and `pairRelay` writes the key.
+   * the same route the connect page's button calls; `pairRelay` writes the key directly so a spec
+   * does not have to drive the page to get an endpoint.
    */
   async register(): Promise<{ token: string; mcp_path: string }> {
     const response = await fetch(`${this.origin}/register`, {

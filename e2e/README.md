@@ -37,7 +37,8 @@ constructor through an alias that minifies the same way. So `artifacts.spec.ts` 
 constructor being **called**, and allows exactly one site — zod's own JIT probe, which is
 try/caught and identified by the `Cloudflare` marker beside it. Anything else fails.
 
-Worth knowing: that probe runs unless the extension sets `z.config({ jitless: true })`, and zod's
+Worth knowing: the extension now sets `z.config({ jitless: true })` (`zod-config.ts`), so the
+probe never runs; without it zod's
 own comment says a strict CSP reports the caught throw as a `securitypolicyviolation`. Harmless
 today, visible to a Web Store reviewer.
 
@@ -75,8 +76,8 @@ for putting state into the extension.
 Two of those are working around things that are not built yet, and should be revisited:
 
 - `pairRelay` writes `attach:relay` straight into extension storage after calling the relay's own
-  `POST /register`. That is what T-015.10's connect-page button will do; the button is not wired
-  (`douze:connect:start` still answers "not wired up yet").
+  `POST /register` — the same call the connect page's button now makes (`douze:connect:start`).
+  The helper exists so a spec does not have to drive the page's UI to get an endpoint.
 - `redial` sends `douze:connect:pair` to tick the attachment manager on demand, because its own
   trigger is a `chrome.alarms` tick with a 30-second floor. An empty code means "no bridge", so it
   is a tick; a real code is the pairing itself, which is how `bridge.spec.ts` pairs.

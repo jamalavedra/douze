@@ -370,11 +370,12 @@ target returned a moment ago — so `gateResult` is a separate last check before
 browser at all, per trust level, with a per-tool `expose` list under `attach:expose` as the only
 override.
 
-**The artifact sweep has no home right now.** It used to be `e2e/metrics.mjs` walking `DOUZE_HOME`,
-which no longer exists; it must be re-pointed at extension storage (IndexedDB plus
-`chrome.storage.local`, read out through the service worker). `e2e/README.md` carries the patterns
-verbatim. Until that exists, C-4 cannot be re-established on the new architecture and no report may
-claim it.
+**The artifact sweep runs against extension storage.** It used to be `e2e/metrics.mjs` walking
+`DOUZE_HOME`, which no longer exists. `e2e/artifacts.spec.ts` replaces it: it records a session
+carrying every secret shape in the pattern list, then sweeps `chrome.storage.local` and IndexedDB
+through the service worker, and asserts the exchanges are present so the sweep cannot pass by
+finding nothing. It also carries the build guard — the worker bundle must contain no
+code-generating call site beyond zod's one probe, which `zod-config.ts` now disables.
 
 ## Verify the whole path
 
@@ -382,9 +383,9 @@ claim it.
 pnpm e2e            # Playwright, testDir ./e2e, Helium headed, one worker
 ```
 
-There is no `verify:e2e` script in `package.json` today — check it before quoting one. The suite was
-deleted with the daemon and rebuilt under T-015.14; **its coverage is exactly what
-`e2e/README.md` claims and nothing more**, so read that file before deciding what a green run
+`pnpm verify:e2e` names the five specs that must pass before a release. The suite was deleted with
+the daemon and rebuilt under T-015.14; **its coverage is exactly what `e2e/README.md` claims and
+nothing more**, so read that file before deciding what a green run
 proves. `e2e/global-setup.ts` builds the extension with the fixture origin baked into
 `host_permissions`, because `chrome.permissions.request` needs a user gesture Playwright cannot
 supply.
@@ -431,10 +432,6 @@ live response bodies, or a real account's browser profile into an issue.
 Stated plainly, as of 2026-08-11. Each is something nobody has done, not something that merely
 lacks a test.
 
-- **No hosted client has ever attached.** Not ChatGPT, not claude.ai, not Dust. The relay path has
-  only ever been exercised by hand-written clients speaking the same streamable HTTP, so every
-  claim about how a real platform behaves — whether it accepts a non-SSE JSON response, how it
-  renders a JSON-RPC error, what it does with a 404 session — is assumption.
 - **C-1 is still open and can no longer be closed the way it was being closed.** No recording
   against a real authenticated dashboard has produced a completed read since the rewrite, and the
   daemon path that the last attempt ran on has been deleted. It must be redone on the extension.
