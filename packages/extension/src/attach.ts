@@ -1,5 +1,16 @@
 import { HostFrame, type AttachedTool, type ExtensionFrame, type Trust } from '@douze/mcp-host'
-import type { RelayRequest, RelayResponse } from '@douze/shared'
+import {
+  BRIDGE_PORT_RANGE,
+  codeKey,
+  isNonce,
+  mintNonce,
+  proof,
+  proofMatches,
+  secretHashKey,
+  sha256Hex,
+  type RelayRequest,
+  type RelayResponse,
+} from '@douze/shared'
 import { AuditLog, RateLimiter, attachedSurface, runToolCall, type AuditEntry } from './guards.js'
 import type { SurfaceTool } from './recipes.js'
 
@@ -14,14 +25,14 @@ import type { SurfaceTool } from './recipes.js'
  * before reporting the browser as gone — and the alarm is recreated at every worker start, because
  * an evicted worker loses every timer it had.
  *
- * **Trust is derived here, from what was dialled, and never read off a frame.** A `tool.call`
+ * **Trust is derived here, from what was dialled AND from what the far side proved.** A `tool.call`
  * carries the host's own `trust` claim; it is deliberately ignored, because a relay operator or
- * anyone holding a stolen URL can put whatever they like in it. A paired loopback bridge is
- * `local`; everything else is `remote`. The guards in guards.ts read only the value below.
+ * anyone holding a stolen URL can put whatever they like in it. `local` is a bridge that answered
+ * the handshake in `@douze/shared`'s bridge-handshake.ts with a proof only the holder of this
+ * install's credential could compute; everything else is `remote`. Dialling loopback is not that
+ * proof: binding 127.0.0.1 needs no privilege, so any process on this machine can be first to
+ * 8913 and wait for the next alarm. The guards in guards.ts read only the value below.
  */
-
-/** T-015.11 — the ports a bridge walks, deliberately not douzed's 8787–8791. */
-export const BRIDGE_PORT_RANGE = [8912, 8913, 8914, 8915, 8916] as const
 
 const RECONNECT_ALARM = 'douze-attach'
 /** `chrome.alarms` will not fire faster than this, which sets the floor for every backoff below. */
@@ -50,8 +61,10 @@ export interface RelayPairing {
 
 /**
  * The bridge half. `secret` is the 32-byte credential the bridge minted on the first pairing and
- * handed back on the raw `welcome`; `code` is what the user typed in from the bridge's stderr and
- * is spent the moment a pairing succeeds. `blocked` means a host answered 1008 — see `onClose`.
+ * handed back on the raw `welcome` — after the handshake, never before it; `code` is what the user
+ * typed in from the bridge's stderr and is spent the moment a pairing succeeds. Neither is ever
+ * put on the wire: both are only ever HMAC keys. `blocked` means a host answered 1008 — see
+ * `onClose`.
  */
 export interface BridgePairing {
   secret?: string
@@ -89,6 +102,12 @@ class Attachment {
   private nextAttemptAt = 0
   private silence: ReturnType<typeof setTimeout> | undefined
   private heartbeatMs = DEFAULT_HEARTBEAT_MS
+  /** This dial's nonce, minted at `open` and single-use: a replayed challenge answers the old one. */
+  private nonce = ''
+  /** One challenge is answered per socket; a second is a peer trying to spend our CPU. */
+  private challenged = false
+  /** The far side proved it holds this install's bridge credential. Nothing is disclosed until it has. */
+  private verified = false
 
   constructor(
     readonly target: Target,
@@ -101,12 +120,13 @@ class Attachment {
   }
 
   /**
-   * The trust this attachment stamps on every call it runs. A bridge is `local` only once it holds
-   * the credential the user typed a code to earn — loopback alone is not consent, because any
-   * process on the machine can listen on 127.0.0.1.
+   * The trust this attachment stamps on every call it runs. A bridge is `local` only once **this
+   * socket's peer** has proved it holds the credential the user typed a code to earn. Holding a
+   * secret is not the test — the peer proving it holds the same one is: loopback alone is not
+   * consent, because any process on the machine can listen on 127.0.0.1 and answer.
    */
   get trust(): Trust {
-    return this.target.kind === 'bridge' && this.manager.bridgePaired ? 'local' : 'remote'
+    return this.target.kind === 'bridge' && this.verified ? 'local' : 'remote'
   }
 
   private get allowWrites(): boolean {
@@ -127,6 +147,9 @@ class Attachment {
       return
     }
     this.socket = socket
+    this.nonce = mintNonce()
+    this.challenged = false
+    this.verified = false
     socket.addEventListener('open', () => {
       this.send(socket, this.hello())
       // Armed at `open`, not at the first frame: a host that accepts the socket and then never
@@ -144,6 +167,7 @@ class Attachment {
     const socket = this.socket
     this.socket = null
     this.attached = false
+    this.verified = false
     clearTimeout(this.silence)
     socket?.close()
   }
@@ -161,15 +185,18 @@ class Attachment {
   private hello(): ExtensionFrame & Record<string, unknown> {
     const base = { type: 'hello' as const, extension_version: version() }
     if (this.target.kind === 'relay') return { ...base, token: this.target.token }
-    // The secret if we have one, the code exactly once if we do not. Both ride BESIDE the protocol
-    // fields, as the relay's token does: whose credential it is belongs to the transport.
-    const pairing = this.manager.bridge
-    return pairing.secret ? { ...base, secret: pairing.secret } : { ...base, code: pairing.code ?? '' }
+    // A bridge hello carries no credential at all, only this dial's nonce: whatever answered on
+    // this port has not proved anything yet, and the first frame is the one a rogue is waiting for.
+    return { ...base, nonce: this.nonce }
   }
 
   private onFrame(socket: WebSocket, raw: string): void {
     if (this.socket !== socket) return
     const payload = parse(raw)
+    // Until the bridge has proved itself the ONLY frame that means anything is its challenge — no
+    // pong, no surface, no call, and no silence timer reset, so a peer that stalls here is closed
+    // by the watchdog armed at `open` rather than kept alive by its own chatter.
+    if (this.target.kind === 'bridge' && !this.verified) return void this.onChallenge(socket, payload)
     const frame = HostFrame.safeParse(payload)
     if (!frame.success) return
     this.watchSilence()
@@ -180,13 +207,48 @@ class Attachment {
     void this.onCall(socket, frame.data.id, frame.data.name, frame.data.args)
   }
 
+  /**
+   * The bridge's half of the handshake. It carries a proof over both nonces and this port, and it
+   * is the whole basis for `local` trust: if it does not verify, this attachment sends nothing
+   * back, stays `remote`, never attaches and never pins anything. Silence rather than a close, so
+   * a REAL bridge that was given the wrong code still gets to answer 1008 and tell the user so.
+   *
+   * A rogue that squats the port instead learns nothing from the silence and is dropped by the
+   * watchdog. The mismatch is deliberately not notified: a squatter must not be able to turn the
+   * extension's bridge pairing off by answering badly.
+   */
+  private async onChallenge(socket: WebSocket, payload: unknown): Promise<void> {
+    if (this.challenged || this.target.kind !== 'bridge') return
+    if (!isRecord(payload) || payload['type'] !== 'bridge.challenge') return
+    const bridgeNonce = payload['nonce']
+    if (!isNonce(bridgeNonce)) return
+    this.challenged = true
+    const key = await this.handshakeKey()
+    if (!key) return
+    const transcript = { port: this.target.port, extensionNonce: this.nonce, bridgeNonce }
+    const expected = await proof(key, { role: 'bridge', ...transcript })
+    if (!proofMatches(expected, payload['proof'])) return
+    if (this.socket !== socket || socket.readyState !== 1) return
+    this.verified = true
+    this.watchSilence()
+    this.send(socket, { type: 'bridge.proof', proof: await proof(key, { role: 'extension', ...transcript }) })
+  }
+
+  /** `sha256(secret)` once paired — what the bridge stores — or the stretched code before that. */
+  private async handshakeKey(): Promise<CryptoKey | null> {
+    const pairing = this.manager.bridge
+    if (pairing.secret) return secretHashKey(await sha256Hex(pairing.secret))
+    return pairing.code ? codeKey(pairing.code) : null
+  }
+
   private onWelcome(socket: WebSocket, heartbeatMs: number, payload: unknown): void {
     this.heartbeatMs = heartbeatMs
     this.attached = true
     this.failures = 0
     this.nextAttemptAt = 0
     // The bridge's `secret` rides on the RAW welcome — the protocol schema strips it, because it
-    // is the bridge's business and not the host's. Pinned now; the code that earned it is spent.
+    // is the bridge's business and not the host's. Only reachable once `verified` (see `onFrame`),
+    // so a rogue cannot make us pin its own. Pinned now; the code that earned it is spent.
     const secret = isRecord(payload) ? payload['secret'] : undefined
     if (this.target.kind === 'bridge' && typeof secret === 'string') void this.manager.pinBridge(secret)
     this.watchSilence()
@@ -274,6 +336,16 @@ class Manager {
    * differs from this one, so a re-pairing dials immediately.
    */
   private refusedToken: string | null = null
+  /**
+   * A relay refusal waiting to be explained to the user, held until the next tick.
+   *
+   * The relay closes the old socket 1008 the moment it answers `POST /rotate`, which the user just
+   * asked for, and that close routinely beats the connect page's write of the new token to
+   * storage. Judged at the close it reads as a revocation; judged one tick later — with the write
+   * certainly landed — a rotate is simply a token that is no longer the stored one. Deciding late
+   * costs a notification up to 30 seconds; deciding early cries wolf every single rotate.
+   */
+  private pendingRefusal: string | null = null
 
   constructor(private readonly deps: AttachDeps) {}
 
@@ -303,6 +375,7 @@ class Manager {
    */
   async tick(): Promise<void> {
     await this.load()
+    this.judgeRefusal()
     const relay = this.relay && this.relay.token !== this.refusedToken ? relayTarget(this.relay) : null
     this.drop('relay:', relay?.key)
     if (relay) this.attachment(relay).connect()
@@ -337,12 +410,8 @@ class Manager {
   async refused(target: Target): Promise<void> {
     if (target.kind === 'relay') {
       this.refusedToken = target.token
+      this.pendingRefusal = target.token
       this.drop('relay:')
-      this.deps.notify(
-        'douze-relay-refused',
-        'Douze lost its link',
-        'The link you shared with your hosted assistant is no longer valid. Open Douze and get a new one.',
-      )
       return
     }
     this.bridge = { blocked: true }
@@ -361,6 +430,24 @@ class Manager {
     await chrome.storage.local.set({ [BRIDGE_KEY]: this.bridge })
     this.drop('bridge:')
     await this.tick()
+  }
+
+  /**
+   * Says something about a relay refusal only if the token that was refused is still the one in
+   * storage. A rotate or a stop replaced it, and the user knows: they did it. Runs on the fresh
+   * read at the top of `tick`, so a worker Chrome evicted between the close and the alarm simply
+   * dials again, is refused again, and asks on the tick after that.
+   */
+  private judgeRefusal(): void {
+    const refused = this.pendingRefusal
+    if (!refused) return
+    this.pendingRefusal = null
+    if (this.relay?.token !== refused) return
+    this.deps.notify(
+      'douze-relay-refused',
+      'Douze lost its link',
+      'The link you shared with your hosted assistant is no longer valid. Open Douze and get a new one.',
+    )
   }
 
   private attachment(target: Target): Attachment {

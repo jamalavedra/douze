@@ -136,6 +136,10 @@ describe('tools/call', () => {
     const response = await pending
 
     expect(call).toMatchObject({ type: 'tool.call', name: 'shop_list_orders', args: { id: 'o1' } })
+    // A UUID per host and a counter after it. The relay fans a `tool.result` to every session on
+    // an endpoint, so two hosts that happened to mint the same prefix would settle each other's
+    // calls — which is what a slice of `Math.random().toString(36)` occasionally produces.
+    expect(call?.id).toMatch(/^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}-1$/)
     expect(response).toEqual({
       jsonrpc: '2.0',
       id: 7,

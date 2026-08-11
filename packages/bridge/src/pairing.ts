@@ -1,4 +1,4 @@
-import { createHash, randomBytes, randomInt, timingSafeEqual } from 'node:crypto'
+import { createHash, randomBytes, randomInt } from 'node:crypto'
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -16,10 +16,13 @@ import { dirname, join } from 'node:path'
  *
  * 1. A bridge with no credential mints a short code and prints it **to stderr**, which reaches the
  *    human through their MCP client's log and reaches no socket.
- * 2. The extension presents that code on `hello`. Nothing else attaches.
- * 3. On success the bridge mints a 32-byte secret, hands it back on `welcome` for the extension to
- *    pin, and stores only its sha256 in a `0600` file — the same discipline `installToken()` used
- *    for the daemon's token (packages/douzed/src/paths.ts).
+ * 2. Neither end presents a credential: they prove they hold one, over nonces both contributed and
+ *    bound to this port. `@douze/shared`'s `bridge-handshake.ts` is that exchange, and it is shared
+ *    with the extension precisely so the two cannot drift into disagreeing about what proves what.
+ * 3. On a first pairing — once the extension has proved it holds the code — the bridge mints a
+ *    32-byte secret, hands it back on `welcome` for the extension to pin, and stores only its
+ *    sha256 in a `0600` file. That hash is also the HMAC key every later attach runs on, so the
+ *    secret itself is written down nowhere and never travels the wire again.
  * 4. Every later run reads that file and never prompts again.
  *
  * The code is short because a human retypes it into the extension; the credential it buys is not,
@@ -47,7 +50,10 @@ export const credentialFile = (): string =>
   join(process.env['DOUZE_HOME'] ?? join(homedir(), '.douze'), 'bridge.json')
 
 export interface Credential {
-  /** sha256 hex of the secret. The secret itself is never written down on this side. */
+  /**
+   * sha256 hex of the secret, and the HMAC key the handshake runs on. The secret itself is never
+   * written down on this side, and after the pairing that minted it, never sent either.
+   */
   secret_hash: string
   paired_at: string
 }
@@ -59,16 +65,7 @@ export const mintCode = (): string => {
   return `${code.slice(0, 4)}-${code.slice(4)}`
 }
 
-/** A code is compared by its characters, not its formatting: dashes, spaces and case are noise. */
-const normalize = (value: string): string => value.toUpperCase().replaceAll(/[^0-9A-Z]/g, '')
-
-export const codeMatches = (presented: string, expected: string): boolean =>
-  equal(Buffer.from(normalize(presented)), Buffer.from(normalize(expected)))
-
 export const mintSecret = (): string => randomBytes(32).toString('base64url')
-
-export const secretMatches = (presented: string, credential: Credential): boolean =>
-  equal(sha256(presented), Buffer.from(credential.secret_hash, 'hex'))
 
 /** A missing, truncated or hand-edited file counts as unpaired, and the bridge prompts again. */
 export const readCredential = (): Credential | null => {
@@ -98,6 +95,3 @@ export const writeCredential = (secret: string): Credential => {
 }
 
 const sha256 = (value: string): Buffer => createHash('sha256').update(value).digest()
-
-/** timingSafeEqual throws on a length mismatch, which is itself an oracle if it escapes. */
-const equal = (a: Buffer, b: Buffer): boolean => a.length === b.length && timingSafeEqual(a, b)

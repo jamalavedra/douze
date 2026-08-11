@@ -61,65 +61,114 @@ it happens once per machine — every later run reads the credential and prints 
 
 ## Pairing, and why it is not optional
 
-**Loopback is not consent.** `127.0.0.1` proves only that the peer is on this machine, and every
-process on this machine can dial it. Without a shared secret the first thing to connect would
-inherit `local` trust, which includes destructive tools. So:
+**Loopback is not consent, and it is not identity either.** `127.0.0.1` proves only that the peer
+is on this machine. Binding a loopback port needs no privilege, so any process running as any local
+user can take 8913 and wait for the extension's next 30-second alarm — and the extension hands
+`local` trust, destructive tools included, to whatever is on the far side of that socket. So
+neither end tells the other anything until the other has **proved** it holds the credential.
 
-1. A bridge with no credential mints an 8-character code and prints it **to stderr**. stderr
-   reaches the human through their client's log and reaches no socket.
-2. The extension presents that code on `hello`. Nothing else attaches; every other socket is
-   closed with 1008 before the host is ever told anything is there.
-3. On success the bridge mints a 32-byte secret, hands it back alongside `welcome` for the
-   extension to pin, and stores **only its sha256** in `~/.douze/bridge.json`, mode `0600`.
-4. Every later run reads that file and never prompts again.
+### The handshake
 
-Ten failed attempts and the process refuses every connection until it is restarted — and only your
-own MCP client restarts a bridge. That cap is what makes a short, typeable code safe on a port
-anything can reach: brute-forcing 39 bits at ten guesses per process is not a thing that finishes.
+One implementation, in `@douze/shared` (`bridge-handshake.ts`), imported by both ends so they
+cannot drift into disagreeing about what proves what.
+
+```
+extension → hello             { extension_version, nonce: Ne }
+bridge    → bridge.challenge  { nonce: Nb, proof: P(bridge) }
+extension → bridge.proof      { proof: P(extension) }       only if P(bridge) verified
+bridge    → welcome           { heartbeat_ms, secret? }     only if P(extension) verified
+```
+
+`P(role) = HMAC-SHA256(K, "douze-bridge-v1|<role>|<port>|<Ne>|<Nb>")`, hex, compared in constant
+time on both ends. `hello` and `bridge.proof` and `bridge.challenge` are the transport's own frames
+and are deliberately not in the `HostFrame`/`ExtensionFrame` union, exactly as the relay's endpoint
+token is not.
+
+`K` is never on the wire, in either direction:
+
+- **first pairing**: `K = PBKDF2-SHA256(code, "douze-bridge-v1|pairing", 200 000 rounds)`. The
+  bridge mints an 8-character code and prints it **to stderr**, which reaches the human through
+  their client's log and reaches no socket. The user types it into the extension. Nothing sends it.
+- **every attach after that**: `K = sha256(secret)`, which is exactly the 32 bytes in
+  `~/.douze/bridge.json`. The 32-byte secret itself crosses the wire once — on the `welcome` that
+  ends the pairing handshake, after the extension has proved it holds the code — and is written
+  down nowhere on this side.
+
+What each element of the transcript is for:
+
+- **Both nonces**, 32 random bytes minted fresh per socket on both ends: a recorded transcript
+  replays into a different `Nb` and a different `Ne` and verifies against neither end.
+- **The role**, so a rogue cannot reflect the extension's own proof back at it.
+- **The port**, which is the channel binding. Without it a rogue on 8913 could forward the whole
+  exchange to a real bridge on 8912 and sit in the middle of it; with it, the challenge is bound to
+  8912 while the extension is verifying against 8913, and the relay fails on both sides. One
+  listener per port on loopback is the only binding two unauthenticated TCP connections have, and
+  this uses it.
+
+The bridge answers a challenge to anything that says hello, so that challenge is an offline oracle
+for the code — which is why the code's key is stretched. Searching 39 bits at 200 000 PBKDF2 rounds
+each is not an afternoon's work, and the code is single-use and lives only until the first pairing.
+On top of that, **ten failed proofs and the process refuses every connection until it is
+restarted**, and only your own MCP client restarts a bridge.
+
+Upgrades are rejected unless `Origin` is a `chrome-extension://` URL, before anything is counted as
+an attempt. WebSocket connections are not subject to CORS, so without that check any page you
+happen to visit could open `ws://127.0.0.1:8912/ws`, fingerprint whether Douze is running, and burn
+the attempt cap until the bridge refuses your own extension.
 
 ### What an attacker on the same machine can and cannot do
 
-Cannot, without ever having seen the code:
+Cannot, without holding the code or the credential:
 
 - attach and inherit `local` trust, which is what makes destructive tools reachable;
+- be told the tool surface, or anything else — an unproved peer is sent no `surface.push`, no
+  `pong`, and gets no answer to a `tool.call`;
 - reach the extension, your recipes, or any dashboard, through this pipe;
-- read the code off the wire, because it never travels the wire in the pairing direction — the
-  bridge prints it and only ever receives a candidate to compare;
-- learn it by guessing, because of the ten-attempt cap;
-- learn it from the credential file, which holds a sha256 of the secret and never the secret;
-- learn it by timing, because both comparisons are `timingSafeEqual`.
+- read the code or the secret off the wire, because neither travels it: the extension sends a
+  nonce, then an HMAC;
+- pass off a secret of its own for the extension to pin, because a `welcome` from a peer that has
+  not proved itself is ignored;
+- replay a recorded handshake, because both nonces are fresh per socket;
+- sit between a real extension and a real bridge, because the proof is bound to the port;
+- learn any of it by guessing, because of the ten-attempt cap, or by timing, because both ends
+  compare digests in constant time.
 
 Can:
 
-- see that a bridge is listening, and that pairing has or has not happened (`connect` succeeds, and
-  a refusal is distinguishable from a `welcome`);
-- take the port, so the bridge walks to the next one in its range;
+- see that a bridge is listening, and that pairing has or has not happened;
+- take the port, so the bridge walks to the next one in its range — and, by answering the
+  extension's dial with a wrong proof, keep that port useless until the socket times out. It is
+  told nothing and the extension's pairing is not turned off by it;
 - occupy the ten attempts and so deny pairing until the client restarts the bridge.
 
 **The residual, stated plainly: local malware running as you reads the file.** `~/.douze/bridge.json`
-is `0600`, which stops other *users*, not other *code* running under your own account — the same
-process can also read your browser profile, your SSH keys and your shell history. Anything that has
-already achieved arbitrary code execution as you has better targets than this one; pairing defends
-the boundary that is actually defensible, which is one local process against another that is not
-running as you, and against every unprivileged listener that merely got to loopback first. A
-`.mcpb`-style OS keychain would move the secret but not this line.
+is `0600`, which stops other *users*, not other *code* running under your own account — and what is
+in it is the HMAC key, so reading it is enough to impersonate either end. The same process can also
+read your browser profile, your SSH keys and your shell history. Anything that has already achieved
+arbitrary code execution as you has better targets than this one; pairing defends the boundary that
+is actually defensible, which is one local process against another that is not running as you, and
+against every unprivileged listener that merely got to loopback first. A `.mcpb`-style OS keychain
+would move the key but not this line.
 
 If you reinstall the extension and it no longer has the secret, delete `~/.douze/bridge.json` and
 restart the bridge; it prints a fresh code. The refusal message says so.
 
 ## Ports
 
-`8912–8916`, walked in order, taking the first that is free — **not** `PORT_RANGE` (8787–8791)
-from `@douze/shared`. That range is douzed's, and it speaks a different protocol on it (capture,
+`BRIDGE_PORT_RANGE` in `@douze/shared` — `8912–8916`, walked in order, taking the first that is
+free. It lives there rather than in either end because both ends must agree on it: the bridge binds
+the range and the extension sweeps it, and a constant declared twice is a constant that eventually
+differs. Deliberately **not** douzed's 8787–8791: that range speaks a different protocol (capture,
 not attachment), so a single range would have the extension meeting the wrong server until the
 daemon goes away in phase 4. The walk itself is kept because a bridge is per MCP client rather than
 per machine: Claude Code and Cursor open one each, so several are live at once and the extension
-sweeps the range rather than assuming one.
+sweeps the range rather than assuming one. The port is also part of the handshake transcript, which
+is what stops one member of the range from relaying for another.
 
 ## Lifecycle
 
-- `hello` with a valid credential → `setAttached(true)`; a second one is a reconnecting worker and
-  replaces the first.
+- a completed handshake → `setAttached(true)`; a second one is a reconnecting worker and replaces
+  the first.
 - socket loss → `setAttached(false)`, which **fails in-flight calls at once** rather than leaving
   them on a 120-second timer. None is ever re-sent: a tool can be a write, and a silent retry of a
   write is worse than a failure a human decides about.
@@ -137,17 +186,21 @@ sweeps the range rather than assuming one.
 
 ## What the extension side must implement
 
-- Dial `ws://127.0.0.1:<port>/ws` across `8912–8916`, attaching to each bridge that answers; one
-  attachment client per bridge, since each is a separate MCP client's session.
-- First frame `hello{extension_version, secret?, code?}` within 5 seconds — `secret` when this
-  bridge's install has been paired before, `code` when the user has just typed one in. The
-  credential rides *alongside* the attachment protocol's own fields, exactly as the endpoint token
-  does in the relay's `hello`.
+- Dial `ws://127.0.0.1:<port>/ws` across `BRIDGE_PORT_RANGE`, attaching to each bridge that answers;
+  one attachment client per bridge, since each is a separate MCP client's session. Chrome puts
+  `Origin: chrome-extension://<id>` on the upgrade, which is what gets it past the check above.
+- First frame `hello{extension_version, nonce}` within 5 seconds, carrying **no credential** — then
+  the handshake above, which the whole 5 seconds covers.
+- Verify `bridge.challenge` before sending anything else, and stay silent on a mismatch rather than
+  closing: a real bridge given the wrong code answers 1008 a moment later, and that is what tells
+  the user to type it again. A rogue that answers badly must not be able to switch bridge pairing
+  off from the outside.
 - Read `secret` off the **raw** `welcome` frame on a first pairing and pin it in extension storage;
   the `HostFrame` schema does not carry it, and parsing strictly would drop it.
 - Treat a 1008 close as "not paired": prompt for a code rather than retrying the same credential.
-- Derive `trust` from what it dialled — a `ws://127.0.0.1` bridge it paired is `local` — and never
-  from anything a frame claims.
+- Derive `trust` from what it dialled **and from what the far side proved** — a `ws://127.0.0.1`
+  bridge whose proof verified is `local` — and never from anything a frame claims. Holding a secret
+  is not the test; the peer proving it holds the same one is.
 - Everything else is the attachment protocol it already speaks to the relay: `pong`,
   `surface.push` on connect and on every recipe change, `tool.result{id, result | error}`.
 

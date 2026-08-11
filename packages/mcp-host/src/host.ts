@@ -116,8 +116,13 @@ export class McpHost {
    * at all because `handle()` awaits each request and echoes its id straight back.
    */
   private readonly pending = new Map<string, { resolve: (outcome: Outcome) => void; timer: ReturnType<typeof setTimeout> }>()
-  /** Unique per host instance, so ids from two sessions on one attachment cannot collide. */
-  private readonly prefix = Math.random().toString(36).slice(2, 10)
+  /**
+   * Unique per host instance, so ids from two sessions on one attachment cannot collide. A UUID
+   * rather than a slice of `Math.random().toString(36)`, which is occasionally short and sometimes
+   * empty: the relay fans a `tool.result` to every session on an endpoint, so two hosts that
+   * happened to share a prefix would settle each other's calls.
+   */
+  private readonly prefix = crypto.randomUUID()
   private calls = 0
 
   constructor(options: McpHostOptions) {

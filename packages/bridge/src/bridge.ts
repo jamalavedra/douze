@@ -2,18 +2,18 @@ import { createServer, type Server as HttpServer } from 'node:http'
 import { createInterface } from 'node:readline'
 import type { Readable, Writable } from 'node:stream'
 import { WebSocketServer, type WebSocket } from 'ws'
-import { HEARTBEAT_MS } from '@douze/shared'
-import { ExtensionFrame, McpHost, welcome, type JsonRpcResponse } from '@douze/mcp-host'
 import {
-  ATTEMPTS,
-  codeMatches,
-  credentialFile,
-  mintCode,
-  mintSecret,
-  readCredential,
-  secretMatches,
-  writeCredential,
-} from './pairing.js'
+  BRIDGE_PORT_RANGE,
+  HEARTBEAT_MS,
+  codeKey,
+  isNonce,
+  mintNonce,
+  proof,
+  proofMatches,
+  secretHashKey,
+} from '@douze/shared'
+import { ExtensionFrame, McpHost, welcome, type JsonRpcResponse } from '@douze/mcp-host'
+import { ATTEMPTS, credentialFile, mintCode, mintSecret, readCredential, writeCredential } from './pairing.js'
 
 /**
  * WO-015 T-015.11 — **the local pipe**. The relay (WO-015 T-015.7) lets hosted assistants reach
@@ -36,23 +36,10 @@ import {
  *
  * The one thing it does claim is trust: the host is constructed `local`, so every `tool.call` it
  * emits is stamped `local` and the extension's guards let a destructive tool through with
- * `confirm: true`. That claim is exactly what pairing.ts exists to earn.
+ * `confirm: true`. That claim is exactly what pairing.ts and the handshake below exist to earn —
+ * and the extension grants it only to a peer that proved it, never to whatever answered on the
+ * port, because binding a loopback port takes no privilege at all.
  */
-
-/**
- * Five ports, walked in order, deliberately **not** `PORT_RANGE` (8787–8791) from
- * `@douze/shared`.
- *
- * Two reasons. That range belongs to douzed, which speaks an entirely different protocol on it
- * (`ClientMessage`/`ServerMessage` — capture, not attachment); until the daemon is deleted in
- * phase 4 an extension probing one range would keep meeting the wrong server on it. And a bridge
- * is per MCP client, not per machine: Claude Code and Cursor open one each, so several are live at
- * once and the walk is load-bearing rather than a courtesy to squatters.
- *
- * The convention itself is reused as-is, because the extension's only way to find a listener is to
- * probe: five is enough for every client a person has open and short enough to sweep on a timer.
- */
-export const BRIDGE_PORT_RANGE = [8912, 8913, 8914, 8915, 8916] as const
 
 /** Frames are small; ws defaults to 100 MB, which nothing here needs. */
 const MAX_PAYLOAD = 1_048_576
@@ -101,6 +88,7 @@ export async function startBridge(options: BridgeOptions): Promise<Bridge> {
 
   let credential = readCredential()
   const code = credential ? null : mintCode()
+  let key: Promise<CryptoKey> | null = null
   let failures = 0
   let socket: WebSocket | null = null
   let heartbeat: NodeJS.Timeout | undefined
@@ -170,20 +158,34 @@ export async function startBridge(options: BridgeOptions): Promise<Bridge> {
   }
 
   /**
-   * The pairing decision, and the only thing standing between a local process and `local` trust.
-   * Returns the secret to hand back on a first pairing, `{}` for an already-paired extension, and
-   * null for everything else — including every socket that never saw the code.
+   * The key every handshake on this bridge runs on: the stored credential once paired, the printed
+   * code before that. Null when there is nothing to prove knowledge of, which is a bridge whose
+   * code has been used and whose credential file vanished under it.
+   *
+   * Derived **once per credential**, not once per socket. `codeKey` is deliberately slow (200k
+   * PBKDF2 rounds), the key depends on the credential and nothing else, and a per-socket derivation
+   * would let any local process spend this process's CPU by connecting in a loop.
    */
-  const authenticate = (payload: Record<string, unknown>): { secret?: string } | null => {
-    if (failures >= ATTEMPTS) return null
-    if (credential) {
-      const presented = payload['secret']
-      return typeof presented === 'string' && secretMatches(presented, credential) ? {} : null
-    }
-    const presented = payload['code']
-    if (typeof presented !== 'string' || !code || !codeMatches(presented, code)) return null
+  const handshakeKey = (): Promise<CryptoKey> | null => {
+    if (key) return key
+    if (credential) key = secretHashKey(credential.secret_hash)
+    else if (code) key = codeKey(code)
+    return key
+  }
+
+  /**
+   * The pairing decision, and the only thing standing between a local process and `local` trust.
+   * The extension has just proved it holds the credential over both nonces and this port; the
+   * bridge proved the same to it one frame earlier, which is what stops a rogue listener on the
+   * next port up from ever being told anything. A first pairing mints the secret here — after the
+   * proof, never before it.
+   */
+  const settle = (): { secret?: string } => {
+    if (credential) return {}
     const secret = mintSecret()
     credential = writeCredential(secret)
+    // The code is spent; every later handshake runs on the credential's key instead.
+    key = null
     diag(`paired — credential stored in ${credentialFile()} (owner-only)`)
     return { secret }
   }
@@ -228,7 +230,7 @@ export async function startBridge(options: BridgeOptions): Promise<Bridge> {
       `refused an unpaired connection (${reason}). ${
         credential
           ? `If this is your extension after a reinstall, delete ${credentialFile()} and restart this bridge to pair again.`
-          : 'It did not present the pairing code above.'
+          : 'It did not prove it holds the pairing code above.'
       }`,
     )
     if (failures >= ATTEMPTS) diag(`too many failed attempts; refusing every connection until restart.`)
@@ -239,6 +241,10 @@ export async function startBridge(options: BridgeOptions): Promise<Bridge> {
 
   wss.on('connection', (candidate: WebSocket) => {
     let adopted = false
+    /** One hello per socket: the derivation behind a challenge is not free, and one is all it takes. */
+    let greeted = false
+    /** Minted for this socket's hello, spent by its one `bridge.proof`, and never reused. */
+    let challenge: { key: CryptoKey; extensionNonce: string; bridgeNonce: string } | null = null
     const deadline = setTimeout(() => candidate.close(1008, 'expected hello'), helloMs)
     // ws raises 'error' on an abruptly dropped peer; an unhandled one is an uncaughtException that
     // would take the whole bridge — and the client's MCP session — down with it.
@@ -249,18 +255,57 @@ export async function startBridge(options: BridgeOptions): Promise<Bridge> {
       socket = null
       detach('closed')
     })
+
+    /**
+     * Answers a `hello` with this bridge's proof and its own nonce. Nothing is disclosed here and
+     * nothing is trusted: the peer has said only that it is dialling, and the reply says only that
+     * whoever holds the credential is on this end. `secret` is minted in `settle()`, three frames
+     * later, once the peer has proved it holds the credential too.
+     */
+    const offerChallenge = async (payload: Record<string, unknown>): Promise<void> => {
+      const extensionNonce = payload['nonce']
+      const pending = handshakeKey()
+      if (!isNonce(extensionNonce) || !pending) return refuse(candidate, 'not paired')
+      const resolved = await pending
+      const bridgeNonce = mintNonce()
+      const mine = await proof(resolved, { role: 'bridge', port, extensionNonce, bridgeNonce })
+      if (candidate.readyState !== 1) return
+      challenge = { key: resolved, extensionNonce, bridgeNonce }
+      candidate.send(JSON.stringify({ type: 'bridge.challenge', nonce: bridgeNonce, proof: mine }))
+    }
+
+    /**
+     * The pairing gate, on the RAW payload: the handshake belongs to the transport rather than to
+     * the attachment protocol, exactly as the relay's endpoint token does, and neither `hello` nor
+     * `bridge.proof` carries a credential — only a proof of one.
+     */
+    const handshake = async (payload: unknown): Promise<void> => {
+      if (failures >= ATTEMPTS || !isRecord(payload)) return refuse(candidate, 'not paired')
+      if (payload['type'] === 'hello' && !greeted) {
+        greeted = true
+        return await offerChallenge(payload)
+      }
+      const answered = challenge
+      // One proof per challenge: a replayed transcript must not find its nonces still live.
+      challenge = null
+      if (payload['type'] !== 'bridge.proof' || !answered) return refuse(candidate, 'expected hello')
+      const { key: proven, extensionNonce, bridgeNonce } = answered
+      const expected = await proof(proven, { role: 'extension', port, extensionNonce, bridgeNonce })
+      if (!proofMatches(expected, payload['proof'])) return refuse(candidate, 'not paired')
+      if (candidate.readyState !== 1) return
+      clearTimeout(deadline)
+      adopted = true
+      adopt(candidate, settle().secret)
+    }
+
     candidate.on('message', (raw) => {
       const payload = parse(String(raw))
-      const frame = ExtensionFrame.safeParse(payload)
-      if (!frame.success) return
       if (!adopted) {
-        const paired = frame.data.type === 'hello' && isRecord(payload) ? authenticate(payload) : null
-        if (!paired) return refuse(candidate, frame.data.type === 'hello' ? 'not paired' : 'expected hello')
-        clearTimeout(deadline)
-        adopted = true
-        adopt(candidate, paired.secret)
+        void handshake(payload).catch(() => refuse(candidate, 'not paired'))
         return
       }
+      const frame = ExtensionFrame.safeParse(payload)
+      if (!frame.success) return
       if (frame.data.type === 'pong') lastPong = Date.now()
       // Everything else is the host's: `surface.push` replaces the cache, `tool.result` settles a
       // call, and a frame it does not know is dropped rather than thrown on.
@@ -271,6 +316,12 @@ export async function startBridge(options: BridgeOptions): Promise<Bridge> {
   const { server, port } = await listen(options.ports ?? BRIDGE_PORT_RANGE)
   server.on('upgrade', (request, netSocket, head) => {
     if (new URL(request.url ?? '/', 'http://bridge').pathname !== '/ws') return netSocket.destroy()
+    // WebSocket upgrades are not subject to CORS, so without this any page the user happens to
+    // visit can open ws://127.0.0.1:8912/ws, learn that Douze is running, and burn the attempt cap
+    // until the bridge refuses its own extension. Dropped before `connection` fires, so a page
+    // cannot count an attempt at all. Chrome sends `Origin: chrome-extension://<id>` from an MV3
+    // worker; a page sends its own origin, and a plain WS client sends none.
+    if (!(request.headers.origin ?? '').startsWith('chrome-extension://')) return netSocket.destroy()
     wss.handleUpgrade(request, netSocket, head, (ws) => wss.emit('connection', ws, request))
   })
 
