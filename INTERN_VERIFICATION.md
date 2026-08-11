@@ -1,21 +1,30 @@
 # Douze intern verification flow
 
-Use this guide to verify Douze without touching a real account first. It covers the complete
-capture-to-call path, the authentication boundaries — target site, local control, and the opt-in
-remote relay — the local HTTP/WebSocket API, and the remaining live-verification work.
+Use this guide to verify Douze without touching a real account first. It covers the extension —
+which is the product — and the two stateless pipes that attach to it: the cloud relay and the local
+bridge. There is no daemon, no `douze` CLI, no `.mcpb`, and no headless mode; if you find a document
+or a comment that mentions one, it is stale and the code wins.
+
+Everything here is a check you can run and a piece of evidence you can record. Where something has
+never been verified, it is in [Known verification gaps](#known-verification-gaps), not softened into
+a claim.
 
 ## Pass criteria
 
 An intern can mark the application verified only when all of these are true:
 
-- Build, typecheck, unit tests, and the focused browser tests pass.
+- Build, typecheck, lint, and unit tests pass across every package.
+- The extension's smoke run boots the built extension in a real browser and records exchanges.
 - Cookie and page-state authentication both reach the fixture API.
-- No cookie, bearer token, CSRF value, password, or API key reaches persisted artifacts.
-- Missing confirmation, a degraded tool, a disconnected extension, and an expired target session
-  fail before an unsafe retry or unintended target request.
-- A recorded read tool appears through the daemon API, CLI, and MCP surface and returns live data.
-- A second approved recipe appears in a running MCP session without reinstalling or reconnecting.
-- The read-only Openfort run passes. The write run is optional and requires explicit approval.
+- No cookie, bearer token, CSRF value, password, or API key reaches persisted artifacts —
+  IndexedDB, `chrome.storage.local`, or a fixture.
+- An exchange carrying a JWT is refused by the single write path, not stored and reported.
+- A recipe exported as YAML and re-imported round-trips byte-identically.
+- Both pipes complete list + call against the fixture with no daemon on the machine.
+- A destructive call is refused on the relay path whatever it sends, and succeeds on the paired
+  bridge path only with `confirm: true`.
+- An unpaired bridge is refused before the MCP host is ever told anything attached.
+- A second approved recipe appears in a running local MCP session without reconnecting.
 
 ## System flow
 
@@ -24,388 +33,384 @@ sequenceDiagram
     actor User
     participant Page as Signed-in dashboard
     participant Ext as Chrome extension
-    participant D as douzed on 127.0.0.1
-    participant Studio as Review/inference
-    participant Client as CLI or MCP client
+    participant Host as Relay or bridge
+    participant Client as MCP client
     participant API as Dashboard API
 
     User->>Ext: Watch this site
-    Ext->>Page: Reload with capture interceptor
+    Ext->>Page: Register interceptor, reload
     User->>Page: Perform normal workflow
     Page->>API: Authenticated fetch/XHR
-    Ext->>Ext: Redact headers, URL, and bodies
-    Ext->>D: exchange.append over authenticated WebSocket
+    Ext->>Ext: Redact, then CaptureStore.appendExchange (the gate)
     User->>Ext: Done
-    Ext->>Studio: Open local review page
-    Studio->>D: Approve and save recipe + fixtures
-    D-->>Client: Hot-reload approved tools
-    Client->>D: POST /relay/:recipe/:tool
-    D->>Ext: relay.request
+    Ext->>Ext: Infer candidates, review page, approve
+    Ext->>Ext: Write recipe + fixtures to chrome.storage.local
+    Ext->>Host: surface.push (filtered by this attachment's trust)
+    Host-->>Client: notifications/tools/list_changed
+    Client->>Host: tools/call
+    Host->>Ext: tool.call{id, name, args, trust}
+    Ext->>Ext: Guards: degraded, trust, confirm, rate limit
     Ext->>Page: Read current page-state credential if declared
     Ext->>API: fetch from browser context; credentials included when required
     API-->>Ext: JSON response
-    Ext-->>D: relay.response
-    D-->>Client: Redacted, shaped result
+    Ext->>Ext: classify, shape, gateResult
+    Ext-->>Host: tool.result{id, result | error}
+    Host-->>Client: MCP result
 ```
+
+The extension always dials outward and never listens. Neither pipe can wake it: `chrome.alarms`
+(30-second floor) is the only thing that revives an evicted worker, which is why both hosts hold an
+inbound `tools/call` for 40 seconds before answering it as offline.
 
 ## 1. Prepare an isolated run
 
 Prerequisites are Node 22+, pnpm, and Helium at
-`/Applications/Helium.app/Contents/MacOS/Helium`. Browser tests are macOS-only in the current
-harness and run headed with one worker.
+`/Applications/Helium.app/Contents/MacOS/Helium`. Browser runs are macOS-only in the current
+harness, run headed, and use one worker.
 
-Do not point verification at `~/.douze`. The automated harness creates scratch `DOUZE_HOME`
-directories and disposable browser profiles. The live script instead defaults to `~/.douze-live`
-and a persistent `~/.douze-e2e-profile` because a real login must survive restarts.
+Use a scratch browser profile. Never load a build under verification into a browser profile that is
+signed into anything you care about.
 
 ```sh
 pnpm install --frozen-lockfile
 pnpm build
 pnpm typecheck
+pnpm lint
 pnpm test
 ```
 
-Expected result: every command exits zero. Do not update dependencies to make this pass; record
-the failing command and first relevant error. One negative eject test intentionally prints
-`1 of 4 fixture replays failed: get_order`; use Vitest's final pass/fail summary and process exit
-code, not that expected fixture-corruption message.
+Expected result: every command exits zero. `pnpm lint` is `oxlint packages e2e fixtures` and must
+report zero warnings, not just zero errors. Do not update dependencies to make any of this pass;
+record the failing command and the first relevant error.
 
-## 2. Verify authentication and API execution against the fixture
-
-Run the smallest browser set that proves the security and execution model:
+Per-package tests, when you need to name the boundary you are verifying:
 
 ```sh
-lsof -nP -iTCP:4180 -sTCP:LISTEN
+pnpm --filter @douze/shared    test   # redaction, recipe schema, protocol
+pnpm --filter @douze/studio    test   # inference, deterministic descriptions, merge, promotion
+pnpm --filter @douze/extension test   # store, recipes, guards, attach, review, HAR, background
+pnpm --filter @douze/mcp-host  test   # MCP termination and the attachment protocol
+pnpm --filter @douze/relay     test   # sessions, tenancy, wake grace, log discipline
+pnpm --filter @douze/bridge    test   # stdio transport, loopback WS, pairing
 ```
 
-This preflight must print nothing. If another fixture or developer process owns port 4180, ask its
-owner to stop it before continuing; the harness deliberately refuses to reuse an existing server.
+## 2. The extension standing alone
+
+Nothing in this section needs either pipe. Run it first: if capture, storage or review is broken,
+every pipe result below is meaningless.
 
 ```sh
-pnpm verify:e2e
+pnpm exec tsx fixtures/server.ts                       # the fixture dashboard on 127.0.0.1:4180
+
+DOUZE_TEST_ORIGIN=http://127.0.0.1:4180 \
+  pnpm --filter @douze/extension build                 # bakes the fixture origin in
+pnpm --filter @douze/extension smoke
 ```
 
-This runs the whole-app journey plus the narrower cookie/page-state authentication and preflight
-guard cases: local API authentication, dashboard login, capture, redaction, review UI approval,
-recipe hot reload, browser relay, MCP listing/call, target-session expiry with no retry,
-destructive confirmation, and degraded-tool refusal.
+`smoke.mjs` proves the built artifact actually loads: Helium boots it, the MV3 service worker runs
+its top-level registrations, the popup renders, and a session on the fixture records real
+exchanges. Without a fixture on 4180 the capture half is skipped and the rest still runs, so check
+what it reported rather than only its exit code.
 
-Playwright's global setup builds the extension with `http://127.0.0.1:4180` granted. It launches
-Helium, the fixture API, and scratch daemon instances automatically.
+### Storage and the single write path
 
-Record this evidence:
+`packages/extension/src/store.ts` holds captures in IndexedDB — sessions, exchanges ordered by
+`(session_id, position)`, annotation spans — which is why the manifest carries `unlimitedStorage`.
+
+`CaptureStore.appendExchange` is **the only method that writes an exchange**. It re-applies
+`redactUrl` / `redactHeaders` / `redactBody` even though the capture pipeline already ran them, then
+scans the *whole record* with `findSurvivingSecrets` and throws rather than storing anything that
+survives. `db` is private and no object-store access is exported, so from outside that file there is
+no way to persist an exchange that skipped the gate.
 
 | Check | Required evidence |
 |---|---|
-| Capture | POST and GET request/response bodies are persisted; CSS and analytics are absent. |
-| Redaction | `authorization` and `password` are placeholders and originals are absent on disk. |
-| Cookie auth | The fixture server receives `fixture_session` on a relayed GET. |
-| Page-state auth | The fixture receives current bearer and CSRF values read from page state. |
-| Expiry | A target 401 becomes `session_expired`; exactly one target request was made. |
-| Guards | Missing `confirm`, degraded tools, and unknown tools produce zero target requests. |
-| Surface | Only approved tools are namespaced as `<recipe>_<tool>`. |
-| Connector | MCP initializes, lists tools, and forwards a call through the same relay. |
+| Capture | POST and GET request/response bodies persist; CSS and analytics are absent. |
+| Redaction | `authorization` and `password` are `«redacted:…»` placeholders; originals appear nowhere in IndexedDB. |
+| The gate | An exchange carrying a JWT throws `refusing to persist exchange <id>: credential at <path>` and is absent from the store. |
+| Ordering | Exchanges read back in `position` order from the compound index, not from a sort. |
+| Annotations | A note with nothing captured since the previous one produces an EMPTY span (`end < start`), not a claim on the next exchange. |
 
-Then run the complete browser suite:
+### Recipes, the surface, and YAML export/import
 
-```sh
-pnpm e2e
-```
+`packages/extension/src/recipes.ts` keeps recipes in `chrome.storage.local` under `recipe:` and
+fixtures under `fixture:`, and `chrome.storage.onChanged` is the hot-reload signal. A recipe is
+stored **as its YAML source string**, which is what makes export byte-identical.
 
-## 3. Manually verify the product flow
+| Check | Required evidence |
+|---|---|
+| Validation | An invalid recipe never reaches storage; the last good version keeps serving. |
+| Fixture gate | A fixture with a credential-shaped value throws `refusing to store fixture "<ref>": credential at …`. |
+| Surface | Only `approved` tools in `enabled` recipes appear, named `<recipe>_<tool>`. |
+| Degradation | A missing fixture degrades the tool with a reason rather than hiding it. |
+| Revision | `revision` bumps only when the tools actually change; a parse error alone does not bump it. |
+| Round trip | `exportRecipe` → `importFiles` reproduces the YAML byte for byte, comments and key order intact. |
+| Atomicity | An import with any error or name conflict writes nothing at all. |
 
-Use a scratch Chrome/Helium profile and the local fixture, not a personal browser profile.
+### Review and inference
 
-1. Build the extension: `pnpm --filter @douze/extension build`.
-2. Start the fixture: `pnpm exec tsx fixtures/server.ts`.
-3. Start Douze: `pnpm exec tsx packages/cli/src/bin.ts start`.
-4. Load `packages/extension/dist` as an unpacked extension.
-5. Open `http://127.0.0.1:4180` and POST `/login` through the page or use the browser test to
-   establish the fixture cookie.
-6. Click **Watch this site**, use **Create order** and **List orders**, add a note, then click
-   **Done**.
-7. Confirm the review page lists inferred candidates. Bulk-enable reads only. Inspect write and
-   destructive candidates individually.
-8. Save, run `pnpm exec tsx packages/cli/src/bin.ts status`, and confirm the extension is
-   connected and the tool count is non-zero.
-9. Invoke the approved read through `douze <recipe> <tool>` or an MCP client.
-10. Confirm the fixture's `/__test/log` shows one authenticated target request.
+`ReviewSession` (`review-session.ts`) is the old daemon studio session on extension storage; it
+reuses `@douze/studio/browser` wholesale rather than re-implementing inference or descriptions. The
+review page is an extension page — `chrome.runtime.getURL('review.html?session=<id>')`, opened by
+the service worker — which removes the expired-link failure mode the daemon's HTTP review UI had.
 
-Do not approve or call a destructive tool merely to complete this checklist. Its preflight guard
-is already verified by `e2e/relay/guards.spec.ts`.
+Verify by hand: candidates group into read / write / destructive; only reads are bulk-enabled;
+name and description edits persist; save writes fixtures first and then the validated recipe.
 
-## 4. Live read-only verification
+### HAR import
 
-This is the outstanding release criterion tracked as C-1 in `TASKS.md`:
+`importHar` (`har.ts`) does no redaction of its own **by design** — it routes every entry through
+`CaptureStore.appendExchange`, so the same gate applies. Refusals are reported per entry in
+`refused[]` and do not abort the import; `imported + skipped + refused.length` must equal the number
+of entries in the file. `fixtures/orders.har` is the input to use.
 
-```sh
-pnpm exec tsx e2e/live/openfort.mjs
-```
+## 3. The attachment protocol and both pipes
 
-On the first run, sign in manually in the Helium window. The script then:
+`packages/mcp-host` is the one MCP implementation both pipes use. Two of it would be the failure
+this design exists to avoid, so check that neither transport answers MCP itself.
 
-1. builds the extension with dashboard and API origins granted;
-2. starts a daemon under `DOUZE_HOME` (default `~/.douze-live`);
-3. records real authenticated dashboard traffic;
-4. scans the persisted capture for JWT and prefixed-key leaks;
-5. infers and approves read candidates;
-6. confirms registry hot reload;
-7. calls one read through the browser relay; and
-8. verifies the same tools through an MCP `tools/list` exchange.
+What the host owns: `initialize`, `ping`, `tools/list`, `tools/call`; protocol version
+`2025-06-18` with older ones echoed back when asked for; `capabilities.tools.listChanged` declared
+**unconditionally**, empty surface or not; a 120 s per-call ceiling.
 
-If Openfort uses additional API hosts, set a comma-separated `DOUZE_LIVE_API_ORIGINS`. Never put
-credentials in this variable; it accepts origins only.
+| Check | Required evidence |
+|---|---|
+| Answered from cache | `initialize` and `tools/list` succeed with the extension detached. |
+| listChanged | A `surface.push` that changes the surface emits `notifications/tools/list_changed`; an identical one does not. |
+| Empty surface | A host with zero tools still advertises the tools capability and answers `tools/list` with `[]`, never "Method not found". |
+| Call ids | A `tool.result` carrying `1` cannot settle a call waiting on `"1"`. |
+| Disconnect | `setAttached(false)` fails everything in flight at once with `extension_disconnected`, and **re-sends nothing**. |
+| Trust | `trust` is set at host construction and stamped on every `tool.call`; nothing a client sends can reach it. |
 
-`pnpm exec tsx e2e/live/openfort.mjs --writes` approves and invokes write tools. Run it only with an account
-whose data may be changed and explicit owner approval. It is not required for the read-only gate.
+On the extension side (`attach.ts`), the mirror check is the one that matters most: the `trust` on
+an inbound frame is **deliberately dropped**, and the level used is derived from what was dialled. A
+test that only asserts the host's stamp has not verified this.
 
-For C-2, keep the MCP session running, record and approve a second target, and require a
-`notifications/tools/list_changed` notification followed by both recipes in `tools/list`. No MCP
-restart or connector reinstall is allowed.
+## 4. The guards
 
-## Authentication inventory
+`packages/extension/src/guards.ts` is the only place policy lives. Both pipes stamp a trust level
+and **neither enforces anything**.
+
+The table, enforced twice:
+
+| | `remote` (relay) | `local` (paired bridge) |
+|---|---|---|
+| read | always | always |
+| write | opt-in per attachment | always |
+| destructive | never, no setting restores it | allowed, `confirm: true` required |
+| result secret gate | enforced, `expose` to exempt | enforced, `expose` to exempt |
+
+- **Push time** — `attachedSurface` filters, so a hosted client never sees a tool that would always
+  be refused.
+- **Call time** — `checkPolicy` refuses whatever was pushed, because a host that lies about what it
+  sent must not get through.
+
+Both halves are required and both must be tested. Filtering alone is a UI courtesy, not a control:
+verify the call-time refusal by sending a `tool.call` for a destructive tool that was never on the
+pushed surface.
+
+| Check | Required evidence |
+|---|---|
+| Destructive, remote | Refused as `trust_refused`, **not** `confirm_required` — the second would invite a retry that can never work. Zero target requests. |
+| Write, remote, no opt-in | Refused as `trust_refused`. Zero target requests. |
+| Write, remote, opted in | Succeeds; the surface pushed after the opt-in contains it. |
+| Destructive, local | Refused without `confirm: true`, succeeds with it. |
+| Degraded | Refused before any trust check, because "this tool is broken" outranks "you may not call it". Zero target requests. |
+| Unknown tool | `unknown_tool`, zero target requests. |
+| Expiry | A target 401/403/login redirect becomes `session_expired`; exactly one target request was made and none retried. |
+| Rate limit | Excess calls queue per tool; a wait over `RATE_WAIT_MAX_MS` (20 s) is refused as retryable `rate_limited` naming the seconds, never parked across a worker eviction. |
+| Result size | A result over 32 KB is cut on a UTF-8 boundary and `returned_bytes` is at or under the cap. |
+| Result gate | A result carrying a credential-shaped value is withheld, naming the tool and the paths; the value itself is absent from the refusal. |
+| Audit | Every call appends `{at, tool, trust, outcome, duration_ms, status?}` and **no arguments** — that is deliberate, not an omission. |
+
+## 5. The bridge: pairing at full trust
+
+`packages/bridge` is stdio JSON-RPC on one side and a loopback WebSocket the extension dials on the
+other, over one `McpHost`. It holds no state except the pairing credential.
+
+**Loopback is not consent.** `127.0.0.1` proves only that the peer is on this machine, and every
+process on this machine can dial it; without a shared secret the first thing to connect would
+inherit `local` trust and with it destructive tools.
+
+| Check | Required evidence |
+|---|---|
+| Code | 8 characters from a Crockford-style alphabet (~39 bits), printed to **stderr only**; stdout carries protocol and nothing else. |
+| Refusal | An unpaired socket is closed with 1008 **before the host is told anything attached**. |
+| Attempt cap | Ten failed attempts and the process refuses every connection until the client restarts it. |
+| Secret | 32 random bytes handed back on the raw `welcome`; only its sha256 is written, to `$DOUZE_HOME/bridge.json` (default `~/.douze/bridge.json`), mode `0600` — set by an explicit `chmodSync`, because `mode` applies at creation only. |
+| Timing | Both the code and the secret comparison use `timingSafeEqual`. |
+| Ports | 8912–8916, walked in order; several bridges are live at once because a bridge is per MCP client. |
+| Wake grace | A `tools/call` with nothing attached is held 40 s; `initialize` and `tools/list` never wait. |
+| Extension pin | The `secret` is read off the **raw** `welcome` — the `HostFrame` schema strips it, so strict parsing would drop it — and pinned in extension storage. |
+
+The residual risk is stated in `packages/bridge/README.md` and must not be sanded off in a report:
+`0600` stops other *users*, not other *code* running as you. Local malware that already has
+execution as your user reads the file, and also reads your browser profile and your SSH keys.
+
+## 6. The relay: session ownership and the wake grace
+
+`packages/relay` terminates MCP rather than forwarding it. One `McpHost` per session answers
+`initialize` and `tools/list` from the surface the extension last pushed; only `tools/call` goes to
+the browser. That is what lets a connector added while Chrome was closed list its tools instead of
+looking broken.
+
+| Check | Required evidence |
+|---|---|
+| Session id | `initialize` mints one and returns it in `Mcp-Session-Id`; an unknown one is a 404 so the client re-initializes. |
+| Tenancy | Interleaved calls across two enrolled endpoints each return their own tenant's result; one tenant's session id is a 404 on the other's URL. |
+| Wake grace | A `tools/call` with no live socket is held **40 s** and then refused; `initialize` and `tools/list` never wait. |
+| Socket loss | In-flight calls fail at once with retryable `extension_disconnected` and **none is re-sent** — a tool can be a write. |
+| Surface cache | One cached surface per endpoint, replaced wholesale by each `surface.push` and fanned out to every live session, including one created later. |
+| Caps | 1 MB bodies, 8 in flight, 4 sessions per endpoint, 120 s per call; a duplicate in-flight JSON-RPC id is a 409. |
+| Error shape | In-flight / duplicate-id / too-many-sessions refusals come back as `200` with a JSON-RPC error, because an MCP client renders that and drops an HTTP error body. |
+| No stream | `GET /m/<secret>` is 405; there is no server-initiated stream in v1. |
+| Log discipline | Sweep every stderr line of a full register → connect → initialize → call → close run: no payload, tool name, description, session id, token, path secret, or bearer. |
+
+## Boundary inventory
+
+The daemon-era boundaries — an install token, a loopback HTTP API, `/pair` extension pinning — are
+gone with the daemon. Three remain, and they are the whole authenticated surface of the product.
 
 ### A. Target-site authentication
 
-This is authentication to the dashboard/API being automated. Douze does not implement login and
-does not store the primary-path credential.
+Authentication to the dashboard being automated. Douze does not implement login and stores no
+credential.
 
 | Mode | How it works | What is persisted | Required verification |
 |---|---|---|---|
-| Cookie browser relay | The extension executes `fetch` in a tab on the execution origin with `credentials: include`; Chrome attaches cookies, including HttpOnly cookies. | Recipe descriptor `{kind: cookie}` only. | Fixture server receives the cookie; persisted files do not. |
-| Page-state browser relay | Capture discovers the storage expression that produced a header or credential-shaped path segment. At call time the extension reads the current value in the page's MAIN world, then attaches it in the isolated-world request. | Expression, destination header/parameter, and prefix only; never the value. | Bearer and CSRF fixture case succeeds; registry and disk contain neither value. |
-| Cross-origin API | The recipe stores `page_origin` for the dashboard and `target.base_url` for the API. Execution occurs from the dashboard tab so storage and CORS origin match. Token-only cross-origin requests use `credentials: omit`; cookie requests use `include`. | Origins and credential locations only. | Live target retains API-host exchanges and relay succeeds. |
-| Headless, degraded | `executeHeadless` reads a session from the macOS Keychain, may refresh once after 401, and labels the result degraded. It is never an implicit fallback. | `keychain_ref` and optional refresh endpoint; session is in Keychain. | Unit coverage exists in `packages/douzed/src/headless.test.ts`. See the known gap below before claiming product support. |
+| Cookie | The extension executes `fetch` in a tab on the execution origin with `credentials: include`; Chrome attaches cookies, HttpOnly included. | `{kind: cookie}` descriptor only. | Fixture server receives the cookie; stored artifacts do not contain it. |
+| Page state | Capture discovers the storage expression that produced a header or a credential-shaped path segment. At call time the extension reads the current value in the page's MAIN world and attaches it from the isolated world. | Expression, destination header/parameter, and prefix — never the value. | Bearer and CSRF fixture cases succeed; storage contains neither value. |
+| Cross-origin API | The recipe stores `page_origin` for the dashboard and `target.base_url` for the API; execution happens from the dashboard tab so storage and CORS origin match. | Origins and credential locations only. | A dashboard whose API is on another host retains exchanges and relays successfully. |
 
-Session expiry is a target 401, 403, or redirect to a login/auth path. Browser relay performs no
-retry and tells the user to sign in again. The extension can show a login notification. Headless
-mode alone may refresh once when explicitly configured.
+Session expiry is a target 401, 403, or a redirect to a login path. There is no retry and no refresh
+path anywhere in the product now — the browser is the only executor.
 
-### B. Douze local-control authentication
+### B. Extension-internal message guards
 
-This protects the local daemon and is separate from target-site authentication.
+The extension's own contexts are the trust boundary that replaced loopback.
 
-- `douzed` binds `127.0.0.1`, normally on 8787-8791.
-- A 24-byte random base64url install token is created at `$DOUZE_HOME/token` with mode `0600`.
-- Every HTTP route except `/health` and `/pair` requires `x-douze-token` or a `token` query
-  parameter. The CLI adds the header automatically.
-- `/pair` accepts only a syntactically valid `chrome-extension://<extension-id>` Origin, returns
-  CORS only to that exact origin, and pins the first extension ID at `$DOUZE_HOME/extension`.
-- The WebSocket requires the token in `/ws?token=...`; invalid upgrades close with code 1008.
-- HTTP and WebSocket traffic also reject non-loopback `Host` headers to reduce DNS-rebinding risk.
-- Review links carry the local token because their own API requests require it. A stale token gets
-  a human-readable expired-link page.
-- The MCP transport has its own JSON-RPC initialization but no separate Douze account. It calls
-  the authenticated loopback API through `DaemonClient`.
+- `chrome.runtime.onMessage`: every non-capture command requires
+  `sender.url?.startsWith('chrome-extension://')`. A failing sender gets no response at all.
+  `sender.tab === undefined` is explicitly **not** the discriminator.
+- Capture batches are gated separately: a `sender.tab?.id` is required, and the frame's own
+  `sender.origin` must be in the recording session's origin list. Nothing in the message body
+  decides this. The batch is truncated at 200 entries.
+- `chrome.runtime.onMessageExternal` is not wired up anywhere, which is why the scheme test
+  suffices. **If anyone adds an external handler, this guard stops being sufficient** — check for
+  one before signing off.
+- Host permissions are requested per target at record time (`optional_host_permissions`), as the
+  first statement of a click handler because Chrome requires a user gesture. `debugger` is an
+  optional permission behind a checkbox.
+- The review page is reachable only as `chrome-extension://…/review.html?session=<id>`; the session
+  id is a plain query parameter with no token, on the grounds that only this extension can open that
+  scheme.
 
-Verify this boundary directly with:
+Verify with `pnpm --filter @douze/extension test`, which must cover the sender guard, the capture
+origin gate, and the batch cap.
 
-```sh
-pnpm --filter @douze/douzed test
-pnpm --filter @douze/extension test
-```
+### C. Bridge pairing
 
-The tests must cover missing-token 401, pairing Origin validation, first-extension pinning,
-second-extension refusal, loopback Host validation, WebSocket token use, and reconnection.
+Section 5. The credential file, the ten-attempt cap, the 1008-before-attach refusal, and the
+stderr-only code are the four things a report must state individually.
 
-### C. Secret handling
+### D. Relay endpoint authentication
 
-Redaction happens before an exchange leaves the extension and again at daemon/store, fixture,
-audit, recipe, eject, and model-description boundaries.
+| Route | Auth |
+|---|---|
+| `POST /register` | none, rate-limited per caller |
+| `POST /rotate`, `DELETE /register` | `x-douze-relay-token` |
+| `WS /ws` | first frame `hello{token}` within 5 s; anything else closes 1008 |
+| `POST /m/<secret>` | the secret in the path, plus `Authorization: Bearer` if one was registered |
+| `GET /health` | none |
 
-- Always-secret headers include authorization, cookie, set-cookie, API key, CSRF/XSRF, and proxy
-  authorization variants.
-- Secret-like body/query keys include password, token, secret, API key, refresh/access token,
-  client secret, private key, session, and credential variants.
-- JWTs, Basic/Bearer strings, prefixed keys, and long high-entropy values are detected by value
-  shape even when the field name looks harmless.
-- Stored placeholders preserve type and string length, for example `«redacted:string:28»`.
-- A final `findSurvivingSecrets` gate refuses anything redaction missed.
-- Audit arguments are redacted, and tool errors are recorded without retrying the target.
+The endpoint token and the URL secret are independent randoms, and the relay stores only sha256
+hashes of both (and of any bearer), so a memory dump of a running relay hands over neither. The
+registration rate limit counts per socket address, which behind a terminator is the terminator —
+`TRUST_PROXY=1` charges it to the forwarded caller instead, and must be set **only** where that
+proxy is the sole route to the port.
 
-This guarantee covers Douze persistence and model-description input. A successful live tool call
-returns the target API's response to the requesting CLI/MCP client; the relay does not redact that
-result body. Verify read tools do not expose secrets as ordinary business data before approving
-them.
-
-Run the repository-wide artifact sweep after the browser suite:
-
-```sh
-pnpm exec tsx e2e/metrics.mjs
-```
-
-### D. Remote relay authentication
-
-This boundary exists only after `douze connect`. It is the path a hosted client (ChatGPT,
-claude.ai, Dust) takes to reach the daemon, and it is treated as less trusted than loopback
-throughout. Everything below is in the source tree; none of it has been exercised against a real
-platform yet, so treat this section as code-verified and live-unverified.
-
-**Pairing.** `douze connect <url>` POSTs `/register` to the relay with the daemon version and an
-optional `bearer_token`, and receives `{token, mcp_path}`. The token authenticates the daemon's
-WebSocket; the secret is the path half of the platform-facing URL. They are two independent
-32-byte base64url randoms, so a URL leaked into a platform log does not yield the ability to
-impersonate the daemon. The relay stores only sha256 hashes of both (and of the bearer), so a
-memory dump of a running relay hands over neither. `douze connect --rotate` POSTs `/rotate` and
-kills the old pair immediately; `douze disconnect` DELETEs `/register` and removes the local
-pairing even when the relay cannot be reached. See `packages/cli/src/commands/connect.ts` and
-`packages/relay/src/server.ts`.
-
-**Local storage.** `$DOUZE_HOME/relay.json` holds the URL, token, MCP path, `allow_writes`, a
-boolean recording whether a bearer was registered (never its value), and the optional `expose`
-list. It is written mode `0600` and re-chmodded on rotate, because `mode` only applies at creation.
-
-**WebSocket authentication.** The daemon dials `wss://<relay>/ws` outbound and opens no listener.
-Its first frame must be `hello{token}` within 5 seconds; an unknown token or any other first frame
-closes the socket with 1008. One socket per endpoint — a second `hello` is a reconnecting daemon
-and replaces the first. A rotate closes the live socket with 1008 so the daemon re-hellos with the
-token it just received.
-
-**Per-endpoint authentication.** `POST /m/<secret>` is authenticated by the secret in the path.
-If a bearer was registered, `Authorization: Bearer` is also required and compared with
-`timingSafeEqual` over hashes. `POST /rotate` and `DELETE /register` require the
-`x-douze-relay-token` header. `GET /health` is unauthenticated.
-
-**Capability scoping.** Enforced at the daemon, not at the relay or the platform:
-`filterRemoteRegistry` in `packages/cli/src/remote-bridge.ts` serves the remote MCP instance a
-registry containing read tools always, write tools only when `allow_writes` is set, and destructive
-tools never — no configuration can put one back. The destructive guard's `confirm: true` is a
-caller-supplied argument, which is consent UX for a well-behaved local client and forgeable by
-anyone holding the URL. Remote calls enter only through the schema-validating MCP surface; the raw
-`/relay` route is not reachable from this path. Each platform session gets its own MCP server
-instance, capped at `REMOTE_MAX_SESSIONS`; an excess session is refused, not queued.
-
-**Result gate.** `gateResult` runs `findSurvivingSecrets` over every `tools/call` result before it
-leaves the machine and replaces a result carrying credential-shaped values with a JSON-RPC error
-naming the tool and the paths found. Redaction already ran on the way into a fixture, but a live
-response is whatever the target returned just now and the platform stores it. Naming the tool in
-`expose` in `relay.json` is the only override.
-
-**Audit.** Every remote `tools/call` appends `{ts, sid, tool}` to `$DOUZE_HOME/remote-audit.jsonl`;
-`douze status` reports `remote: {configured, recent_calls}` with the last five. An unwritable audit
-file warns on stderr rather than killing the daemon.
-
-**Relay logging.** One line per event carrying a timestamp, an event name, a duration, and an
-8-character hash prefix per endpoint — never a payload, tool name, session id, or secret in any
-form.
+**Capability scoping is enforced in the extension, not at the relay and not at the platform.** Do
+not accept a relay-side test as evidence for the trust table.
 
 | Boundary | What crosses it | Protection |
 |---|---|---|
-| Browser ↔ extension | raw traffic, credentials | redaction before anything leaves the extension |
-| Extension ↔ daemon | redacted exchanges, relay execs | install token, loopback-only |
-| Daemon → relay | MCP frames: tool args and full result bodies | outbound-only WSS, relay token, TLS; the daemon treats this path as less trusted than loopback |
-| Relay ↔ AI platform | the same MCP frames | per-user secret URL, optional static bearer, TLS |
+| Page ↔ extension | raw traffic, credentials | redaction before anything is stored; the write-path gate |
+| Extension ↔ bridge | MCP frames: tool args and full result bodies | loopback, paired credential, `local` trust |
+| Extension → relay | the same frames | outbound-only WSS, endpoint token, TLS; `remote` trust |
+| Relay ↔ AI platform | the same frames | per-user secret URL, optional static bearer, TLS |
 | Platform ↔ model | tool results enter the conversation | out of our control — disclosed, not mitigated |
 
-Three facts are disclosed rather than mitigated, and the README states them without softening: the
-relay operator can read and inject traffic (self-hosting via `DOUZE_REMOTE_URL` is the only
-remedy); the platform stores whatever the tools return; those result bodies are live dashboard
-data. A strict-local-only user must not run `douze connect`. The residual risk nobody here owns a
-lever for is prompt injection through attacker-authored dashboard content steering the agent,
-bounded by the read-only default and the per-tool opt-in.
+Three facts are disclosed rather than mitigated, and `README.md` states them without softening: the
+relay operator can read and inject traffic; the platform stores whatever the tools return; those
+result bodies are live dashboard data. The relay additionally holds every tool **name, description
+and input schema** an endpoint has pushed, because that is what `tools/list` is answered from —
+which describes the systems a user has automated whether or not anyone ever calls them. A
+strictly-local user must never connect a hosted assistant. The residual nobody here owns a lever for
+is prompt injection through attacker-authored dashboard content, bounded by the read-only default
+and the absolute destructive ban on the remote path.
 
-Verify this boundary with:
+## Secret handling
+
+Redaction runs at every persistence boundary, and two rules decide what may be written:
+
+- **Key names**: authorization, cookie, set-cookie, API key, CSRF/XSRF, proxy-authorization, and the
+  body/query equivalents (password, token, secret, refresh/access token, client secret, private key,
+  session, credential).
+- **Value shape**: JWTs, Basic/Bearer strings, `sk_`/`pk_`/`rk_`-prefixed keys, and long
+  high-entropy runs, **whatever the field is called**. URLs are judged part by part — path segments
+  and decoded query values — because judging a whole URL as one string once refused 30 of 31
+  exchanges from a real dashboard.
+
+Placeholders preserve type and length (`«redacted:string:28»`) so schema inference still sees the
+right shape. `findSurvivingSecrets` is the final gate at each boundary, and detection and removal
+share one test so the gate and the redactor cannot disagree.
+
+Redaction protects what Douze *stores*. A live tool result is not a fixture — it is whatever the
+target returned a moment ago — so `gateResult` is a separate last check before anything leaves the
+browser at all, per trust level, with a per-tool `expose` list under `attach:expose` as the only
+override.
+
+**The artifact sweep has no home right now.** It used to be `e2e/metrics.mjs` walking `DOUZE_HOME`,
+which no longer exists; it must be re-pointed at extension storage (IndexedDB plus
+`chrome.storage.local`, read out through the service worker). `e2e/README.md` carries the patterns
+verbatim. Until that exists, C-4 cannot be re-established on the new architecture and no report may
+claim it.
+
+## Verify the whole path
 
 ```sh
-pnpm --filter @douze/relay test
-pnpm --filter @douze/cli test
+pnpm e2e            # Playwright, testDir ./e2e, Helium headed, one worker
 ```
 
-The relay tests cover the streamable-HTTP round trip, session routing by `Mcp-Session-Id`, the
-1008 close on an unknown token, rotate/delete authentication, the bearer requirement, registration
-rate limiting, two-tenant isolation under interleaved calls, immediate failure of in-flight calls
-when the daemon socket drops, and a log sweep asserting no payload, token, path secret, tool name,
-or session id ever reaches stderr. The CLI tests cover pairing and `relay.json` mode 0600
-(`connect.test.ts`), the capability filter, the result gate, and the bridge's session lifecycle
-(`remote-bridge.test.ts`).
+There is no `verify:e2e` script in `package.json` today — check it before quoting one. The suite was
+deleted with the daemon and rebuilt under T-015.14; **its coverage is exactly what
+`e2e/README.md` claims and nothing more**, so read that file before deciding what a green run
+proves. `e2e/global-setup.ts` builds the extension with the fixture origin baked into
+`host_permissions`, because `chrome.permissions.request` needs a user gesture Playwright cannot
+supply.
 
-## Local HTTP API inventory
+```sh
+pnpm --filter @douze/studio eval   # agent tool-selection accuracy on the reference recipe
+```
 
-Base URL is the runtime's `http://127.0.0.1:<port>`. Unless noted, send JSON and
-`x-douze-token: <install token>`.
+## Manually verify the product flow
 
-| Method and path | Authentication | Purpose / body | Main response or failure |
-|---|---|---|---|
-| `GET /health` | None | Liveness and extension connection state. | `{ok, extension_connected}` |
-| `GET, OPTIONS /pair` | Chrome-extension Origin; first ID is pinned | Give the extension its token and bound port. | `{token, port, version}` or 403 |
-| `GET /registry` | Install token | Current hot-loaded tool surface and recipe errors. | `{revision, tools, errors}` |
-| `GET /recipes` | Install token | Parsed recipes. | `Recipe[]` |
-| `GET /sessions` | Install token | Capture-session summaries. | `CaptureSession[]` |
-| `GET /sessions/:id` | Install token | Session, redacted exchanges, and annotations. | `{session, exchanges, annotations}` or 404 |
-| `POST /doctor/:recipe` | Install token | Replay read fixtures and classify drift. | Doctor report or 400 `doctor_failed` |
-| `POST /import/har` | Install token | `{har, name}`; filter/redact and create a session. | Imported session summary |
-| `GET /review/:sessionId` | Install token in link | Serve the local review UI. | HTML; human-readable 401/404 pages |
-| `GET /api/review/:sessionId` | Install token | Candidate list for the review page. | `{site, recipe, candidates}` or 404 |
-| `POST /api/review/:sessionId/enable` | Install token | Empty body bulk-enables reads; `{names}` enables named candidates. | `{enabled, skipped}` |
-| `POST /api/review/:sessionId/disable` | Install token | `{names}` unapproves candidates. | `{ok: true}` |
-| `POST /api/review/:sessionId/edit` | Install token | `{name, field, value}` edits and immediately saves. | `{ok: true}` or 400 |
-| `POST /api/review/:sessionId/save` | Install token | Write fixtures then validated recipe. | `{path, tools}` or 400 `save_failed` |
-| `GET /api/site-tools?origin=...` | Install token; extension Origin gets matching CORS | Tools already approved for one site. | `{tools}` |
-| `POST /relay/:recipe/:tool` | Install token | `{args, timeout_ms?}`; enforce guards and relay to browser. | `RelayResponse`; 404 unknown tool; 502 named Douze error |
+Use a scratch browser profile and the local fixture.
 
-The relay endpoint returns target `status`, response `headers`, parsed `body`, `duration_ms`, and
-`redirected_to_login`. It can return these named errors: `relay_unreachable`,
-`extension_disconnected`, `session_expired`, `tool_degraded`, `confirm_required`, `rate_limited`,
-and `timeout`. Current rate limiting queues calls; it does not deliberately emit `rate_limited`.
+1. `pnpm --filter @douze/extension build`, then load `packages/extension/dist` unpacked.
+2. `pnpm exec tsx fixtures/server.ts`.
+3. Open `http://127.0.0.1:4180` and establish the fixture cookie.
+4. Click **Watch this site**, use **Create order** and **List orders**, add a note, click **Done**.
+5. Confirm the review page lists inferred candidates. Bulk-enable reads only; inspect write and
+   destructive candidates individually.
+6. Save. Confirm the popup shows the tools for that site.
+7. Build and start the bridge, pair it with the code it prints, and call the approved read from a
+   real MCP client.
+8. Confirm the fixture's `/__test/log` shows exactly one authenticated target request.
+9. For C-2: keep that session open, record and approve a second target, and require a
+   `notifications/tools/list_changed` followed by both recipes in `tools/list`, with no restart.
 
-## Fixture target API inventory
-
-The fixture on `http://127.0.0.1:4180` stands in for a dashboard; it is not part of the shipped
-daemon API. Its protected routes accept either the `fixture_session` cookie or the exact bearer
-plus CSRF pair served by its page-state-auth variant.
-
-| Method and path | Purpose |
-|---|---|
-| `POST /login` | Set the fixture session cookie. |
-| `GET, POST /api/orders` | List or create orders. |
-| `GET, DELETE /api/orders/:id` | Read or destructively delete one order. |
-| `GET /api/report` | Return a large envelope with a small primary payload. |
-| `GET /api/poll` | Generate background traffic. |
-| `POST /graphql` | Exercise named query/mutation inference and GraphQL errors. |
-| `GET /__test/log` | Return requests observed by the target. |
-| `GET /__test/reset` | Clear the log and reset behavior flags. |
-| `GET /__test/:flag?value=<json>` | Set `sessionValid`, `pageStateAuth`, drift shape, or latency. |
-
-The `__test` control plane is intentionally unauthenticated and must never be copied into a real
-target. It exists only so tests can prove whether the target saw zero, one, or multiple requests.
-
-## WebSocket protocol inventory
-
-The extension connects to `ws://127.0.0.1:<port>/ws?token=<install token>`.
-
-Extension to daemon:
-
-- `hello`, `pong`
-- `exchange.session.start`, `exchange.append`, `exchange.annotate`, `exchange.session.stop`
-- `relay.response`
-
-Daemon to extension:
-
-- `welcome` with heartbeat interval, then `ping` every 20 seconds
-- `relay.request` with id, execution origin, URL, method, non-secret headers/body, credential-source
-  descriptors, and timeout
-
-Requests and responses are correlated by UUID. A disconnect fails all in-flight calls immediately;
-the extension buffers capture messages and drains them in order after reconnecting.
-
-## Recipe/API contract checks
-
-A saved recipe is invalid unless:
-
-- version and kebab-case recipe name are valid;
-- tool names are unique snake_case;
-- approved tools reference at least one fixture;
-- approved destructive tools require a boolean `confirm` parameter;
-- no credential value appears anywhere in the serialized recipe; and
-- the request method is GET, HEAD, POST, PUT, PATCH, or DELETE.
-
-At runtime, only approved tools are exposed. GET/HEAD arguments not consumed by path templates
-become query parameters; other REST arguments become a JSON body; GraphQL stores the document and
-uses arguments as variables. The CLI trims to `primary_payload_path` unless `raw=true` and applies
-the configured response-size cap. CLI and MCP calls validate arguments against the inferred JSON
-Schema. A caller using the authenticated `/relay` HTTP endpoint directly bypasses that surface
-validation, but still cannot bypass daemon-owned destructive confirmation, degradation,
-connectivity, and rate-limit guards.
+Do not approve or call a destructive tool merely to complete this checklist.
 
 ## Failure record
 
@@ -414,58 +419,75 @@ For every failure, capture:
 - commit SHA and whether the working tree was already dirty;
 - exact command and test name;
 - first relevant stack trace or API response;
-- daemon port and `douze status` output, with token values removed;
-- whether the fixture target received zero, one, or multiple requests; and
+- which pipe was in the path, and the trust level the extension derived;
+- whether the fixture target received zero, one, or multiple requests;
 - paths to Playwright traces or screenshots.
 
-Never paste `$DOUZE_HOME/token`, cookies, authorization values, live response bodies, or a real
-account's stored browser profile into an issue.
+Never paste a relay URL or endpoint token, `~/.douze/bridge.json`, cookies, authorization values,
+live response bodies, or a real account's browser profile into an issue.
 
-## Known verification gaps as of 2026-08-11
+## Known verification gaps
 
-- `TASKS.md` still has C-1 (real Openfort read) and C-2 (second recipe without reconnect) open.
-- The headless implementation and unit tests exist, but the tracked `douze headless enable|disable`
-  command and browser-closed E2E files do not exist in the current source tree, and the primary
-  `/relay` route always uses `RelayBridge`. Do not report headless as end-to-end verified.
-- The README release link still uses the `OWNER` placeholder and no release has been tagged, so
-  install verification from published artifacts is not yet possible.
-- The browser harness assumes the fixed macOS Helium path and cannot run headless.
-- The remote relay (section D) has never been attached to a real platform. A relay is now deployed
-  (see below) and the whole path has been exercised by a hand-written client speaking the same
-  streamable HTTP a platform speaks, but no ChatGPT, claude.ai, or Dust connector has been added,
-  so their client-side behaviour — whether they accept a non-SSE JSON response, how they render a
-  JSON-RPC error, what they do with a 404 session — is still assumption.
-- There is no server-initiated stream on the remote surface: `GET /m/<secret>` is 405 and a
-  `notifications/tools/list_changed` arriving with no request waiting is counted and dropped, so a
-  remote client sees new tools only when it next polls `tools/list`. That is a weaker guarantee
-  than C-2 requires of the local path.
-- Cloudflare closes a proxied request at ~100 s while the relay holds one for 120 s, so a tool call
+Stated plainly, as of 2026-08-11. Each is something nobody has done, not something that merely
+lacks a test.
+
+- **No hosted client has ever attached.** Not ChatGPT, not claude.ai, not Dust. The relay path has
+  only ever been exercised by hand-written clients speaking the same streamable HTTP, so every
+  claim about how a real platform behaves — whether it accepts a non-SSE JSON response, how it
+  renders a JSON-RPC error, what it does with a 404 session — is assumption.
+- **C-1 is still open and can no longer be closed the way it was being closed.** No recording
+  against a real authenticated dashboard has produced a completed read since the rewrite, and the
+  daemon path that the last attempt ran on has been deleted. It must be redone on the extension.
+- **Q5 is still open.** Whether MAIN-world interception survives real sites' CSP and page hardening
+  has never been tested on three real targets. The `chrome.debugger` fallback exists but its being
+  needed would be a product finding, not a configuration detail.
+- **There is no Chrome Web Store listing.** It has not been opened. Review latency and the
+  data-disclosure wording are on the critical path and neither is code. Note also that
+  `packages/extension/public/manifest.json` currently describes Douze as "Nothing leaves your
+  computer", which stops being true the moment a hosted assistant is connected — that is a
+  disclosure defect to fix before submission, not after.
+- **No release exists and there is nowhere to publish one.** No `v*` tag has been pushed and
+  `git remote -v` prints nothing, so installation from a published artifact cannot be verified at
+  all. `@douze/bridge` is likewise `private` and unpublished, so the `npx @douze/bridge` invocation
+  in its own README does not work; run the built `dist/index.js` instead.
+- **The e2e suite is only as good as `e2e/README.md` claims.** Fifty-one specs were deleted with the
+  daemon and the replacement was written against that file's requirements list. Read it before
+  treating a green run as coverage of anything it does not name.
+- **The artifact secret sweep does not exist on the new architecture.** See the note under
+  [Secret handling](#secret-handling). C-4 is unverified until it does.
+- **HAR import and YAML export/import have no user interface.** `importHar`, `exportRecipe`,
+  `exportAll` and `importFiles` are implemented and unit-tested but have no caller outside their own
+  tests — no file picker, no download, no message type. They can be verified as APIs and not as
+  features.
+- **Model-written descriptions are not implemented.** Descriptions are deterministic only
+  (`describeSync`), and there is no options page in the manifest to put a toggle on. The 96.4%
+  template-only score against a ≥90% bar is why this is acceptable, not evidence that the model path
+  works.
+- **Connecting a hosted assistant may not be wired.** Confirm before testing it:
+  `rg NOT_CONNECTED_YET packages/extension/src` — while `douze:connect:start` / `rotate` / `stop`
+  return that message, the connect page renders and refuses, and nothing in the extension calls the
+  relay's `/register`. T-015.10 owns closing this.
+- **The recipe schema still accepts `auth.mode: headless`** with no implementation behind it
+  anywhere; the daemon owned that path and it was deleted. A recipe declaring it will load and then
+  execute through the browser regardless.
+- **No server-initiated stream on the remote surface.** `GET /m/<secret>` is 405, so a hosted client
+  sees new tools only when it next polls `tools/list`. That is a weaker guarantee than C-2 requires
+  of the local path, where stdio carries `notifications/tools/list_changed` properly.
+- **Cloudflare closes a proxied request at ~100 s while the relay holds one for 120 s**, so a call
   slower than that returns a Cloudflare error page instead of a JSON-RPC error the client can read.
   Untested, because no call has yet taken that long.
+- **The browser harness assumes a fixed macOS Helium path** and cannot run headless.
 
 ## Deployed relay (2026-08-11)
 
-One relay runs at `https://douze.jamalavedra.com`, a Cloudflare tunnel in front of a systemd user
-unit on `coolify-fsn1` bound to `127.0.0.1:9787` with `TRUST_PROXY=1`. It serves one bundled file,
-`~/douze-relay/index.js`, built by `pnpm --filter @douze/relay build`.
+One relay runs at `https://douze.jamalavedra.com`: a Cloudflare tunnel in front of a systemd user
+unit on `coolify-fsn1` bound to `127.0.0.1:9787` with `TRUST_PROXY=1`, serving one bundled file
+built by `pnpm --filter @douze/relay build`.
 
-Verified against it from a second machine, with a scratch `DOUZE_HOME` and a real daemon:
-
-| Check | Result |
-|---|---|
-| `POST /register`, `DELETE /register` over HTTPS | 201 then 204 |
-| WebSocket upgrade through Cloudflare | connected in 189 ms; `welcome` received |
-| `initialize` platform → relay → daemon | 164 ms, real `serverInfo`, session id issued |
-| `tools/list` routed by `Mcp-Session-Id` | answered from the daemon |
-| Unknown session, wrong secret path | 404 each, so a client re-initializes |
-| `daemon_version` carrying a newline | 400; nothing forged reached the log |
-| Daemon socket dropped | 503 immediately, no hang |
-| Remote surface with read + write + destructive approved | only the read tool listed |
-| `tools/call` on the destructive tool with `confirm: true` | refused, no target request |
-
-The relay log through all of it carried event names, durations, and endpoint hash prefixes only.
-
-That run found one defect, now fixed: the MCP SDK installs its tool handlers on the first
-`registerTool`, so a session whose registry had no approved tools connected with no tools
-capability and answered `tools/list` with "Method not found" for the life of the session — which
-is what a hosted client hits when it is attached before the first site is recorded.
+It was verified end to end against **the daemon that has since been deleted** — register, WebSocket
+upgrade through Cloudflare, `initialize`, `tools/list` routed by `Mcp-Session-Id`, 404 on an unknown
+session, immediate 503 on a dropped socket, a destructive tool refused with `confirm: true` — and
+the log through all of it carried event names, durations and endpoint hash prefixes only. Those
+results are evidence about the relay and about Cloudflare. **They are not evidence about the
+extension attaching**, which is a different client on the same socket and has not been run against
+this deployment.
