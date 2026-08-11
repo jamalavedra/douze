@@ -8,6 +8,7 @@
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
+    "@douze/mcp-host": "workspace:*",
     "@douze/shared": "workspace:*",
     "ws": "8.18.3"
   },

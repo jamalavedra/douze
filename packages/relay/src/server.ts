@@ -1,28 +1,31 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { WebSocketServer, type WebSocket } from 'ws'
-import {
-  HEARTBEAT_MS,
-  REMOTE_MAX_SESSIONS,
-  REMOTE_SESSION_IDLE_MS,
-  RemoteDaemonMessage,
-  RemoteRegistration,
-  type RemoteRelayMessage,
-} from '@douze/shared'
+import { HEARTBEAT_MS, REMOTE_MAX_SESSIONS, REMOTE_SESSION_IDLE_MS, RemoteRegistration } from '@douze/shared'
+import { ExtensionFrame, McpHost, welcome, type AttachedTool } from '@douze/mcp-host'
 
 /**
- * WO-014 T-014.5 — the relay: a stateless forwarder between a hosted MCP client (ChatGPT,
- * claude.ai, Dust — anything speaking streamable HTTP) and one douzed per endpoint, which dials
- * in over a single outbound WebSocket and opens no listener of its own.
+ * WO-015 T-015.7 — the relay: a hosted MCP endpoint for clients that cannot run a local process
+ * (ChatGPT, claude.ai web and mobile, Dust — anything speaking streamable HTTP), paired with one
+ * Douze browser extension per endpoint, which dials in over a single outbound WebSocket and opens
+ * no listener of its own.
  *
- * Stateless means exactly that: every endpoint lives in the map below and dies with the process.
- * Nothing touches disk, no payload is ever logged, and the relay reads only `message.method` and
- * `message.id` — enough to route, and nothing more. It stores hashes of the endpoint token, the
- * URL secret, and the optional platform bearer, so a memory dump of a running relay still does
- * not hand over a credential that would let anyone reach a user's daemon.
+ * It **terminates MCP itself**, one `McpHost` per session, rather than forwarding opaque JSON-RPC
+ * to something that owns the session on the far side (WO-014 did that, with a daemon there). The
+ * attached party is now an MV3 service worker Chrome evicts at will, so it can hold no session
+ * state and cannot be woken by an inbound frame: `initialize` and `tools/list` are answered here,
+ * from the surface the extension last pushed, and only `tools/call` needs the browser awake.
  *
- * The trust boundary is honest and narrow: the operator can read and inject MCP traffic. That is
- * disclosed rather than mitigated (README), and self-hosting via DOUZE_REMOTE_URL is the remedy.
+ * What that buys: a connector added while Chrome is closed lists its tools instead of looking
+ * broken, and a call that arrives at a sleeping worker waits out WAKE_GRACE_MS for it to come back
+ * rather than reporting a browser that is merely asleep as one that is gone.
+ *
+ * Still stateless in the sense that matters: every endpoint lives in the maps below and dies with
+ * the process, nothing touches disk, and no payload is logged. What is new — and disclosed in the
+ * README rather than softened — is that the relay now holds each endpoint's tool names,
+ * descriptions and schemas in memory in order to answer `tools/list`. It stores hashes of the
+ * endpoint token, the URL secret, and the optional platform bearer, so a memory dump still does
+ * not hand over a credential that would reach a user's browser.
  */
 
 export interface Relay {
@@ -30,7 +33,7 @@ export interface Relay {
   close: () => Promise<void>
 }
 
-/** Matches the daemon-side per-call ceiling; a tool call reaching a live dashboard can be slow. */
+/** Matches the host's per-call ceiling; a tool call reaching a live dashboard can be slow. */
 const REQUEST_TIMEOUT_MS = 120_000
 const MAX_BODY_BYTES = 1_048_576
 const MAX_IN_FLIGHT = 8
@@ -40,14 +43,34 @@ const REGISTRATION_WINDOW_MS = 3_600_000
 const SWEEP_MS = 30_000
 /** How long an over-cap body is read and discarded so its 413 can land. See readBody. */
 const LINGER_MS = 5_000
-/** An endpoint with no daemon and no session for this many idle windows is nobody's; reap it. */
+/** An endpoint with no extension and no session for this many idle windows is nobody's; reap it. */
 const ENDPOINT_IDLE_WINDOWS = 2
+/**
+ * How long a `tools/call` waits for a detached extension before it is answered as offline.
+ *
+ * An evicted MV3 service worker cannot be woken from outside — no inbound frame reaches a worker
+ * that is not running — and the only thing that revives it on its own is `chrome.alarms`, whose
+ * minimum period is 30 seconds. So any grace shorter than that reports a browser which is merely
+ * asleep as one that is gone. This is that floor plus the seconds a cold worker needs to boot and
+ * re-dial, and it stays well inside the 120 s per-call ceiling.
+ *
+ * `initialize` and `tools/list` never wait: they are answered from the cached surface, which is
+ * the whole point of the host owning the session.
+ */
+const WAKE_GRACE_MS = 40_000
 /**
  * Refusals a hosted MCP client would otherwise never show anyone: it renders a JSON-RPC error and
  * drops an HTTP error body on the floor, so these are delivered as `200 {error:{code:-32000}}`
  * instead. 401/404/413 keep their HTTP meaning — that is what makes a client re-auth or re-init.
+ * Everything the extension itself fails is already a JSON-RPC error shaped by the host.
  */
-const RPC_VISIBLE = new Set([409, 429, 502, 503, 504])
+const RPC_VISIBLE = new Set([409, 429])
+
+interface Session {
+  last: number
+  /** Owns MCP for this session: initialize, tools/list, and the correlation of every tool.call. */
+  host: McpHost
+}
 
 interface Endpoint {
   /** First 8 hex of the token hash — the only endpoint identifier that ever reaches a log line. */
@@ -58,10 +81,19 @@ interface Endpoint {
   socket: WebSocket | null
   heartbeat: NodeJS.Timeout | undefined
   lastPong: number
-  /** Last time a daemon or a platform client touched this endpoint, for the reaper below. */
+  /** Last time the extension or a platform client touched this endpoint, for the reaper below. */
   lastSeen: number
-  sessions: Map<string, { last: number }>
-  pending: Map<string, { resolve: (message: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>
+  /**
+   * One cached surface per endpoint, not per session: the extension pushes it once per connect,
+   * every live session is fanned out from it, and a session created later is seeded from it. That
+   * is what lets a connector added while Chrome is closed list its tools.
+   */
+  surface: AttachedTool[]
+  sessions: Map<string, Session>
+  /** Waiter keys of calls being awaited: both the in-flight cap and the duplicate-id guard. */
+  inFlight: Set<string>
+  /** Calls parked in the wake grace, resolved by the next `hello` or by their own timer. */
+  waking: Set<{ resolve: () => void; timer: NodeJS.Timeout }>
 }
 
 /** An answer the HTTP layer owes the caller; thrown from anywhere in a request's path. */
@@ -73,20 +105,6 @@ class Refusal extends Error {
     super(String(payload['error']))
     this.name = 'Refusal'
   }
-}
-
-const OFFLINE = {
-  error: 'daemon_offline',
-  message:
-    'Douze is not connected to the relay right now. Run `douze status` on the machine that holds ' +
-    'your recipes and make sure the daemon is running, then try again.',
-}
-
-const SESSION_REFUSED = {
-  error: 'session_refused',
-  message:
-    'Douze closed this session before answering it. That usually means too many assistants are ' +
-    'connected to this daemon at once; close one and try again.',
 }
 
 export async function startRelay(options: {
@@ -103,17 +121,19 @@ export async function startRelay(options: {
   sessionIdleMs?: number
   heartbeatMs?: number
   requestTimeoutMs?: number
+  wakeGraceMs?: number
 }): Promise<Relay> {
   // Only the tests set these; production reads the numbers both halves of the protocol agree on.
   const idleMs = options.sessionIdleMs ?? REMOTE_SESSION_IDLE_MS
   const heartbeatMs = options.heartbeatMs ?? HEARTBEAT_MS
   const timeoutMs = options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS
+  const graceMs = options.wakeGraceMs ?? WAKE_GRACE_MS
   const byToken = new Map<string, Endpoint>()
   const bySecret = new Map<string, Endpoint>()
   const registrations = new Map<string, { count: number; resetAt: number }>()
   // Metrics for now are counters and nothing else: no endpoint is exposed to scrape them, so
   // they surface once, on shutdown, where they cost nothing and answer "was anything dropped?".
-  const counters = { registered: 0, requests: 0, refused: 0, orphaned: 0 }
+  const counters = { registered: 0, requests: 0, refused: 0, waited: 0 }
 
   const register = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     // ponytail: a fixed in-memory window, keyed per caller. Good enough for one process; swap for
@@ -138,9 +158,9 @@ export async function startRelay(options: {
       })
     }
     const body = parsed.data
-    // Two independent randoms: the token authenticates the daemon's socket, the secret is the URL
-    // the platform holds. Neither is recoverable from the other, so leaking one URL to a platform
-    // log never yields the ability to impersonate the daemon.
+    // Two independent randoms: the token authenticates the extension's socket, the secret is the
+    // URL the platform holds. Neither is recoverable from the other, so leaking one URL to a
+    // platform log never yields the ability to impersonate the extension.
     const token = randomBytes(32).toString('base64url')
     const secret = randomBytes(32).toString('base64url')
     const endpoint: Endpoint = {
@@ -152,13 +172,15 @@ export async function startRelay(options: {
       heartbeat: undefined,
       lastPong: 0,
       lastSeen: now,
+      surface: [],
       sessions: new Map(),
-      pending: new Map(),
+      inFlight: new Set(),
+      waking: new Set(),
     }
     byToken.set(endpoint.tokenHash, endpoint)
     bySecret.set(endpoint.secretHash, endpoint)
     counters.registered += 1
-    log('endpoint.registered', { ep: endpoint.label, daemon: body.daemon_version ?? 'unknown' })
+    log('endpoint.registered', { ep: endpoint.label, client: body.daemon_version ?? 'unknown' })
     json(res, 201, { token, mcp_path: `/m/${secret}` })
   }
 
@@ -182,7 +204,7 @@ export async function startRelay(options: {
     byToken.set(endpoint.tokenHash, endpoint)
     bySecret.set(endpoint.secretHash, endpoint)
     // The live socket authenticated with a token that no longer exists. Closing it with 1008 is
-    // what makes the daemon re-hello with the token it just received rather than sit there
+    // what makes the extension re-hello with the token it just received rather than sit there
     // holding a connection the relay would refuse to re-establish.
     const stale = endpoint.socket
     endpoint.socket = null
@@ -201,55 +223,90 @@ export async function startRelay(options: {
     const socket = endpoint.socket
     endpoint.socket = null
     detach(endpoint, 'unregistered')
+    for (const sid of endpoint.sessions.keys()) closeSession(endpoint, sid)
+    // Nothing is coming back for a call parked in the wake grace on an endpoint that no longer
+    // exists: released now, and the host answers it as offline.
+    wake(endpoint)
     socket?.close(1000, 'unregistered')
     log('endpoint.deleted', { ep: endpoint.label })
     res.writeHead(204).end()
   }
 
-  const send = (endpoint: Endpoint, message: RemoteRelayMessage): void => {
-    if (endpoint.socket?.readyState === 1) endpoint.socket.send(JSON.stringify(message))
-  }
-
-  /** Waits for the daemon's reply to one JSON-RPC request, correlated by session and id. */
-  const forward = (endpoint: Endpoint, sid: string, message: { id?: unknown }): Promise<unknown> => {
-    const key = waiterKey(sid, message.id)
-    // Reusing an id that is still in flight would replace the first waiter rather than add one:
-    // the first call hangs to its 120s timeout and the in-flight cap never counts either of them.
-    if (endpoint.pending.has(key)) {
-      throw new Refusal(409, { error: 'duplicate_id', message: 'A request with this id is already in flight.' })
-    }
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        endpoint.pending.delete(key)
-        reject(new Refusal(504, { error: 'timeout', message: 'The daemon did not answer in time.' }))
-      }, timeoutMs)
-      endpoint.pending.set(key, {
-        timer,
-        resolve: (reply) => {
-          clearTimeout(timer)
-          resolve(reply)
-        },
-        reject: (error) => {
-          clearTimeout(timer)
-          reject(error)
-        },
-      })
-      send(endpoint, { type: 'mcp.message', sid, message })
+  /**
+   * One MCP session, terminated here. The host answers `initialize` and `tools/list` on its own
+   * and only reaches the extension for a `tools/call`; seeding it with the endpoint's cached
+   * surface is what makes a session opened while the browser is closed useful rather than empty.
+   */
+  const openSession = (endpoint: Endpoint, sid: string, now: number): Session => {
+    const host = new McpHost({
+      trust: 'remote',
+      callTimeoutMs: timeoutMs,
+      send: (frame) => {
+        // Throwing rather than dropping: the host turns it into the offline refusal for this call,
+        // where silently swallowing it would leave the caller waiting out the full timeout.
+        if (!live(endpoint)) throw new Error('detached')
+        endpoint.socket?.send(JSON.stringify(frame))
+      },
+      // There is no server-initiated stream in v1 (GET is 405), so a list change is recorded and
+      // the client sees it the next time it polls tools/list — which every target client does.
+      notify: () => log('mcp.list_changed', { ep: endpoint.label }),
     })
+    host.setAttached(live(endpoint))
+    host.pushSurface(endpoint.surface)
+    const session: Session = { last: now, host }
+    endpoint.sessions.set(sid, session)
+    return session
   }
 
-  /** Everything still waiting on one session, once that session is known to be dead. */
-  const abandon = (endpoint: Endpoint, sid: string, refusal: Refusal): void => {
-    for (const [key, waiter] of endpoint.pending) {
-      if (!key.startsWith(`${sid}:`)) continue
-      endpoint.pending.delete(key)
-      waiter.reject(refusal)
-    }
+  const closeSession = (endpoint: Endpoint, sid: string): boolean => {
+    const session = endpoint.sessions.get(sid)
+    if (!session) return false
+    endpoint.sessions.delete(sid)
+    // Fails whatever that session had in flight instead of leaving it on a 120s timer.
+    session.host.close()
+    return true
+  }
+
+  /** The extension's one surface, fanned out to every session that already exists. */
+  const pushSurface = (endpoint: Endpoint, tools: AttachedTool[]): void => {
+    endpoint.surface = tools
+    for (const session of endpoint.sessions.values()) session.host.pushSurface(tools)
+    // The count, never the names: this is the metadata the relay now holds and must not log.
+    log('surface.pushed', { ep: endpoint.label, tools: tools.length })
   }
 
   /**
-   * The streamable-HTTP MCP endpoint. Everything a platform client touches lands here, and the
-   * only parts of the body read are `method` and `id` — the payload itself is opaque.
+   * Parks a call until the extension re-attaches or the grace runs out. Never re-sends anything —
+   * the call has not been sent yet; a call already in flight when the socket dropped is failed by
+   * `setAttached(false)` and stays failed, because a tool can be a write.
+   */
+  const waitForAttach = (endpoint: Endpoint): Promise<void> => {
+    counters.waited += 1
+    log('extension.waking', { ep: endpoint.label, grace_ms: graceMs })
+    return new Promise<void>((resolve) => {
+      const waiter = {
+        resolve,
+        timer: setTimeout(() => {
+          endpoint.waking.delete(waiter)
+          resolve()
+        }, graceMs),
+      }
+      waiter.timer.unref()
+      endpoint.waking.add(waiter)
+    })
+  }
+
+  const wake = (endpoint: Endpoint): void => {
+    for (const waiter of endpoint.waking) {
+      clearTimeout(waiter.timer)
+      waiter.resolve()
+    }
+    endpoint.waking.clear()
+  }
+
+  /**
+   * The streamable-HTTP MCP endpoint. Everything a platform client touches lands here, and every
+   * JSON-RPC message is answered by this endpoint's own host.
    */
   const mcp = async (req: IncomingMessage, res: ServerResponse, secret: string): Promise<void> => {
     const endpoint = bySecret.get(sha256hex(secret))
@@ -265,16 +322,15 @@ export async function startRelay(options: {
     }
     endpoint.lastSeen = Date.now()
 
-    // No server-initiated stream in v1: a daemon-side tool change reaches the platform when the
-    // client next polls tools/list, which every target client does after a reconnect.
+    // No server-initiated stream in v1: a tool change reaches the platform when the client next
+    // polls tools/list, which every target client does after a reconnect.
     if (req.method !== 'POST' && req.method !== 'DELETE') {
       res.setHeader('Allow', 'POST, DELETE')
       throw new Refusal(405, { error: 'method_not_allowed' })
     }
 
     if (req.method === 'DELETE') {
-      const sid = String(req.headers['mcp-session-id'] ?? '')
-      if (endpoint.sessions.delete(sid)) send(endpoint, { type: 'session.close', sid })
+      closeSession(endpoint, String(req.headers['mcp-session-id'] ?? ''))
       res.writeHead(204).end()
       return
     }
@@ -292,17 +348,13 @@ export async function startRelay(options: {
     }
   }
 
-  /** One POST to `/m/<secret>`, from the in-flight cap down to the daemon's reply. */
+  /** One POST to `/m/<secret>`, from the in-flight cap down to the host's answer. */
   const exchange = async (
     endpoint: Endpoint,
     req: IncomingMessage,
     res: ServerResponse,
     message: { method?: unknown; id?: unknown },
   ): Promise<void> => {
-    if (!endpoint.socket) throw new Refusal(503, OFFLINE)
-    if (endpoint.pending.size >= MAX_IN_FLIGHT) {
-      throw new Refusal(429, { error: 'rate_limited', message: 'Too many calls in flight for this endpoint.' })
-    }
     counters.requests += 1
     const started = Date.now()
     const answered = 'id' in message && message.id !== null && message.id !== undefined
@@ -310,17 +362,14 @@ export async function startRelay(options: {
 
     if (message.method === 'initialize' && answered) {
       // A client re-initializing over a session it already holds gets that one closed rather than
-      // orphaned: without this the previous MCP instance survives on the daemon until it idles out.
-      if (endpoint.sessions.delete(header)) send(endpoint, { type: 'session.close', sid: header })
-      // The daemon enforces this cap too, but a relay that mints sessions it knows will be refused
-      // is what let one endpoint hold hundreds of them.
+      // orphaned: without this the previous host survives until the session idles out.
+      closeSession(endpoint, header)
       if (endpoint.sessions.size >= REMOTE_MAX_SESSIONS) {
         throw new Refusal(429, { error: 'rate_limited', message: 'Too many MCP sessions open for this endpoint.' })
       }
       const sid = randomUUID()
-      endpoint.sessions.set(sid, { last: started })
-      send(endpoint, { type: 'session.open', sid })
-      const reply = await forward(endpoint, sid, message)
+      const session = openSession(endpoint, sid, started)
+      const reply = await session.host.handle(message)
       log('mcp.initialized', { ep: endpoint.label, ms: Date.now() - started })
       json(res, 200, reply, { 'Mcp-Session-Id': sid })
       return
@@ -332,14 +381,31 @@ export async function startRelay(options: {
     session.last = started
 
     if (!answered) {
-      send(endpoint, { type: 'mcp.message', sid: header, message })
+      void session.host.handle(message)
       log('mcp.notified', { ep: endpoint.label })
       res.writeHead(202).end()
       return
     }
-    const reply = await forward(endpoint, header, message)
-    log('mcp.answered', { ep: endpoint.label, ms: Date.now() - started })
-    json(res, 200, reply)
+
+    // Reusing an id that is still in flight would let one caller's answer settle another's request.
+    const key = waiterKey(header, message.id)
+    if (endpoint.inFlight.has(key)) {
+      throw new Refusal(409, { error: 'duplicate_id', message: 'A request with this id is already in flight.' })
+    }
+    if (endpoint.inFlight.size >= MAX_IN_FLIGHT) {
+      throw new Refusal(429, { error: 'rate_limited', message: 'Too many calls in flight for this endpoint.' })
+    }
+    endpoint.inFlight.add(key)
+    try {
+      // Only a call needs the browser: initialize and tools/list are already answered above and
+      // below from cache, and making them wait would stall a client that is merely listing tools.
+      if (message.method === 'tools/call' && !live(endpoint)) await waitForAttach(endpoint)
+      const reply = await session.host.handle(message)
+      log('mcp.answered', { ep: endpoint.label, ms: Date.now() - started })
+      json(res, 200, reply)
+    } finally {
+      endpoint.inFlight.delete(key)
+    }
   }
 
   const route = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
@@ -361,18 +427,17 @@ export async function startRelay(options: {
     })
   })
 
-  /** Everything that outlives a socket: in-flight calls fail now, sessions are gone with it. */
+  /**
+   * Everything that outlives a socket. Sessions **survive** it — they belong to the relay now, and
+   * a client must still be able to list tools with the browser closed — but each host is told it
+   * is detached, which fails what it had in flight at once rather than on a 120s timer. Those
+   * calls are never re-sent when the extension returns: a tool can be a write.
+   */
   const detach = (endpoint: Endpoint, reason: string): void => {
     clearInterval(endpoint.heartbeat)
     endpoint.heartbeat = undefined
-    for (const [key, waiter] of endpoint.pending) {
-      endpoint.pending.delete(key)
-      // Waiting out the 120s timeout for a failure already known is the opposite of legible.
-      waiter.reject(new Refusal(502, OFFLINE))
-    }
-    // A reconnecting daemon builds fresh MCP server instances and knows none of these ids.
-    endpoint.sessions.clear()
-    log('daemon.detached', { ep: endpoint.label, reason })
+    for (const session of endpoint.sessions.values()) session.host.setAttached(false)
+    log('extension.detached', { ep: endpoint.label, reason })
   }
 
   // maxPayload matches the HTTP body cap; ws defaults to 100MB, which no frame here ever needs.
@@ -384,7 +449,7 @@ export async function startRelay(options: {
     let endpoint: Endpoint | null = null
     const deadline = setTimeout(() => socket.close(1008, 'expected hello'), HELLO_TIMEOUT_MS)
     // ws raises 'error' on an abruptly dropped peer, and an unhandled one is an uncaughtException
-    // — a single half-open daemon connection would take the whole relay down with it.
+    // — a single half-open extension connection would take the whole relay down with it.
     socket.on('error', () => socket.terminate())
     socket.on('close', () => {
       clearTimeout(deadline)
@@ -394,38 +459,38 @@ export async function startRelay(options: {
     })
 
     socket.on('message', (raw) => {
-      const frame = RemoteDaemonMessage.safeParse(parse(String(raw)))
+      const payload = parse(String(raw))
+      const frame = ExtensionFrame.safeParse(payload)
       if (!frame.success) {
-        log('daemon.dropped_frame', { bytes: String(raw).length })
+        log('extension.dropped_frame', { bytes: String(raw).length })
         return
       }
       if (!endpoint) {
-        if (frame.data.type !== 'hello') {
-          socket.close(1008, 'expected hello')
-          return
-        }
-        const found = byToken.get(sha256hex(frame.data.token))
+        // `hello` carries the endpoint token alongside the attachment protocol's own field; the
+        // token is the relay's, not the host's, which is why it is read off the raw frame.
+        const token = isRecord(payload) ? payload['token'] : undefined
+        const found =
+          frame.data.type === 'hello' && typeof token === 'string' ? byToken.get(sha256hex(token)) : undefined
         if (!found) {
-          socket.close(1008, 'invalid relay token')
+          socket.close(1008, frame.data.type === 'hello' ? 'invalid relay token' : 'expected hello')
           return
         }
         clearTimeout(deadline)
         endpoint = adopt(found, socket)
-        socket.send(JSON.stringify({ type: 'welcome', heartbeat_ms: heartbeatMs } satisfies RemoteRelayMessage))
+        socket.send(JSON.stringify(welcome(heartbeatMs)))
         return
       }
       switch (frame.data.type) {
         case 'pong':
           endpoint.lastPong = Date.now()
           return
-        case 'mcp.message':
-          settle(endpoint, frame.data.sid, frame.data.message)
+        case 'surface.push':
+          pushSurface(endpoint, frame.data.tools)
           return
-        case 'session.closed':
-          endpoint.sessions.delete(frame.data.sid)
-          // The daemon refused or tore down this session, so nothing waiting on it will ever be
-          // answered — including the `initialize` that opened it, which would otherwise hang 120s.
-          abandon(endpoint, frame.data.sid, new Refusal(503, SESSION_REFUSED))
+        case 'tool.result':
+          // Fanned out rather than routed: every call id is minted by a host and unique across the
+          // attachment, so at most one session knows this one and the rest ignore it.
+          for (const session of endpoint.sessions.values()) session.host.receive(frame.data)
           return
         default:
           return
@@ -433,7 +498,7 @@ export async function startRelay(options: {
     })
   })
 
-  /** One socket per endpoint: a second hello is a reconnecting daemon, and it wins. */
+  /** One socket per endpoint: a second hello is a reconnecting extension, and it wins. */
   const adopt = (endpoint: Endpoint, socket: WebSocket): Endpoint => {
     const previous = endpoint.socket
     endpoint.socket = null
@@ -449,36 +514,25 @@ export async function startRelay(options: {
         socket.terminate()
         return
       }
-      send(endpoint, { type: 'ping' })
+      if (socket.readyState === 1) socket.send(JSON.stringify({ type: 'ping' }))
     }, heartbeatMs)
-    log('daemon.connected', { ep: endpoint.label })
+    // Sessions outlived the disconnect, so they are told the browser is back before anything
+    // parked in the grace is released into a host that would otherwise refuse it as offline.
+    for (const session of endpoint.sessions.values()) session.host.setAttached(true)
+    wake(endpoint)
+    log('extension.connected', { ep: endpoint.label })
     return endpoint
-  }
-
-  const settle = (endpoint: Endpoint, sid: string, message: unknown): void => {
-    const key = waiterKey(sid, (message as { id?: unknown } | null)?.id)
-    const waiter = endpoint.pending.get(key)
-    if (!waiter) {
-      // A server-initiated notification (tools/list_changed and friends) with no request waiting
-      // for it. There is no stream to put it on in v1, so it is counted and dropped.
-      counters.orphaned += 1
-      log('mcp.dropped', { ep: endpoint.label })
-      return
-    }
-    endpoint.pending.delete(key)
-    waiter.resolve(message)
   }
 
   const sweep = setInterval(() => {
     const now = Date.now()
     // Both maps below only ever grew: a rate-limit bucket per peer address that outlived its
-    // window, and an endpoint whose daemon never dialled in and whose owner never called DELETE.
+    // window, and an endpoint whose extension never dialled in and whose owner never called DELETE.
     for (const [ip, seen] of registrations) if (seen.resetAt <= now) registrations.delete(ip)
     for (const endpoint of byToken.values()) {
       for (const [sid, session] of endpoint.sessions) {
         if (session.last > now - idleMs) continue
-        endpoint.sessions.delete(sid)
-        send(endpoint, { type: 'session.close', sid })
+        closeSession(endpoint, sid)
         log('session.expired', { ep: endpoint.label })
       }
       if (endpoint.socket || endpoint.sessions.size > 0) continue
@@ -508,8 +562,12 @@ export async function startRelay(options: {
     port,
     close: async () => {
       clearInterval(sweep)
-      for (const endpoint of byToken.values()) clearInterval(endpoint.heartbeat)
-      // wss.close() only stops new upgrades; a connected daemon otherwise holds the process open.
+      for (const endpoint of byToken.values()) {
+        clearInterval(endpoint.heartbeat)
+        for (const sid of endpoint.sessions.keys()) closeSession(endpoint, sid)
+        wake(endpoint)
+      }
+      // wss.close() only stops new upgrades; a connected extension otherwise holds the process open.
       for (const client of wss.clients) client.terminate()
       wss.close()
       // All, not just idle: a client mid-upload holds a connection that is anything but idle, and
@@ -522,9 +580,11 @@ export async function startRelay(options: {
 }
 
 /**
- * One line per event: when, what, how big, and which endpoint by hash prefix. No payloads, no
- * tool names, no session ids, and no secret in any form — the sweep test in relay.test.ts holds
- * this line, because a relay log is the one place a bearer token would sit in plaintext forever.
+ * One line per event: when, what, how big, and which endpoint by hash prefix. No payloads, no tool
+ * names, no descriptions, no session ids, and no secret in any form — the sweep test in
+ * relay.test.ts holds this line, and it matters more than it did in WO-014: the relay now holds a
+ * whole tool surface in memory, so a careless log line would put a user's recipe names and
+ * descriptions in an operator's journal forever. Counts and durations only.
  */
 const log = (event: string, fields: Record<string, string | number> = {}): void => {
   const tail = Object.entries(fields)
@@ -550,7 +610,7 @@ const callerAddress = (req: IncomingMessage, trustProxy: boolean): string => {
 /**
  * JSON-RPC ids keep their type, so `1` and `"1"` are two different calls and two objects are not
  * the same call just because both stringify to `[object Object]`. Correlating on the string alone
- * hands one caller's result to another.
+ * would let one caller's request pass the duplicate-id guard on another's key.
  */
 const waiterKey = (sid: string, id: unknown): string => `${sid}:${typeof id}:${String(id)}`
 
@@ -570,13 +630,23 @@ const parse = (raw: string): unknown => {
   }
 }
 
+/**
+ * An attachment that can carry a frame right now. A socket in CLOSING is not one: without this,
+ * a call arriving between the peer's close and the relay's own 'close' event would be refused as
+ * offline instead of parked for the worker that is on its way back.
+ */
+const live = (endpoint: { socket: WebSocket | null }): boolean => endpoint.socket?.readyState === 1
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value)
+
 const jsonBody = async <T>(req: IncomingMessage): Promise<T> => {
   const raw = await readBody(req)
   if (raw === null) {
     throw new Refusal(413, { error: 'payload_too_large', message: `The body exceeds ${MAX_BODY_BYTES} bytes.` })
   }
   const body = parse(raw.toString('utf8'))
-  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+  if (!isRecord(body)) {
     throw new Refusal(400, { error: 'bad_request', message: 'Expected one JSON object.' })
   }
   return body as T
