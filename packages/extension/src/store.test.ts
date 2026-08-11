@@ -314,6 +314,21 @@ describe('the write gate (AC-CAP-005, TR-6)', () => {
   })
 
   /**
+   * The same token one slot over: as the query parameter NAME rather than its value, which is how
+   * a URL carrying a set arrives. The gate walked query values only, so this was stored verbatim.
+   */
+  it('lets no JWT through as a query parameter name either', async () => {
+    const { store, id } = await withSession()
+    await store.appendExchange(exchange(id, 0, { url: `https://app.test/api/thing?${JWT}=1&page=2` }))
+
+    const detail = await store.session(id)
+    const persisted = JSON.stringify(detail?.exchanges)
+    expect(persisted).not.toContain(JWT)
+    expect(persisted).toContain('page=2')
+    expect(findSurvivingSecrets(detail?.exchanges)).toEqual([])
+  })
+
+  /**
    * `credentials[]` is a list of LOCATIONS the pipeline discovered — a storage key, a header
    * name. Redaction does not walk it, so a hint carrying the value itself is only stopped by the
    * gate reading the full document. Scanning url + headers + bodies alone let this one to disk.

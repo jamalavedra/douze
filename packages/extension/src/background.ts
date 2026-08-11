@@ -200,9 +200,39 @@ const dialled = hydrated.then(async () => {
     liveSurface = state.tools
     // T-015.8 — a recipe change is a `surface.push` on every live attachment.
     attachments.pushSurface()
+    void pruneExposed(state.tools)
   })
+  await pruneExposed(liveSurface)
   await attachments.tick()
 })
+
+/**
+ * T-015.9 — `attach:expose` holds qualified tool names, and nothing ever removed one.
+ *
+ * An exemption says "this tool's results legitimately look like credentials", which is a statement
+ * about the tool the user was looking at. Delete recipe `foo` and import a different `foo` later
+ * and its `bar` would inherit an exemption nobody granted it — silently, because the name is the
+ * whole key. Filtered against the live surface whenever the surface moves, so a name that is not
+ * a tool right now is not an exemption right now either. Re-granting is two clicks; a credential
+ * released to a relay operator is not recallable.
+ */
+async function pruneExposed(tools: readonly SurfaceTool[]): Promise<void> {
+  const stored = await chrome.storage.local.get(EXPOSE_KEY)
+  const expose = stored[EXPOSE_KEY] as Partial<ExposeLists> | undefined
+  if (!expose) return
+  const live = new Set(tools.map((tool) => tool.qualified_name))
+  const kept: ExposeLists = {
+    local: (expose.local ?? []).filter((name) => live.has(name)),
+    remote: (expose.remote ?? []).filter((name) => live.has(name)),
+  }
+  if (kept.local.length === (expose.local ?? []).length && kept.remote.length === (expose.remote ?? []).length) {
+    return
+  }
+  await chrome.storage.local.set({ [EXPOSE_KEY]: kept })
+  // The manager holds its own copy and only re-reads storage on a tick, so without this the gate
+  // would go on exempting a tool that no longer exists until the next alarm.
+  await attachments.tick()
+}
 
 // --- capture --------------------------------------------------------------
 
@@ -658,6 +688,9 @@ async function rotateLink(): Promise<ConnectState> {
   await chrome.storage.local.set({
     [RELAY_KEY]: { ...relay, token: rotated.token, mcp_path: rotated.mcp_path } satisfies RelayPairing,
   })
+  // The old token is dead the moment the relay answered; without this the socket holding it stays
+  // up until the next alarm, up to 30 seconds of an attachment the relay has already forgotten.
+  await attachments.tick()
   return connectState()
 }
 
@@ -677,17 +710,25 @@ async function stopLink(): Promise<ConnectState> {
       `${relay.url} to drop it: ${String((error as Error)?.message ?? error)}`
   }
   await chrome.storage.local.remove(RELAY_KEY)
+  // Stopping means stopping now. The `DELETE` above is best effort and may well have failed, in
+  // which case closing this socket is the only thing that ends the sharing at all.
+  await attachments.tick()
   return connectState(warning === undefined ? {} : { warning })
 }
 
 /**
  * T-015.9 — the write opt-in, stored on the pairing. The attachment key includes it, so the client
- * closes the read-only socket and dials a new one within 30 seconds, pushing the surface that opt-in
- * implies. Destructive tools are not on either surface and this does not put them there.
+ * closes the socket it has and dials a new one that pushes the surface this opt-in implies.
+ * Destructive tools are not on either surface and this does not put them there.
+ *
+ * Ticked here rather than left to the alarm, because the direction that matters is OFF: the live
+ * attachment froze `allowWrites` at construction, so a host the user has just restricted would go
+ * on completing writes for up to 30 seconds, and nothing on the relay side helps.
  */
 async function setWrites(allow: boolean): Promise<ConnectState> {
   const relay = await storedRelay()
   await chrome.storage.local.set({ [RELAY_KEY]: { ...relay, allow_writes: allow } satisfies RelayPairing })
+  await attachments.tick()
   return connectState()
 }
 

@@ -207,8 +207,16 @@ const storageArea = (items: Map<string, unknown>, area: string, onChanged: FakeE
     }
     queueMicrotask(() => onChanged.emit(changes, area))
   },
+  // A removal notifies exactly as a write does, because Chrome's does: the recipe store's
+  // `onChanged` listener is how a deleted recipe ever leaves the live surface.
   remove: async (keys: string | string[]): Promise<void> => {
-    for (const key of typeof keys === 'string' ? [keys] : keys) items.delete(key)
+    const changes: Changes = {}
+    for (const key of typeof keys === 'string' ? [keys] : keys) {
+      if (!items.has(key)) continue
+      changes[key] = { oldValue: items.get(key) }
+      items.delete(key)
+    }
+    if (Object.keys(changes).length > 0) queueMicrotask(() => onChanged.emit(changes, area))
   },
 })
 
@@ -766,7 +774,11 @@ const SHOP_ALL = Recipe.parse({
       confidence: 0.9,
       observations: 3,
       approved: true,
-      request: { method: 'POST', path: '/orders' },
+      request: {
+        method: 'POST',
+        path: '/orders',
+        input_schema: { type: 'object', properties: { item: { type: 'string' } } },
+      },
       fixtures: ['shop/create_order.json'],
     },
     {
@@ -948,8 +960,91 @@ describe('the trust table, enforced in the extension (T-015.9)', () => {
     await settle()
 
     expect(failure(socket, 'r2').code).toBe('result_withheld')
-    expect(failure(socket, 'r2').message).toContain('$.content[0].text')
+    expect(failure(socket, 'r2').message).toContain('$.session')
     expect(JSON.stringify(socket.sent)).not.toContain(JWT)
+  })
+
+  it('refuses an argument the recipe never recorded before anything is fetched', async () => {
+    const socket = await attach({ 'attach:relay': RELAY }, 'relay.test')
+    await approveShop()
+    let fetched = false
+    fake.inject = async (url) => {
+      fetched = true
+      return { status: 200, headers: {}, body: '{}', url, redirected: false }
+    }
+    socket.deliver(callFrame('a1', 'shop_list_orders', { role: 'admin' }))
+    await settle()
+
+    expect(fetched).toBe(false)
+    expect(failure(socket, 'a1').code).toBe('invalid_arguments')
+    expect(failure(socket, 'a1').message).toContain('"role" is not a parameter of this tool')
+  })
+
+  it('stops serving writes on the call after the opt-in is turned off, not on the next alarm', async () => {
+    const socket = await attach({ 'attach:relay': { ...RELAY, allow_writes: true } }, 'relay.test')
+    await approveShop()
+    socket.deliver(callFrame('w1', 'shop_create_order', { item: 'lamp' }))
+    await settle()
+    expect(resultFor(socket, 'w1')?.['error']).toBeUndefined()
+
+    // `allowWrites` is frozen into the attachment at construction, so nothing about this socket
+    // can be re-read: turning the opt-in off has to close it, and no alarm is fired here.
+    await sendFrom(extensionPage(), { type: 'douze:connect:writes', allow: false })
+    await settle()
+    expect(socket.readyState).toBe(3)
+
+    const reopened = dialled('relay.test') as FakeSocket
+    expect(reopened).not.toBe(socket)
+    reopened.accept()
+    await settle()
+    reopened.deliver({ type: 'welcome', heartbeat_ms: 20_000 })
+    await settle()
+    expect(pushedNames(reopened).at(-1)).toEqual(['shop_list_orders'])
+
+    reopened.deliver(callFrame('w2', 'shop_create_order', { item: 'lamp' }))
+    await settle()
+    expect(failure(reopened, 'w2').code).toBe('trust_refused')
+  })
+
+  it('drops an exemption when its tool leaves the surface, so a later namesake does not inherit it', async () => {
+    const socket = await attach({ 'attach:relay': RELAY }, 'relay.test')
+    await approveShop()
+    fake.inject = async (url) => ({
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ data: { session: JWT } }),
+      url,
+      redirected: false,
+    })
+    await sendFrom(extensionPage(), {
+      type: 'douze:connect:expose',
+      trust: 'remote',
+      tool: 'shop_list_orders',
+      allow: true,
+    })
+    await settle()
+    socket.deliver(callFrame('e1', 'shop_list_orders', {}))
+    await settle()
+    expect(resultFor(socket, 'e1')?.['error']).toBeUndefined()
+
+    // The recipe goes, and a different `shop` arrives later carrying the same qualified name. The
+    // exemption was granted to a tool that no longer exists and must not follow the name.
+    const recipes = await RecipeStore.open()
+    await recipes.delete('shop')
+    await settle()
+    expect(fake.local.get('attach:expose')).toEqual({ local: [], remote: [] })
+
+    await approveShop()
+    const live = dialled('relay.test') as FakeSocket
+    if (live !== socket) {
+      live.accept()
+      await settle()
+      live.deliver({ type: 'welcome', heartbeat_ms: 20_000 })
+      await settle()
+    }
+    live.deliver(callFrame('e2', 'shop_list_orders', {}))
+    await settle()
+    expect(failure(live, 'e2').code).toBe('result_withheld')
   })
 
   it('exempts a tool from the gate at one trust level only', async () => {

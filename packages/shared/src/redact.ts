@@ -166,10 +166,15 @@ export function redactUrl(url: string, config: RedactionConfig = defaultRedactio
   for (const [key, value] of [...parsed.searchParams.entries()]) {
     // `isPlaceholder` matters because this runs twice on the way to disk — once in the extension,
     // once in the store — and re-redacting a placeholder would report the placeholder's own length.
-    if ((matches(key, config.fields) || looksLikeCredential(value)) && !isPlaceholder(value)) {
-      parsed.searchParams.set(key, placeholder(value))
-      changed = true
-    }
+    const secret = (matches(key, config.fields) || looksLikeCredential(value)) && !isPlaceholder(value)
+    // The key is redacted for the same reason an object key and a header name are: `?<jwt>=1` is
+    // as readable off disk as `?token=<jwt>`, and a token really does arrive in key position when
+    // a URL carries a set rather than a mapping.
+    const name = !isPlaceholder(key) && looksLikeCredential(key) ? placeholder(key) : key
+    if (!secret && name === key) continue
+    if (name !== key) parsed.searchParams.delete(key)
+    parsed.searchParams.set(name, secret ? placeholder(value) : value)
+    changed = true
   }
   // A key in the path, not the query — `/v1/projects/pk_live_…/players`. The write gate reads the
   // whole URL, so a segment it would catch has to be replaced here or the exchange is refused.
@@ -201,10 +206,12 @@ export function redactUrl(url: string, config: RedactionConfig = defaultRedactio
     let hashChanged = false
     // oxlint-disable-next-line unicorn/no-useless-spread -- snapshot before set() mutates during iteration
     for (const [key, value] of [...fragment.entries()]) {
-      if ((matches(key, config.fields) || looksLikeCredential(value)) && !isPlaceholder(value)) {
-        fragment.set(key, placeholder(value))
-        hashChanged = true
-      }
+      const secret = (matches(key, config.fields) || looksLikeCredential(value)) && !isPlaceholder(value)
+      const name = !isPlaceholder(key) && looksLikeCredential(key) ? placeholder(key) : key
+      if (!secret && name === key) continue
+      if (name !== key) fragment.delete(key)
+      fragment.set(name, secret ? placeholder(value) : value)
+      hashChanged = true
     }
     if (hashChanged) {
       parsed.hash = fragment.toString()
@@ -329,19 +336,22 @@ const fragmentParams = (hash: string): URLSearchParams | null => {
 }
 
 /**
- * Path segments, query values, userinfo and fragment values, decoded — a placeholder written into
- * a path arrives encoded. The fragment is here because an OAuth implicit flow puts the access
- * token in it, and neither the query walk nor the path walk can see it.
+ * Path segments, query and fragment NAMES and values, and userinfo, decoded — a placeholder
+ * written into a path arrives encoded. The fragment is here because an OAuth implicit flow puts
+ * the access token in it, and neither the query walk nor the path walk can see it. The names are
+ * here for the same reason `findSurvivingSecrets` walks object keys: `?<jwt>=1` persists the token
+ * exactly as well as `?token=<jwt>` does, and a gate that reads only values never sees it.
  */
 function urlParts(parsed: URL): string[] {
   const fragment = fragmentParams(parsed.hash)
   const opaque = decodePart(parsed.hash.slice(1))
   return [
     ...parsed.pathname.split('/').filter(Boolean).map(decodePart),
+    ...parsed.searchParams.keys(),
     ...parsed.searchParams.values(),
     ...(parsed.username ? [decodePart(parsed.username)] : []),
     ...(parsed.password ? [decodePart(parsed.password)] : []),
-    ...(fragment ? [...fragment.values()] : opaque ? [opaque] : []),
+    ...(fragment ? [...fragment.keys(), ...fragment.values()] : opaque ? [opaque] : []),
   ]
 }
 

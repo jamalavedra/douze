@@ -67,7 +67,12 @@ export const RequestContract = z.object({
   method: z.enum(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE']),
   /** Endpoint Template with `{param}` segments — REQ-INF-001. */
   path: z.string(),
-  /** AC-INF-002.4 — JSON Schema, converted to Zod at load time. */
+  /**
+   * AC-INF-002.4 — JSON Schema, kept as JSON Schema: it is pushed to a host verbatim as the
+   * tool's `input_schema`, and `checkPolicy` (packages/extension/src/guards.ts) validates every
+   * inbound argument against it before a request is built. The CLI converted it to Zod at load
+   * time; the CLI is gone and so is the converter.
+   */
   input_schema: z.record(z.string(), z.unknown()).default({ type: 'object', properties: {} }),
   /** Static headers observed as required by the app (never credentials). */
   headers: z.record(z.string(), z.string()).default({}),

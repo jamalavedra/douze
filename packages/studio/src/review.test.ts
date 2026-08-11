@@ -268,6 +268,22 @@ describe('REQ-REC-004 fixtures', () => {
     expect(() => assertFixtureSafe(raw as never)).toThrow(/credential-shaped value/)
   })
 
+  /**
+   * `toFixture` re-redacted the headers and the bodies and copied `exchange.url` verbatim, so a
+   * token in the URL — in value position or, worse, in key position where no redactor looked —
+   * landed in a file `exportRecipe` writes out.
+   */
+  it('redacts a token out of the URL, in value position and in key position', () => {
+    const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r-wW1gFWFOEjXk'
+    for (const url of [`/api/orders?share=${jwt}`, `/api/orders?${jwt}=1&page=2`]) {
+      const exchange = makeExchanges([{ url, response_body: { data: [] } }])[0]
+      if (!exchange) throw new Error('no exchange')
+      const fixture = toFixture('list_orders', exchange)
+      expect(JSON.stringify(fixture)).not.toContain(jwt)
+      assertFixtureSafe(fixture)
+    }
+  })
+
   it('redacts credential headers into the stored fixture', () => {
     const exchange = makeExchanges([
       { url: '/api/orders', request_headers: { authorization: 'Bearer abc123', 'content-type': 'application/json' }, response_body: { data: [] } },
