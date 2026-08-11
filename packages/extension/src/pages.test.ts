@@ -79,6 +79,8 @@ describe('the data page', () => {
     for (const [command, call] of [
       ['douze:data:list', 'await captures.sessions()'],
       ['douze:data:delete', 'captures.deleteSession(command.sessionId)'],
+      ['douze:data:delete-recipe', 'recipes.delete(command.name)'],
+      ['douze:data:clear-audit', 'await clearCalls()'],
       ['douze:data:import-har', 'importHar(command.har, command.name, captures)'],
       ['douze:data:export', 'await recipes.exportAll()'],
       ['douze:data:import', 'recipes.importFiles(command.files'],
@@ -87,6 +89,20 @@ describe('the data page', () => {
       expect(background).toContain(call)
     }
     expect(background).toContain("if (message.type.startsWith('douze:data:'))")
+  })
+
+  /**
+   * The audit log is stored on this computer until the extension is removed, so it belongs on the
+   * page that lists what is stored — and it had no reader and no eraser anywhere before this.
+   */
+  it('lists what the assistants ran and offers the only thing that erases it', () => {
+    expect(background).toContain('calls: await recentCalls()')
+    expect(data).toContain("byId('calls').replaceChildren")
+    expect(html).toContain('<h2 class="section-heading">What your assistants have done</h2>')
+    expect(html).toContain('<button type="button" class="quiet danger" id="clear-audit">Clear</button>')
+    // The audit deliberately holds no arguments and no results, and the page says so rather than
+    // letting a reader assume this is a transcript.
+    expect(html).toContain('What it was asked for and what came back are not recorded.')
   })
 
   /**
@@ -107,9 +123,22 @@ describe('the data page', () => {
     expect(html).toContain('<button type="button" class="primary" id="conflict-yes">Replace them</button>')
   })
 
-  it('takes two clicks to delete a recording, and says what the second one does', () => {
-    expect(data).toContain("textContent: armed ? 'Delete for good' : 'Delete'")
+  it('takes two clicks to delete anything, and says what the second one does', () => {
+    expect(data).toContain("textContent: armed ? armedLabel : 'Delete'")
     expect(data).toContain("{ type: 'douze:data:delete', sessionId: session.id }")
+    expect(data).toContain("{ type: 'douze:data:delete-recipe', name: recipe.name }")
+    // One armed key for the whole page: arming a second delete disarms the first.
+    expect(data).toContain('arming = key')
+    expect(data).toContain("arming !== 'audit'")
+  })
+
+  /**
+   * Deleting a recipe takes the tools with it off every attached assistant, and the wording says
+   * so before the second click rather than after it.
+   */
+  it('says what deleting a skill set breaks before it happens', () => {
+    expect(data).toContain('stops your assistants using ${recipe.name}')
+    expect(data).toContain('the recording they came from stays')
   })
 
   it('is opened through the worker from the popup, like the other two pages', () => {
@@ -207,6 +236,22 @@ describe('the review page', () => {
     expect(review).toContain('chrome.runtime.sendMessage(command)')
   })
 
+  /**
+   * This is the screen where consent actually happens, and it used to show the sample exchange
+   * behind a collapsed "Details" without ever saying the body is kept as a fixture or that live
+   * results go on to whichever assistant is attached. The connect page's disclosure is on a page
+   * a consumer may never open.
+   */
+  it('says what approving keeps and what it sends, above the list', () => {
+    const html = source('..', 'public', 'review.html')
+    expect(html).toContain(
+      'Turning a skill on keeps one complete example answer from this site in this browser, and\n        sends live answers to whichever assistant you connect.',
+    )
+    // Above the candidates, not inside a disclosure below them.
+    expect(html.indexOf('id="keeps"')).toBeLessThan(html.indexOf('id="groups"'))
+    expect(review).toContain("byId('keeps').hidden = false")
+  })
+
   it('pre-selects reads only, so one click never approves an unread delete', () => {
     expect(review).toContain('if (candidate.bulk_approvable) chosen.add(candidate.name)')
     expect(review).not.toContain('for (const candidate of state.candidates) chosen.add')
@@ -253,6 +298,34 @@ describe('the connect page', () => {
     expect(connect).toContain('The link you have now stops working straight away')
     expect(connect).toContain('Every hosted assistant loses access immediately.')
     expect(html).toContain('<section class="confirm" id="confirm" hidden>')
+  })
+
+  /**
+   * Pairing was one-way: an app paired once kept `local` trust — every write and every destructive
+   * tool — for the life of the install, with nothing on this page or anywhere else that withdrew
+   * it. Behind the same confirm as the other two irreversible actions.
+   */
+  it('can withdraw a pairing as well as grant one', () => {
+    expect(connect).toContain("command: { type: 'douze:connect:unpair' }")
+    expect(connect).toContain('It loses every tool straight away, the ones that delete included.')
+    expect(background).toContain('await attachments.unpair()')
+    expect(html).toContain('<button type="button" class="quiet danger" id="unpair">Unpair</button>')
+  })
+
+  /**
+   * The apps this page calls "on this computer" are Claude Code, Cursor and Claude Desktop, which
+   * are AI clients themselves: "everything stays on your computer" is true of Douze and not of
+   * what happens next, and only this page and the README are in a position to say so.
+   */
+  it('says that an app on this computer is still an assistant with a provider', () => {
+    expect(html).toContain('On this computer is not the same as staying on this computer.')
+    expect(html).toContain('goes on to their own\n          model provider')
+  })
+
+  /** "Whoever runs it can read everything" is not actionable until the reader knows who that is. */
+  it('names who runs the relay it offers by default', () => {
+    expect(html).toContain('run by Jaume\n          Alavedra, who wrote Douze, on a personal server')
+    expect(background).toContain('It is run by Jaume Alavedra, who wrote Douze, on a')
   })
 
   it('falls back to selecting the link when there is no clipboard', () => {

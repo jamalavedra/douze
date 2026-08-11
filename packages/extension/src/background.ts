@@ -21,6 +21,7 @@ import {
   BRIDGE_KEY,
   EXPOSE_KEY,
   RELAY_KEY,
+  clearCalls,
   recentCalls,
   startAttachments,
   type BridgePairing,
@@ -584,6 +585,7 @@ async function dataState(extra: Partial<DataState> = {}): Promise<DataState> {
       .recipes()
       .map((recipe) => ({ name: recipe.name, tools: recipe.tools.filter((tool) => tool.approved).length }))
       .sort((a, b) => a.name.localeCompare(b.name)),
+    calls: await recentCalls(),
     ...extra,
   }
 }
@@ -597,6 +599,16 @@ async function onDataCommand(command: DataCommand): Promise<DataState> {
       await sequence(() => captures.deleteSession(command.sessionId))
       // The in-memory review of a capture that no longer exists is not a review of anything.
       reviews.delete(command.sessionId)
+      return await dataState()
+    }
+    if (command.type === 'douze:data:delete-recipe') {
+      // `RecipeStore.delete` had no caller at all. Its `refresh` fires the surface subscription,
+      // so the tools it carried leave every attached host without anything here pushing.
+      await recipes.delete(command.name)
+      return await dataState()
+    }
+    if (command.type === 'douze:data:clear-audit') {
+      await clearCalls()
       return await dataState()
     }
     if (command.type === 'douze:data:import-har') {
@@ -629,6 +641,12 @@ async function onDataCommand(command: DataCommand): Promise<DataState> {
  * client re-reads that key on its own alarm and re-dials within 30 seconds, because its attachment
  * key carries the token and the write opt-in; nothing here touches a socket. Two writers to one
  * connection is a race, and one storage key both halves already agree on is not.
+ */
+/**
+ * The relay a user who types nothing gets. **It is run by Jaume Alavedra, who wrote Douze, on a
+ * personal server** — not a company, and with no agreement behind it. The connect page names him
+ * beside this address for the same reason the comment does: "whoever runs it can read everything
+ * that crosses it" is only actionable once the reader knows who that is.
  */
 const DEFAULT_RELAY_URL = 'https://douze.jamalavedra.com'
 
@@ -822,6 +840,10 @@ async function onConnectCommand(command: ConnectCommand): Promise<ConnectState> 
   try {
     if (command.type === 'douze:connect:pair') {
       await attachments.pair(command.code)
+      return await connectState()
+    }
+    if (command.type === 'douze:connect:unpair') {
+      await attachments.unpair()
       return await connectState()
     }
     if (command.type === 'douze:connect:expose') {

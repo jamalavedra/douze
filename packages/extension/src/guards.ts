@@ -486,9 +486,10 @@ export function gateResult(tool: string, result: unknown, exposed: readonly stri
  * that surface must not vanish with the CLI, so it is read back over a message instead.
  *
  * Arguments are NOT recorded. douzed wrote them redacted to a 0600 file on the user's disk;
- * `chrome.storage.local` is read by every extension context and survives in a profile that syncs,
- * and the question the log answers — what ran, when, at which trust level, and how it ended — does
- * not need them. Dropping them removes the whole class of leak the daemon needed a shape gate for.
+ * `chrome.storage.local` has no equivalent — it is readable by every context of this extension,
+ * it does not sync but it does persist for the life of the install, and the question the log
+ * answers — what ran, when, at which trust level, and how it ended — does not need them. Dropping
+ * them removes the whole class of leak the daemon needed a shape gate for.
  */
 export class AuditLog {
   static readonly KEY = 'attach:audit'
@@ -510,6 +511,16 @@ export class AuditLog {
     const stored = await chrome.storage.local.get(AuditLog.KEY)
     const entries = (stored[AuditLog.KEY] as AuditEntry[] | undefined) ?? []
     return entries.slice(-limit).reverse()
+  }
+
+  /**
+   * The log is a record of what somebody's assistant did in their accounts, kept until the
+   * extension is removed, and until the data page grew a button nothing could remove it. A call
+   * running concurrently may append after this and that is correct: it is clearing what is there,
+   * not muting what happens next.
+   */
+  static clear(): Promise<void> {
+    return chrome.storage.local.remove(AuditLog.KEY)
   }
 }
 

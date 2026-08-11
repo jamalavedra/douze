@@ -1410,6 +1410,27 @@ describe('sharing Douze with a hosted assistant (T-015.10)', () => {
     await settle()
     expect((await connect({ type: 'douze:connect:status' })).bridge).toBe('refused')
   })
+
+  /**
+   * The other half of pairing, which did not exist: an app paired once held `local` trust — every
+   * write and every destructive tool — for the life of the install, and the page that granted it
+   * had no way to take it back.
+   */
+  it('withdraws a pairing, forgets the secret, and drops the socket that had it', async () => {
+    const socket = await attach({ 'attach:bridge': { secret: 'pinned-secret' } }, '127.0.0.1', {
+      secret: 'pinned-secret',
+    })
+    await approveShop()
+    expect((await connect({ type: 'douze:connect:status' })).bridge).toBe('paired')
+
+    const state = await connect({ type: 'douze:connect:unpair' })
+    expect(state.bridge).toBe('unpaired')
+    // Forgotten, not merely disconnected: re-pairing means typing the code the app prints again.
+    expect(fake.local.get('attach:bridge')).toBeUndefined()
+    // Closed here rather than left to the next alarm: a bridge just unpaired must not go on
+    // running destructive tools for the 30 seconds until then.
+    expect(socket.readyState).toBe(3)
+  })
 })
 
 /**
@@ -1541,6 +1562,45 @@ describe('what Douze has stored, from the data page', () => {
     const state = await data({ type: 'douze:data:import-har', name: 'Nonsense', har: { log: { entries: [] } } })
     expect(state.error).toMatch(/no entries/i)
     expect(state.sessions).toEqual([])
+  })
+
+  /**
+   * `RecipeStore.delete` had zero callers. A skill set built from a site the user no longer uses
+   * stayed on the surface — and so on every attached assistant — until the extension was removed.
+   */
+  it('deletes a recipe, its fixtures, and the tools it put on the surface', async () => {
+    await approveShop()
+    expect((await data({ type: 'douze:data:list' })).recipes).toEqual([{ name: 'shop', tools: 3 }])
+
+    const state = await data({ type: 'douze:data:delete-recipe', name: 'shop' })
+    expect(state.recipes).toEqual([])
+    // Not merely hidden: the YAML and every example answer are out of storage.
+    expect([...fake.local.keys()].filter((key) => key.startsWith('recipe:') || key.startsWith('fixture:'))).toEqual(
+      [],
+    )
+    const recipes = await RecipeStore.open()
+    expect(recipes.surface().tools).toEqual([])
+  })
+
+  /**
+   * AC-EXE-003.3 — the audit is a record of what somebody's assistant did in their accounts, kept
+   * in `chrome.storage.local` for the life of the install. Nothing could read it back on a page
+   * and nothing at all could remove it.
+   */
+  it('lists what assistants have run and clears it when asked', async () => {
+    const socket = await attach({ 'attach:relay': RELAY }, 'relay.test')
+    await approveShop()
+    socket.deliver(callFrame('a1', 'shop_list_orders', {}))
+    await settle()
+
+    const listed = await data({ type: 'douze:data:list' })
+    expect(listed.calls).toMatchObject([{ tool: 'shop_list_orders', trust: 'remote', outcome: 'ok' }])
+    // No arguments and no result: what the page shows is what the log deliberately holds.
+    expect(Object.keys(listed.calls[0] ?? {}).sort()).toEqual(['at', 'duration_ms', 'outcome', 'status', 'tool', 'trust'])
+
+    const cleared = await data({ type: 'douze:data:clear-audit' })
+    expect(cleared.calls).toEqual([])
+    expect(fake.local.get('attach:audit')).toBeUndefined()
   })
 })
 

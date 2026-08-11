@@ -151,6 +151,8 @@ function render(): void {
     if (candidates.length > 0) groups.append(group(kind, candidates))
   }
   byId('toolbar').hidden = false
+  // What approving costs, on the screen where approving happens — see review.html.
+  byId('keeps').hidden = false
   byId('actions').hidden = false
   byId('after').hidden = true
   syncButton()
@@ -175,6 +177,7 @@ function done(count: number): void {
   byId('title').textContent = 'All set'
   byId('sub').textContent = `Douze is ready on ${state?.site ?? 'this site'}.`
   byId('groups').textContent = ''
+  byId('keeps').hidden = true
   byId('toolbar').hidden = true
   byId('actions').hidden = true
   byId('after').hidden = false

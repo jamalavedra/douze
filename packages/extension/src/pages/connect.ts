@@ -12,16 +12,31 @@ import type { ConnectCommand, ConnectState } from '../messages.js'
  * encouraging default.
  */
 
+/**
+ * Everything that breaks something somebody is already using: what the second click does, the
+ * command it sends, and what to say if it could not be done. One shape for all three, because the
+ * page's whole confirm flow is "say what it costs, then do exactly that or nothing".
+ */
 const CONFIRM = {
   rotate: {
     copy: 'Get a new link? The link you have now stops working straight away, so every assistant you gave it to stops until you paste in the new one.',
     yes: 'Get a new link',
+    command: { type: 'douze:connect:rotate' },
+    failed: "Couldn't get a new link. The one you have still works.",
   },
   stop: {
     copy: 'Stop sharing? Every hosted assistant loses access immediately. Douze keeps working in the apps on this computer.',
     yes: 'Stop sharing',
+    command: { type: 'douze:connect:stop' },
+    failed: "Couldn't stop sharing. The link still works.",
   },
-} as const
+  unpair: {
+    copy: 'Unpair the app on this computer? It loses every tool straight away, the ones that delete included. Douze forgets the pairing, so starting that app again means typing in the new code it prints.',
+    yes: 'Unpair',
+    command: { type: 'douze:connect:unpair' },
+    failed: "Couldn't unpair. The app on this computer still has every tool.",
+  },
+} as const satisfies Record<string, { copy: string; yes: string; command: ConnectCommand; failed: string }>
 
 type Action = keyof typeof CONFIRM
 type Trust = 'local' | 'remote'
@@ -109,6 +124,8 @@ function render(): void {
       ? 'Shared, and Douze has a live connection right now.'
       : 'Shared, but Douze has no connection at the moment. It keeps trying on its own; the link stays the same.'
   byId('bridge-state').textContent = BRIDGE_SENTENCE[state.bridge]
+  // Nothing to withdraw when nothing was ever granted. `refused` still has a stored block to clear.
+  byId<HTMLButtonElement>('unpair').disabled = state.bridge === 'unpaired'
   renderExposed()
   byId('confirm').hidden = true
   byId('copied').hidden = true
@@ -236,8 +253,9 @@ const confirm = (action: Action): void => {
   byId('confirm-yes').focus()
 }
 
-byId('rotate').addEventListener('click', () => confirm('rotate'))
-byId('stop').addEventListener('click', () => confirm('stop'))
+for (const action of ['rotate', 'stop', 'unpair'] as const) {
+  byId(action).addEventListener('click', () => confirm(action))
+}
 byId('confirm-no').addEventListener('click', () => {
   pending = null
   byId('confirm').hidden = true
@@ -248,11 +266,7 @@ byId('confirm-yes').addEventListener('click', () => {
   byId('confirm').hidden = true
   pending = null
   if (!action) return
-  void run({ type: action === 'rotate' ? 'douze:connect:rotate' : 'douze:connect:stop' }, (reason) =>
-    action === 'rotate'
-      ? `Couldn't get a new link. The one you have still works. ${reason}`
-      : `Couldn't stop sharing. The link still works. ${reason}`,
-  )
+  void run(CONFIRM[action].command, (reason) => `${CONFIRM[action].failed} ${reason}`)
 })
 
 // The page opens on whatever the worker already knows.
