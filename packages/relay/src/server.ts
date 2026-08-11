@@ -91,6 +91,15 @@ const SESSION_REFUSED = {
 
 export async function startRelay(options: {
   port: number
+  /** Defaults to loopback; only widen it when nothing else terminates TLS in front. */
+  host?: string
+  /**
+   * Read the caller's address from `cf-connecting-ip`/`x-forwarded-for` instead of the socket.
+   * Set this only when the port is reachable exclusively through a proxy that overwrites those
+   * headers — otherwise a caller forges the header and gets a rate-limit bucket per request.
+   * Without it, every request behind a tunnel shares the proxy's one bucket.
+   */
+  trustProxy?: boolean
   sessionIdleMs?: number
   heartbeatMs?: number
   requestTimeoutMs?: number
@@ -107,9 +116,9 @@ export async function startRelay(options: {
   const counters = { registered: 0, requests: 0, refused: 0, orphaned: 0 }
 
   const register = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
-    // ponytail: a fixed in-memory window keyed on the socket's peer address, which behind a proxy
-    // is the proxy. Swap for a real limiter reading a trusted forwarded-for when one is deployed.
-    const ip = req.socket.remoteAddress ?? 'unknown'
+    // ponytail: a fixed in-memory window, keyed per caller. Good enough for one process; swap for
+    // a shared store if the relay is ever replicated.
+    const ip = callerAddress(req, options.trustProxy ?? false)
     const now = Date.now()
     const seen = registrations.get(ip)
     if (!seen || seen.resetAt <= now) {
@@ -481,12 +490,14 @@ export async function startRelay(options: {
   }, Math.min(SWEEP_MS, idleMs))
   sweep.unref()
 
-  // 0.0.0.0, and deliberately no TLS here: the relay is deployed behind a terminator (Fly, Render,
-  // a reverse proxy) that owns the certificate. Anything reaching this port is already inside it.
+  // Loopback by default and deliberately no TLS here: the relay is deployed behind a terminator
+  // (a Cloudflare tunnel, Fly, a reverse proxy) that owns the certificate and reaches it over
+  // localhost. Anything arriving on this port is already inside that boundary — which is only
+  // true while it is not bound to a public interface, so widening `host` is opting out of it.
   const port = await new Promise<number>((resolve, reject) => {
     const onError = (error: Error): void => reject(error)
     server.once('error', onError)
-    server.listen(options.port, '0.0.0.0', () => {
+    server.listen(options.port, options.host ?? '127.0.0.1', () => {
       server.removeListener('error', onError)
       resolve((server.address() as { port: number }).port)
     })
@@ -520,6 +531,20 @@ const log = (event: string, fields: Record<string, string | number> = {}): void 
     .map(([key, value]) => ` ${key}=${value}`)
     .join('')
   process.stderr.write(`${new Date().toISOString()} ${event}${tail}\n`)
+}
+
+/**
+ * Who to charge a registration to. Behind a tunnel every request arrives from the proxy, so the
+ * socket address is one bucket for the whole internet — the first legitimate user of the hour
+ * exhausts it for everyone. The headers are only meaningful where the proxy sets them and the
+ * port is reachable no other way, which is why reading them is opt-in rather than automatic.
+ * Never logged: an address is personal data and the log line carries no payload of any kind.
+ */
+const callerAddress = (req: IncomingMessage, trustProxy: boolean): string => {
+  if (!trustProxy) return req.socket.remoteAddress ?? 'unknown'
+  const forwarded = req.headers['cf-connecting-ip'] ?? req.headers['x-forwarded-for']
+  const first = (Array.isArray(forwarded) ? forwarded[0] : forwarded)?.split(',')[0]?.trim()
+  return first && first.length <= 64 ? first : (req.socket.remoteAddress ?? 'unknown')
 }
 
 /**

@@ -21,7 +21,7 @@ hash prefix per endpoint — never a payload, a tool name, a session id, or a se
 
 | Route | Auth | Purpose |
 | --- | --- | --- |
-| `POST /register` | none, 10/hour per peer address | `{daemon_version, bearer_token?}` → `201 {token, mcp_path}` |
+| `POST /register` | none, 10/hour per caller | `{daemon_version, bearer_token?}` → `201 {token, mcp_path}` |
 | `POST /rotate` | `x-douze-relay-token` | new token and path; the old pair dies immediately |
 | `DELETE /register` | `x-douze-relay-token` | drops the endpoint, closes the socket, expires sessions |
 | `GET /health` | none | `{ok: true}` |
@@ -29,9 +29,11 @@ hash prefix per endpoint — never a payload, a tool name, a session id, or a se
 | `POST /m/<secret>` | the secret, plus `Authorization: Bearer` if one was registered | the MCP endpoint |
 | `DELETE /m/<secret>` | same | closes the session named by `Mcp-Session-Id` |
 
-The registration limit counts per peer address, which behind the TLS terminator below is the
-terminator — so all users of one deployment share a single bucket. Reading a trusted
-`X-Forwarded-For` under an explicit `TRUST_PROXY` setting is the upgrade path when that matters.
+The registration limit counts per socket address, which behind the TLS terminator below is the
+terminator itself — one bucket for every user of the deployment, which the first of the hour
+exhausts for everyone. `TRUST_PROXY=1` charges it to `cf-connecting-ip`/`x-forwarded-for`
+instead. Set it only where that proxy is the sole route to the port, because anywhere else a
+caller forges the header and buys a fresh bucket per request.
 
 `initialize` mints a session and returns it in `Mcp-Session-Id`; every later request must carry
 that header, and an unknown one gets a 404 so the client re-initializes. Requests cap at 1 MB,
@@ -49,13 +51,23 @@ rather than waiting out their timeout, and the endpoint's sessions are gone with
 
 ## Deploying
 
-Any Node 22 host: `pnpm build && node dist/bin.js`. Nothing to provision — no database, no
-volume, no shared state, so a restart costs a reconnect and nothing else. Terminate TLS in front
-of it (Fly, Render, a reverse proxy); the process binds plain HTTP on `0.0.0.0` and assumes
-anything reaching that port is already inside the terminator.
+`pnpm --filter @douze/relay build` emits one file, `dist/index.js`, with `ws` and the shared
+schemas bundled in. A deploy is that file plus a Node 22 host — no install step, no
+`node_modules` to keep in sync. Nothing to provision either: no database, no volume, no shared
+state, so a restart costs a reconnect and nothing else.
+
+Terminate TLS in front of it (a Cloudflare tunnel, Fly, a reverse proxy). The process binds
+loopback and speaks plain HTTP, so the terminator must reach it over localhost; widening
+`RELAY_HOST` puts an unencrypted relay on a public interface, which is what the trust model
+above assumes never happens.
 
 | Env var | Default | Meaning |
 | --- | --- | --- |
 | `RELAY_PORT` | `9787` | the port to bind |
+| `RELAY_HOST` | `127.0.0.1` | the interface to bind; widen only with nothing terminating TLS in front |
+| `TRUST_PROXY` | unset | charge rate limits to the forwarded caller (see above) |
+
+A systemd unit is enough to run it; the one deployment so far is a user unit with
+`Restart=always` behind a Cloudflare tunnel pointed at `http://127.0.0.1:9787`.
 
 On the daemon side, point Douze at your instance with `DOUZE_REMOTE_URL`.

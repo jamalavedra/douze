@@ -213,6 +213,31 @@ describe('authentication', () => {
     const refused = await fetch(url('/register'), { method: 'POST', body: '{}' })
     expect(refused.status).toBe(429)
   })
+
+  /**
+   * Behind a tunnel every caller shares the proxy's socket address, so charging the socket would
+   * let the first user of the hour exhaust the window for everyone. Untrusted, the header must be
+   * ignored just as firmly, or forging it buys a fresh bucket per request.
+   */
+  it('charges registrations to the forwarded caller only when the proxy is trusted', async () => {
+    const post = (ip: string): Promise<Response> =>
+      fetch(url('/register'), {
+        method: 'POST',
+        headers: { 'cf-connecting-ip': ip },
+        body: JSON.stringify({ daemon_version: '0.1.0' }),
+      })
+
+    for (let i = 0; i < 10; i++) expect((await post('203.0.113.7')).status).toBe(201)
+    // Untrusted: the header means nothing, so this shares the socket's exhausted bucket.
+    expect((await post('198.51.100.9')).status).toBe(429)
+
+    await relay.close()
+    relay = await startRelay({ port: 0, trustProxy: true })
+    for (let i = 0; i < 10; i++) expect((await post('203.0.113.7')).status).toBe(201)
+    expect((await post('203.0.113.7')).status).toBe(429)
+    // A different caller through the same proxy still has its own window.
+    expect((await post('198.51.100.9')).status).toBe(201)
+  })
 })
 
 describe('isolation and failure', () => {
