@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { infer } from './inference/engine.js'
-import { inferSchema } from './inference/schema.js'
+import { coerceNumericValues, inferSchema } from './inference/schema.js'
 import { classify } from './inference/side-effects.js'
 import { detectPagination, primaryPayloadPath } from './inference/payload.js'
 import { score } from './inference/confidence.js'
@@ -132,7 +132,7 @@ describe('REQ-INF-002 schema inference', () => {
           type: 'array',
           items: {
             type: 'object',
-            properties: { qty: { type: 'integer' }, sku: { type: 'string' } },
+            properties: { qty: { type: 'integer', minimum: -1000, maximum: 1000 }, sku: { type: 'string' } },
             required: ['qty', 'sku'],
           },
         },
@@ -143,6 +143,44 @@ describe('REQ-INF-002 schema inference', () => {
 
   it('returns an unconstrained schema for mixed types rather than guessing', () => {
     expect(inferSchema(['a', 1])).toEqual({})
+  })
+
+  // WO-016 — an observed magnitude bounds what a caller may ask for.
+  it('bounds an observed number with an order of magnitude of headroom', () => {
+    expect(inferSchema([500, 250])).toEqual({ type: 'integer', minimum: -5000, maximum: 5000 })
+    expect(inferSchema([12.5, -4000])).toEqual({ type: 'number', minimum: -40_000, maximum: 40_000 })
+    // A small observation does not pin the ceiling to itself: the floor holds `page=1` open.
+    expect(inferSchema([1])).toEqual({ type: 'integer', minimum: -1000, maximum: 1000 })
+    expect(inferSchema([20, 20, 25])).toEqual({ type: 'integer', minimum: -1000, maximum: 1000 })
+  })
+
+  it('gives an observed query limit a ceiling that admits ordinary use and refuses absurd values', () => {
+    const candidates = infer({
+      exchanges: makeExchanges([
+        { url: '/orders?limit=20', response_body: { data: [{ id: 1 }] } },
+        { url: '/orders?limit=20', response_body: { data: [{ id: 2 }] } },
+      ]),
+    })
+    const schema = byName(candidates, 'list_orders').tool.request.input_schema as JsonSchema
+    const limit = (schema['properties'] as Record<string, JsonSchema>)['limit']
+    expect(limit?.['type']).toBe('integer')
+    expect(limit?.['maximum']).toBeGreaterThanOrEqual(50)
+    expect(limit?.['maximum']).toBeLessThan(1_000_000)
+  })
+
+  it('leaves an identifier unbounded and a non-numeric query value a string', () => {
+    const properties = (inferSchema([{ order_id: 1042, zip: '02138' }]) as JsonSchema)[
+      'properties'
+    ] as Record<string, JsonSchema>
+    // Order 1042 says nothing about whether order 99999 exists.
+    expect(properties['order_id']).toEqual({ type: 'integer' })
+    expect(properties['zip']).toEqual({ type: 'string' })
+    // A leading zero is not a number: coercing it would rewrite the value that goes back out.
+    expect(coerceNumericValues({ zip: '02138', limit: '20', order_id: '1042' })).toEqual({
+      zip: '02138',
+      limit: 20,
+      order_id: '1042',
+    })
   })
 })
 
@@ -167,6 +205,34 @@ describe('REQ-INF-003 side-effect classification', () => {
 
   it('never escalates a read, so a cancelled-orders listing stays bulk approvable', () => {
     expect(classify({ method: 'GET', path: '/orders?status=cancelled' })).toBe('read')
+  })
+
+  // WO-016 — the vocabulary the six-word regex missed: a hosted assistant could reach all of these.
+  it('escalates irreversible access, money and data changes the original vocabulary missed', () => {
+    expect(classify({ method: 'POST', path: '/users/{userId}/suspend' })).toBe('destructive')
+    expect(classify({ method: 'POST', path: '/payouts' })).toBe('destructive')
+    expect(classify({ method: 'POST', path: '/keys/{keyId}/rotate' })).toBe('destructive')
+    expect(classify({ method: 'POST', path: '/transfers' })).toBe('destructive')
+    expect(classify({ method: 'POST', path: '/users/{userId}/password/reset' })).toBe('destructive')
+    expect(classify({ method: 'POST', path: '/instances/{id}/terminate' })).toBe('destructive')
+    expect(classify({ method: 'POST', path: '/webhooks/{id}/disable' })).toBe('destructive')
+  })
+
+  it('reads a camelCased GraphQL mutation name as words', () => {
+    expect(classify({ method: 'POST', path: '/graphql', operation: 'deactivateAccount' })).toBe('destructive')
+    expect(classify({ method: 'POST', path: '/graphql', operation: 'transferFunds' })).toBe('destructive')
+    expect(classify({ method: 'POST', path: '/graphql', operation: 'wipeWorkspace' })).toBe('destructive')
+    // The verb is not always the first word: `adminSuspendUser` is only visible once split.
+    expect(classify({ method: 'POST', path: '/graphql', operation: 'adminSuspendUser' })).toBe('destructive')
+    // A query is a read whatever it is called, so nothing here can make one unreachable.
+    expect(classify({ method: 'GET', path: '/graphql', operation: 'transferHistory' })).toBe('read')
+  })
+
+  it('does not escalate a word that merely contains one of the verbs', () => {
+    // A saved dashboard preset, POSTed because the filter set does not fit in a query string. It
+    // contains "reset"; escalating it would put a tool nothing can undo out of reach for nothing.
+    expect(classify({ method: 'POST', path: '/dashboards/{dashboardId}/preset' })).toBe('write')
+    expect(classify({ method: 'POST', path: '/bank_accounts/verify' })).toBe('write')
   })
 })
 

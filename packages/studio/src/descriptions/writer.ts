@@ -7,6 +7,19 @@ import type { ModelClient } from './model-client.js'
 /** AC-INF-006.2 — what it does, what it returns, when to use it. Never more than three. */
 const MAX_SENTENCES = 3
 
+/**
+ * A hard character bound on a description, because the sentence limit is not one: `limitSentences`
+ * splits on sentence terminators, so a note with none — or a model reply with none — is a single
+ * unbounded "sentence" that survives it intact.
+ *
+ * The number is set by what happens downstream, not by taste. The attachment protocol caps a tool
+ * description at 4096 characters and a host DROPS a frame that fails to parse, so one over-long
+ * description costs the client the whole tool surface, silently. The extension also appends its own
+ * text when it attaches (the destructive sentence, a degradation reason), so the bound has to leave
+ * room for that: 1024 is several times any real description and a quarter of the frame's limit.
+ */
+export const MAX_DESCRIPTION_CHARS = 1024
+
 export interface DescriptionInput {
   name: string
   method: string
@@ -59,7 +72,14 @@ function objectNoun(name: string, lastStatic: string | undefined, graphql: strin
  * dependency (ADR-006).
  */
 export function describeSync(input: DescriptionInput): string {
-  return limitSentences([action(input), returns(input), usage(input)].join(' '))
+  return boundDescription([action(input), returns(input), usage(input)].join(' '))
+}
+
+/** Every description, from either path, leaves through here. Three sentences AND 1024 characters. */
+export function boundDescription(text: string): string {
+  const limited = limitSentences(text)
+  if (limited.length <= MAX_DESCRIPTION_CHARS) return limited
+  return `${limited.slice(0, MAX_DESCRIPTION_CHARS - 1).trimEnd()}…`
 }
 
 /** AC-CAP-007.3 — the note describes intent; the button label only describes the control. */
@@ -173,7 +193,7 @@ export async function describe(candidate: Candidate, options: DescribeOptions = 
   const payload = buildModelPayload(candidate)
   try {
     const completion = await options.model.complete(buildPrompt(payload))
-    const cleaned = limitSentences(completion.replace(/\s+/g, ' ').trim())
+    const cleaned = boundDescription(completion.replace(/\s+/g, ' ').trim())
     return cleaned.length > 0 ? cleaned : describeSync(input)
   } catch {
     return describeSync(input)

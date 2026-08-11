@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { infer } from './inference/engine.js'
 import { disambiguate, nameCandidate } from './descriptions/naming.js'
 import { createModelClient, modelFromEnv } from './descriptions/model-client.js'
-import { buildModelPayload, buildPrompt, describe as writeDescription, describeSync, descriptionInput, limitSentences } from './descriptions/writer.js'
+import { MAX_DESCRIPTION_CHARS, boundDescription, buildModelPayload, buildPrompt, describe as writeDescription, describeSync, descriptionInput, limitSentences } from './descriptions/writer.js'
 import { makeExchanges } from './testing.js'
 import { findSurvivingSecrets } from '@douze/shared'
 import type { ModelClient } from './descriptions/model-client.js'
@@ -129,6 +129,30 @@ describe('AC-INF-006.2 descriptions', () => {
 
   it('truncates anything longer than three sentences', () => {
     expect(limitSentences('One. Two. Three. Four.')).toBe('One. Two. Three.')
+  })
+
+  /**
+   * WO-016 — the sentence limit is not a length limit: text with no sentence terminator is one
+   * unbounded "sentence" and passes through it whole. A description over the protocol's 4096-char
+   * cap makes the host drop the whole surface frame, so the client sees no tools and no error.
+   */
+  it('bounds a description that contains no sentence terminator at all', () => {
+    const runOn = `${'word '.repeat(3000)}`
+    const bounded = boundDescription(runOn)
+    expect(limitSentences(runOn).length).toBeGreaterThan(4096)
+    expect(bounded.length).toBeLessThanOrEqual(MAX_DESCRIPTION_CHARS)
+    expect(bounded.endsWith('…')).toBe(true)
+  })
+
+  it('keeps a long annotation from producing an unbounded description', () => {
+    const description = describeSync({
+      ...descriptionInput(
+        infer({ exchanges: makeExchanges([{ url: '/api/orders', response_body: { id: 1 } }]) })[0]!.tool,
+      ),
+      // Longer than a note may now be, so the description path holds even if one gets past capture.
+      annotation: 'a'.repeat(5000),
+    })
+    expect(description.length).toBeLessThanOrEqual(MAX_DESCRIPTION_CHARS)
   })
 
   it('works with no model configured', async () => {
