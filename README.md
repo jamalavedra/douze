@@ -19,8 +19,14 @@ path. The one exception is the developer bridge, and it says so where it appears
 
 This is the part worth reading carefully.
 
-- **Nothing is scraped.** Douze doesn't read your screen or copy your data. It notices which
-  buttons the site presses behind the scenes and remembers the shape of them.
+- **Your screen is never read — the traffic is, and it is kept.** Douze doesn't look at pixels or
+  at what you have on screen. It watches the requests the site makes behind the scenes, and it
+  stores them: while you record, full request and response bodies go into the extension's own
+  database, and turning a skill on keeps one complete exchange as that skill's example answer.
+  Passwords, cookies, tokens and anything else shaped like a credential are stripped before
+  anything is written. A customer's name, their email address, their order — those are not, and
+  they stay in this browser until you delete the recording on the Douze data page. Only the
+  inferred schema is a "shape"; the example is the real thing.
 - **Your password is never involved.** You never type it into Douze. Douze never asks for one.
 - **No cookie or login is stored, copied, or sent anywhere.** Not to us, not to the assistant, not
   to disk.
@@ -35,6 +41,11 @@ This is the part worth reading carefully.
   earlier. The relay can also read and alter them in flight. That is the design, not a bug to be
   patched, and the only remedy is running your own relay or not connecting a hosted assistant at
   all. See [Connecting a hosted assistant](#connecting-a-hosted-assistant-chatgpt-claudeai-dust).
+  **The apps in [For developers](#for-developers-claude-code-cursor-vs-code-claude-desktop) are
+  not an exception to this either**: Claude Code, Cursor and Claude Desktop are AI assistants
+  themselves, so every result a tool hands them goes on to their own model provider — at full
+  trust, destructive results included. What stays on your computer is Douze. What your assistant
+  does with an answer is your assistant's business, wherever it runs.
 - **Nothing runs without your say-so.** Actions are off until you turn them on, one at a time.
   Anything that deletes or refunds asks you to confirm every single time — and a hosted assistant
   cannot run one at all.
@@ -168,8 +179,16 @@ they share one set of recipes.
 - **The assistant says Douze is offline.** Chrome shuts the extension's background worker down when
   it is idle and wakes it on its own; a call waits about 40 seconds for that. Beyond that, Chrome is
   closed. Open it.
-- **You want it to stop.** Turn actions off on the review page, stop sharing on the connect page, or
-  remove the extension. Nothing of yours is left behind anywhere else.
+- **You want it to stop.** Press **Stop sharing** on the connect page *first*, then remove the
+  extension — and in that order. Removing it takes everything Douze stored in this browser with it:
+  recordings, skills, example answers, the record of what your assistants ran. Three things do not
+  go with it. A link you never stopped sharing leaves the relay holding your tool names,
+  descriptions and schemas until it notices the extension is gone and drops the endpoint, which is
+  about an hour — stopping first ends it immediately. `~/.douze/bridge.json` stays on disk if you
+  ever paired a local app; it is one file and you can delete it by hand. And whatever an AI
+  provider has already stored is under their retention policy, not ours — uninstalling Douze does
+  not reach it. If you only want to stop *some* of it, the Douze data page deletes recordings and
+  skills one at a time, and the connect page unpairs a local app.
 
 ---
 
@@ -330,8 +349,8 @@ description reaches a running session in seconds.
 **Recipes in `~/.douze` from the daemon era.** The extension's importer takes exactly the layout the
 daemon wrote — `recipes/<name>.yaml` alongside `fixtures/<recipe>/<tool>.json` — so a whole
 `~/.douze` directory is a valid import set. It is an all-or-nothing write: any parse error or name
-collision and nothing is stored. There is no file picker on it yet, so `RecipeStore.importFiles` is
-reachable only from code today; until there is one, re-recording the site is the shorter path.
+collision and nothing is stored. The file picker for it is on the Douze data page, alongside the
+export it round-trips with, HAR import, and the controls that delete a recording or a skill set.
 Nothing reads `~/.douze` on its own any more, and the only file still written there is the bridge's
 pairing credential.
 

@@ -649,6 +649,56 @@ describe('sessions', () => {
     await new Promise((resolve) => setTimeout(resolve, 400))
     expect((await initialize(mcp_path)).status).toBe(404)
   })
+
+  /**
+   * The privacy half of the reaper. Every `POST /m/<secret>` refreshes `lastSeen` and holds a
+   * session open, so a platform that goes on polling `tools/list` after the user uninstalled the
+   * extension used to keep the endpoint — and that user's tool names, descriptions and schemas —
+   * in the relay's memory indefinitely, still listing them to whoever holds the URL.
+   *
+   * The loop below IS the polling: each attempt refreshes the endpoint exactly as a connector
+   * would, and the endpoint is reaped anyway because the clock that matters is the extension's.
+   */
+  it('reaps an endpoint whose extension is gone, however hard the platform keeps polling', async () => {
+    await relay.close()
+    relay = await startRelay({ port: 0, sessionIdleMs: 60 })
+    const { token, mcp_path } = await enroll()
+    const extension = await attach(token)
+    const sid = await open(mcp_path)
+    await surfaced(mcp_path, sid)
+
+    extension.socket.close()
+    await vi.waitFor(
+      async () => {
+        const res = await post(mcp_path, { jsonrpc: '2.0', id: 99, method: 'tools/list' }, session(sid))
+        // `not_found` and not `no_session`: the whole endpoint is gone, not merely its session.
+        expect(await res.json()).toMatchObject({ error: 'not_found' })
+      },
+      { timeout: 3000, interval: 25 },
+    )
+  })
+
+  /**
+   * ASVS 7.3.2 — inactivity alone never expires a session a client polls every nine minutes, and
+   * an MCP session is a live capability over somebody's signed-in accounts held by a party we do
+   * not control. The client cost of the ceiling is one 404 and a re-`initialize`.
+   */
+  it('closes a session at its absolute age however busy it is kept', async () => {
+    await relay.close()
+    relay = await startRelay({ port: 0, sessionIdleMs: 500, sessionMaxAgeMs: 150 })
+    const { token, mcp_path } = await enroll()
+    await attach(token)
+    const sid = await open(mcp_path)
+
+    await vi.waitFor(
+      async () => {
+        const res = await post(mcp_path, { jsonrpc: '2.0', id: 99, method: 'tools/list' }, session(sid))
+        // The endpoint is still live — the extension never left — so this is the session alone.
+        expect(await res.json()).toMatchObject({ error: 'no_session' })
+      },
+      { timeout: 3000, interval: 20 },
+    )
+  })
 })
 
 describe('the extension socket', () => {
@@ -807,6 +857,58 @@ describe('the log', () => {
       spy.mockRestore()
       // afterEach closes it again; a second close on a closed server is a no-op.
       relay = await startRelay({ port: 0 })
+    }
+  })
+
+  /**
+   * ASVS 16.3.1 — every refusal used to be silent. The counters existed but surfaced only in
+   * `close()`, which a `Restart=always` unit killed by a signal never reaches, so an operator
+   * could not see somebody guessing URL secrets or endpoint tokens at all. The line carries the
+   * status and the refusal's own code and nothing the caller sent.
+   */
+  it('leaves a line for an authentication failure, carrying nothing that was tried', async () => {
+    const lines: string[] = []
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+      lines.push(String(chunk))
+      return true
+    })
+    try {
+      const guessed = 'g'.repeat(43)
+      expect((await initialize(`/m/${guessed}`)).status).toBe(404)
+
+      const socket = new WebSocket(`ws://127.0.0.1:${relay.port}/ws`)
+      await new Promise<void>((resolve) => {
+        socket.once('open', () =>
+          socket.send(JSON.stringify({ type: 'hello', token: guessed, extension_version: '0.1.0' })),
+        )
+        socket.once('close', () => resolve())
+      })
+
+      const log = lines.join('')
+      expect(log).toContain('request.refused status=404 code=not_found')
+      expect(log).toContain('request.refused status=1008 code=invalid_relay_token')
+      expect(log).not.toContain(guessed)
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('rate-limits the refusal lines, and says how many it swallowed', async () => {
+    const lines: string[] = []
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+      lines.push(String(chunk))
+      return true
+    })
+    try {
+      // A brute force is thousands of these; a line each would be a log flood rather than a record.
+      for (let i = 0; i < 5; i++) expect((await initialize(`/m/${String(i).repeat(43)}`)).status).toBe(404)
+      expect(lines.filter((line) => line.includes('status=404')).length).toBe(1)
+      // The suppressed ones are not lost, they are carried by the next line that gets through.
+      await new Promise((resolve) => setTimeout(resolve, 1100))
+      expect((await initialize(`/m/${'z'.repeat(43)}`)).status).toBe(404)
+      expect(lines.at(-1)).toContain('also=4')
+    } finally {
+      spy.mockRestore()
     }
   })
 })

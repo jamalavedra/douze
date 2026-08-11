@@ -222,7 +222,7 @@ pushed surface.
 | Rate limit | Excess calls queue per tool; a wait over `RATE_WAIT_MAX_MS` (20 s) is refused as retryable `rate_limited` naming the seconds, never parked across a worker eviction. |
 | Result size | A result over 32 KB is cut on a UTF-8 boundary and `returned_bytes` is at or under the cap. |
 | Result gate | A result carrying a credential-shaped value is withheld, naming the tool and the paths; the value itself is absent from the refusal. |
-| Audit | Every call appends `{at, tool, trust, outcome, duration_ms, status?}` and **no arguments** — that is deliberate, not an omission. |
+| Audit | Every call appends `{at, tool, trust, outcome, duration_ms, status?}` and **no arguments** — that is deliberate, not an omission. The data page lists it and clears it; nothing else can remove it. |
 
 ## 5. The bridge: pairing at full trust
 
@@ -263,6 +263,9 @@ looking broken.
 | Socket loss | In-flight calls fail at once with retryable `extension_disconnected` and **none is re-sent** — a tool can be a write. |
 | Surface cache | One cached surface per endpoint, replaced wholesale by each `surface.push` and fanned out to every live session, including one created later. |
 | Caps | 1 MB bodies, 8 in flight, 4 sessions per endpoint, 120 s per call; a duplicate in-flight JSON-RPC id is a 409. |
+| Session ceiling | A session is closed at 12 hours old however busy it is kept, not only after 10 minutes idle. |
+| Endpoint liveness | An endpoint whose extension has not attached for six idle windows (an hour) is reaped **while a client is still polling it** — polling refreshes `lastSeen`, so this is what stops an uninstalled user's tool names and schemas living in memory forever. |
+| Refusals are logged | A 404 on a guessed `/m/<secret>`, a 1008 on a bad endpoint token, a 429 and a 413 each leave `request.refused status=… code=…`, rate-limited to one per status per second with the swallowed count on the next. The secret that was tried is not in the line. |
 | Error shape | In-flight / duplicate-id / too-many-sessions refusals come back as `200` with a JSON-RPC error, because an MCP client renders that and drops an HTTP error body. |
 | No stream | `GET /m/<secret>` is 405; there is no server-initiated stream in v1. |
 | Log discipline | Sweep every stderr line of a full register → connect → initialize → call → close run: no payload, tool name, description, session id, token, path secret, or bearer. |
@@ -441,10 +444,10 @@ lacks a test.
   has never been tested on three real targets. The `chrome.debugger` fallback exists but its being
   needed would be a product finding, not a configuration detail.
 - **There is no Chrome Web Store listing.** It has not been opened. Review latency and the
-  data-disclosure wording are on the critical path and neither is code. Note also that
-  `packages/extension/public/manifest.json` currently describes Douze as "Nothing leaves your
-  computer", which stops being true the moment a hosted assistant is connected — that is a
-  disclosure defect to fix before submission, not after.
+  data-disclosure wording are on the critical path and neither is code. The manifest description
+  is no longer part of that gap: `packages/extension/public/manifest.json` was rewritten and now
+  says that passwords and cookies never leave the browser and that connecting a hosted assistant
+  sends that assistant what the tools return. Check it still says so before submitting.
 - **No release exists and there is nowhere to publish one.** No `v*` tag has been pushed and
   `git remote -v` prints nothing, so installation from a published artifact cannot be verified at
   all. `@douze/bridge` is likewise `private` and unpublished, so the `npx @douze/bridge` invocation
@@ -460,10 +463,12 @@ lacks a test.
 - **Relay overhead has never been measured on this architecture.** The half of `e2e/metrics.mjs`
   that measured it called douzed's `/relay/...` route and was deleted with it; the 1.2 ms figure in
   `TASKS.md` Q4 is the daemon's. C-4 has no evidence here.
-- **HAR import and YAML export/import have no user interface.** `importHar`, `exportRecipe`,
-  `exportAll` and `importFiles` are implemented and unit-tested but have no caller outside their own
-  tests — no file picker, no download, no message type. They can be verified as APIs and not as
-  features.
+- **~~HAR import and YAML export/import have no user interface.~~ Closed.** They are on
+  `packages/extension/public/data.html` now, with `douze:data:*` messages behind them, alongside
+  deleting a recording, deleting a recipe, and clearing the audit log. Verify them as features:
+  drive the page, not the store methods. What is still unverified is the page in a real browser —
+  `background.test.ts` drives the routes and `pages.test.ts` pins the wiring, but no e2e spec opens
+  `data.html`.
 - **Model-written descriptions are not implemented.** Descriptions are deterministic only
   (`describeSync`), and there is no options page in the manifest to put a toggle on. The 96.4%
   template-only score against a ≥90% bar is why this is acceptable, not evidence that the model path

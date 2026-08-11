@@ -27,11 +27,28 @@ is new, and it is more than the transport used to see: the names and description
 describe the systems you have automated, whether or not anyone ever calls them. They are held for
 as long as the endpoint lives, never written to disk, and never logged; the log records a count.
 
+**An endpoint lives only as long as its extension keeps attaching.** Six idle windows — one hour at
+the default — with no `hello` and the endpoint is reaped along with its sessions and its surface,
+whatever the platform is doing. That is deliberately not conditioned on client traffic: every
+`POST /m/<secret>` refreshes the endpoint and holds a session open, so a connector polling
+`tools/list` after the user uninstalled the extension would otherwise keep that user's tool names,
+descriptions and schemas listed forever to whoever holds the URL. A merely-sleeping browser
+re-dials within 30 seconds of Chrome starting, so an hour covers a restart, a Chrome update and a
+lunch break; the 40-second wake grace below is untouched, because that is a call waiting for a
+worker rather than an endpoint waiting for an owner. An endpoint that was registered and never
+used is reaped after two windows, as before.
+
 Secrets are stored as sha256 hashes, so the running process holds nothing that would let anyone
 impersonate an extension or reach a user's tools; the URL secret is a ≥32-byte base64url random
-that must never leave TLS, and the logs carry timestamps, event names, durations, counts, and an
-8-character hash prefix per endpoint — never a payload, a tool name, a description, a session id,
-or a secret.
+that must never leave TLS, and the logs carry timestamps, event names, durations, counts, statuses,
+refusal codes, and an 8-character hash prefix per endpoint — never a payload, a tool name, a
+description, a session id, or a secret.
+
+Every refusal leaves a line — `request.refused status=… code=…`, at most one per status per second
+with the swallowed count carried by the next — so an operator can see somebody guessing URL secrets
+or endpoint tokens while it is happening. A WebSocket that presents an unknown token or never says
+`hello` is logged the same way. The counters are emitted by the sweep whenever they move as well as
+on shutdown, because a `Restart=always` unit killed by a signal never reaches shutdown.
 
 ## API
 
@@ -52,7 +69,10 @@ instead. Set it only where that proxy is the sole route to the port, because any
 caller forges the header and buys a fresh bucket per request.
 
 `initialize` mints a session and returns it in `Mcp-Session-Id`; every later request must carry
-that header, and an unknown one gets a 404 so the client re-initializes. Requests cap at 1 MB,
+that header, and an unknown one gets a 404 so the client re-initializes. A session expires after
+10 minutes idle **and** at 12 hours old whatever it has been doing — inactivity alone never expires
+one that a client polls every nine minutes, and a session is a live capability over somebody's
+signed-in accounts. Either way the client sees a 404 and re-initializes. Requests cap at 1 MB,
 8 in flight per endpoint, 4 sessions per endpoint, and 120s each; reusing a JSON-RPC id that is
 still in flight is a 409. `GET /m/<secret>` is 405 — there is no server-initiated stream in v1, so
 a client sees a tool change when it next polls `tools/list`.

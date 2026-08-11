@@ -166,6 +166,10 @@ export type DataCommand =
   | { type: 'douze:data:import-har'; name: string; har: unknown }
   /** The recording and every exchange, annotation and byte under it. There is no undo. */
   | { type: 'douze:data:delete'; sessionId: string }
+  /** The recipe and every example answer stored under it. The tools it carried stop existing. */
+  | { type: 'douze:data:delete-recipe'; name: string }
+  /** AC-EXE-003.3 — the record of what assistants have run. Nothing could remove it before. */
+  | { type: 'douze:data:clear-audit' }
   | { type: 'douze:data:export' }
   /**
    * AC-REC-003 — `overwrite` is the answer to a `conflicts` the page just showed the reader by
@@ -178,6 +182,8 @@ export interface DataState {
   /** Newest first, each with what it retained — the count the badge showed while recording. */
   sessions: SessionSummary[]
   recipes: { name: string; tools: number }[]
+  /** The audit log, most recent first — stored on this computer, so it is listed on this page. */
+  calls: AuditEntry[]
   /**
    * `douze:data:import-har` only. Carried whole, `refused` included: an import that quietly
    * reported a total would be claiming traffic the write gate did not store.
@@ -215,6 +221,11 @@ export type ConnectCommand =
    * is not consent: this is what earns a bridge `local` trust and its destructive tools with it.
    */
   | { type: 'douze:connect:pair'; code: string }
+  /**
+   * Withdraws that consent. The pairing was one-way until now: an app paired once kept `local`
+   * trust — writes and destructive tools included — for the life of the install.
+   */
+  | { type: 'douze:connect:unpair' }
   /**
    * T-015.9 — exempt one tool's results from the secret gate, or put them back under it. Per trust
    * level: exempting a tool so an app on this computer can read a token must not also start

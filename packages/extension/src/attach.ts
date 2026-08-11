@@ -433,6 +433,22 @@ class Manager {
   }
 
   /**
+   * The other half of `pair`, which the connect page could do and never undo: an app paired once
+   * kept `local` trust — every write and every destructive tool — for the life of the install,
+   * with nothing anywhere that withdrew it.
+   *
+   * The socket is closed here rather than left to the alarm, because the direction that matters is
+   * off: a bridge the user has just unpaired must not go on running destructive tools for the 30
+   * seconds until the next tick. Forgetting the secret is what makes it a real revocation — the
+   * bridge keeps its own copy, so re-pairing means typing the code it prints again.
+   */
+  async unpair(): Promise<void> {
+    this.bridge = {}
+    await chrome.storage.local.remove(BRIDGE_KEY)
+    this.drop('bridge:')
+  }
+
+  /**
    * Says something about a relay refusal only if the token that was refused is still the one in
    * storage. A rotate or a stop replaced it, and the user knows: they did it. Runs on the fresh
    * read at the top of `tick`, so a worker Chrome evicted between the close and the alarm simply
@@ -505,6 +521,7 @@ export function startAttachments(deps: AttachDeps): {
   pushSurface: () => void
   connected: () => boolean
   pair: (code: string) => Promise<void>
+  unpair: () => Promise<void>
   setExposed: (trust: Trust, tool: string, allow: boolean) => Promise<void>
 } {
   const created = new Manager(deps)
@@ -517,12 +534,16 @@ export function startAttachments(deps: AttachDeps): {
     pushSurface: () => created.pushSurface(),
     connected: () => created.connected,
     pair: (code) => created.pair(code),
+    unpair: () => created.unpair(),
     setExposed: (trust, tool, allow) => created.setExposed(trust, tool, allow),
   }
 }
 
 /** The audit surface `douze status` used to print, for the popup and the connect page. */
 export const recentCalls = (limit?: number): Promise<AuditEntry[]> => AuditLog.recent(limit)
+
+/** …and the only thing that removes it, from the data page. */
+export const clearCalls = (): Promise<void> => AuditLog.clear()
 
 const parse = (raw: string): unknown => {
   try {

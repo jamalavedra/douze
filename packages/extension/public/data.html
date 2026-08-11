@@ -84,6 +84,21 @@
         <p class="sub" id="import-report" role="status" hidden></p>
       </section>
 
+      <section id="activity">
+        <h2 class="section-heading">What your assistants have done</h2>
+        <p class="sub">
+          Every skill an assistant runs is written down here &mdash; which one, when, how it went.
+          What it was asked for and what came back are not recorded. The list stays in this browser
+          and nothing else can read it.
+        </p>
+        <p class="sub" id="calls-empty" hidden>No skill has been run yet.</p>
+        <ul class="steps" id="calls"></ul>
+        <div class="actions">
+          <p>Clearing this removes the record. What has already happened is not undone.</p>
+          <button type="button" class="quiet danger" id="clear-audit">Clear</button>
+        </div>
+      </section>
+
       <p id="error" role="alert"></p>
     </main>
     <script type="module" src="data.js"></script>

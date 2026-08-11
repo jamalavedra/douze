@@ -1,3 +1,4 @@
+import type { AuditEntry } from '../guards.js'
 import type { DataCommand, DataState } from '../messages.js'
 import type { ExportedFile } from '../recipes.js'
 import type { SessionSummary } from '../store.js'
@@ -10,6 +11,11 @@ import type { SessionSummary } from '../store.js'
  * `CaptureStore.deleteSession`. Recordings of signed-in dashboards accumulated in IndexedDB under
  * `unlimitedStorage` with no control anywhere that removed one.
  *
+ * Two more joined them in the review round, and for the same reason. `RecipeStore.delete` had zero
+ * callers, so a skill set built from a site the user had finished with stayed on the surface — and
+ * on every attached assistant — for the life of the install; and the audit log, which is the record
+ * of what somebody's assistants did in their accounts, could be written and never erased.
+ *
  * A page of its own rather than a section on the other two: review.html is about one capture named
  * in its URL and connect.html is about one link, while everything here is about the whole set.
  *
@@ -17,10 +23,14 @@ import type { SessionSummary } from '../store.js'
  * the whole `DataState`, so the page never infers what changed.
  */
 
-let state: DataState = { sessions: [], recipes: [] }
+let state: DataState = { sessions: [], recipes: [], calls: [] }
 /** Files picked for import, kept only while a name conflict is on screen. */
 let pending: ExportedFile[] = []
-/** The session id whose delete button is armed — a delete has no undo, so it takes two clicks. */
+/**
+ * Which delete button is armed — a delete has no undo, so every one of them takes two clicks and
+ * the second one says what it does. One value, not one per list: arming a second thing disarms the
+ * first, which is what stops a page of half-cocked delete buttons.
+ */
 let arming = ''
 
 const byId = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T
@@ -55,23 +65,33 @@ const countPhrase = (count: number): string => (count === 1 ? '1 thing' : `${cou
 
 const when = (at: number): string => new Date(at).toLocaleString()
 
-function sessionItem(session: SessionSummary): HTMLElement {
-  const armed = arming === session.id
-  const remove = el('button', {
+/**
+ * Two clicks, and the second one says what it does. Every deletion on this page is permanent —
+ * exchanges and response bodies from a site the user was signed into, or the skills built out of
+ * them — so all three lists arm the same way rather than each inventing its own.
+ */
+function armedDelete(key: string, armedLabel: string, describe: string, act: () => void): HTMLElement {
+  const armed = arming === key
+  const button = el('button', {
     type: 'button',
     className: 'quiet danger',
-    textContent: armed ? 'Delete for good' : 'Delete',
+    textContent: armed ? armedLabel : 'Delete',
   })
-  remove.setAttribute('aria-label', armed ? `Delete ${session.name} for good` : `Delete ${session.name}`)
-  remove.addEventListener('click', () => {
-    // Two clicks, and the second one says what it does: this removes the exchanges, the notes and
-    // the response bodies of a site the user was signed into, and nothing brings them back.
+  button.setAttribute('aria-label', `${armed ? armedLabel : 'Delete'} ${describe}`)
+  button.addEventListener('click', () => {
     if (!armed) {
-      arming = session.id
+      arming = key
       render()
       return
     }
     arming = ''
+    act()
+  })
+  return button
+}
+
+function sessionItem(session: SessionSummary): HTMLElement {
+  const remove = armedDelete(`session:${session.id}`, 'Delete for good', session.name, () => {
     void run({ type: 'douze:data:delete', sessionId: session.id }, "Couldn't delete that recording.")
   })
 
@@ -98,16 +118,51 @@ function renderSessions(): void {
   byId('sessions').replaceChildren(...state.sessions.map(sessionItem))
 }
 
+/**
+ * `RecipeStore.delete` had no caller anywhere: a skill set built from a site the user no longer
+ * uses stayed on the surface, and on every attached assistant, until the extension was removed.
+ */
+function recipeItem(recipe: DataState['recipes'][number]): HTMLElement {
+  const remove = armedDelete(`recipe:${recipe.name}`, 'Delete for good', `the ${recipe.name} skills`, () => {
+    void run({ type: 'douze:data:delete-recipe', name: recipe.name }, "Couldn't delete those skills.")
+  })
+  return el('li', {}, [
+    el('p', { className: 'desc', textContent: recipe.name }),
+    el('p', {
+      className: 'meta',
+      textContent:
+        arming === `recipe:${recipe.name}`
+          ? `Deleting these stops your assistants using ${recipe.name}. The example answers go too, and the recording they came from stays.`
+          : `${recipe.tools} in use`,
+    }),
+    el('div', { className: 'selection-actions' }, [remove]),
+  ])
+}
+
 function renderRecipes(): void {
   byId('recipes-empty').hidden = state.recipes.length > 0
-  byId('recipes').replaceChildren(
-    ...state.recipes.map((recipe) =>
-      el('li', {}, [
-        el('p', { className: 'desc', textContent: recipe.name }),
-        el('p', { className: 'meta', textContent: `${recipe.tools} in use` }),
-      ]),
-    ),
-  )
+  byId('recipes').replaceChildren(...state.recipes.map(recipeItem))
+}
+
+/** AC-EXE-003.3 — the audit log, listed on the page that says what is stored, and clearable. */
+function callItem(call: AuditEntry): HTMLElement {
+  return el('li', {}, [
+    el('p', { className: 'desc', textContent: call.tool }),
+    el('p', {
+      className: 'meta',
+      textContent: `${call.outcome === 'ok' ? 'Worked' : call.outcome} · ${when(Date.parse(call.at))} · ${
+        call.trust === 'local' ? 'an app on this computer' : 'a hosted assistant'
+      }`,
+    }),
+  ])
+}
+
+function renderCalls(): void {
+  byId('calls-empty').hidden = state.calls.length > 0
+  byId('calls').replaceChildren(...state.calls.map(callItem))
+  const clear = byId<HTMLButtonElement>('clear-audit')
+  clear.disabled = state.calls.length === 0
+  clear.textContent = arming === 'audit' ? 'Clear for good' : 'Clear'
 }
 
 /**
@@ -157,9 +212,22 @@ function renderImport(): void {
 function render(): void {
   renderSessions()
   renderRecipes()
+  renderCalls()
   renderHar()
   renderImport()
 }
+
+// --- what the assistants did ----------------------------------------------
+
+byId('clear-audit').addEventListener('click', () => {
+  if (arming !== 'audit') {
+    arming = 'audit'
+    render()
+    return
+  }
+  arming = ''
+  void run({ type: 'douze:data:clear-audit' }, "Couldn't clear the record.")
+})
 
 // --- importing a .har ------------------------------------------------------
 

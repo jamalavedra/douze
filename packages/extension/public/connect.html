@@ -35,8 +35,10 @@
         <label class="field-label" for="relay-url">The relay Douze will use</label>
         <input class="field" id="relay-url" type="text" spellcheck="false" autocomplete="off" />
         <p class="sub" id="relay">
-          Leave this as it is unless you run your own relay. Whoever runs it can read everything
-          that crosses it &mdash; see below.
+          Leave this as it is unless you run your own relay. The one Douze offers is run by Jaume
+          Alavedra, who wrote Douze, on a personal server &mdash; not a company, and with no
+          agreement behind it. Whoever runs a relay can read everything that crosses it &mdash; see
+          below.
         </p>
         <div class="actions">
           <p>You can stop sharing at any time.</p>
@@ -103,10 +105,20 @@
           not take one on trust just because it is running here: the app prints a short code, and
           typing it in is you saying yes.
         </p>
+        <p class="sub">
+          On this computer is not the same as staying on this computer. Claude Code, Cursor and
+          Claude Desktop are AI assistants too, so whatever a tool returns goes on to their own
+          model provider &mdash; including results from the tools that delete, which a hosted
+          assistant is never allowed to run.
+        </p>
         <div class="copy-row">
           <input class="field" id="pair-code" type="text" spellcheck="false" autocomplete="off"
             aria-label="The code the app printed" />
           <button type="button" class="primary" id="pair">Pair</button>
+        </div>
+        <div class="actions">
+          <p>Pairing lasts until you undo it here.</p>
+          <button type="button" class="quiet danger" id="unpair">Unpair</button>
         </div>
       </section>
       <section class="trust">

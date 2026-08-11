@@ -46,6 +46,23 @@ const LINGER_MS = 5_000
 /** An endpoint with no extension and no session for this many idle windows is nobody's; reap it. */
 const ENDPOINT_IDLE_WINDOWS = 2
 /**
+ * How many idle windows an endpoint may go without its extension attached before it is reaped
+ * **whatever the platform is doing**. One hour at the default 10-minute window.
+ *
+ * The rule above is not enough on its own, because every `POST /m/<secret>` refreshes `lastSeen`
+ * and holds a session open: a hosted connector that goes on polling `tools/list` after the user
+ * uninstalled the extension would keep the endpoint — and with it that user's tool names,
+ * descriptions and schemas — alive in memory forever, listing them to whoever still holds the URL.
+ * Liveness has to be a property of the party the surface belongs to, and that is the extension.
+ *
+ * Six windows rather than two: a browser that is merely closed re-dials within 30 seconds of
+ * starting (`chrome.alarms`), so an hour covers a restart, a Chrome update and a lunch break,
+ * while an extension that has not managed one dial in that time is not asleep — Chrome is not
+ * running at all, or it is gone. Reconnecting is one click on a page the user already knows.
+ * The 40-second wake grace is untouched: that is a call waiting for a worker, not an endpoint.
+ */
+const ENDPOINT_ATTACH_WINDOWS = 6
+/**
  * How long a `tools/call` waits for a detached extension before it is answered as offline.
  *
  * An evicted MV3 service worker cannot be woken from outside — no inbound frame reaches a worker
@@ -65,9 +82,26 @@ const WAKE_GRACE_MS = 40_000
  * Everything the extension itself fails is already a JSON-RPC error shaped by the host.
  */
 const RPC_VISIBLE = new Set([409, 429])
+/**
+ * An absolute ceiling on one MCP session, on top of the inactivity rule (ASVS 7.3.2). Idleness
+ * alone never expires a session a client polls every nine minutes, and a session is a live
+ * capability over somebody's signed-in accounts held by a party we do not control.
+ *
+ * Twelve hours: longer than any single conversation, so it costs nothing in practice, and short
+ * enough that a session id which leaked into a platform's logs is not usable tomorrow. The client
+ * cost of being wrong is one 404 and a re-`initialize`, which every target client already does.
+ */
+const SESSION_MAX_AGE_MS = 43_200_000
+/**
+ * At most one refusal line per status per this window; whatever else arrives is counted and
+ * reported with the next one.
+ */
+const REFUSAL_LOG_MS = 1_000
 
 interface Session {
   last: number
+  /** When `initialize` minted it — the clock the absolute ceiling above is measured on. */
+  created: number
   /** Owns MCP for this session: initialize, tools/list, and the correlation of every tool.call. */
   host: McpHost
 }
@@ -83,6 +117,12 @@ interface Endpoint {
   lastPong: number
   /** Last time the extension or a platform client touched this endpoint, for the reaper below. */
   lastSeen: number
+  /**
+   * Last time the **extension** was attached, and the only clock a platform client cannot move.
+   * Set at registration, on every `hello`, and refreshed by the sweep for as long as the socket is
+   * up, so a long-lived attachment is never mistaken for an abandoned endpoint.
+   */
+  lastAttached: number
   /**
    * One cached surface per endpoint, not per session: the extension pushes it once per connect,
    * every live session is fanned out from it, and a session created later is seeded from it. That
@@ -101,6 +141,8 @@ class Refusal extends Error {
   constructor(
     readonly status: number,
     readonly payload: Record<string, unknown>,
+    /** The endpoint this was refused on, where one was identified. There often is not one. */
+    readonly ep?: string,
   ) {
     super(String(payload['error']))
     this.name = 'Refusal'
@@ -119,21 +161,56 @@ export async function startRelay(options: {
    */
   trustProxy?: boolean
   sessionIdleMs?: number
+  sessionMaxAgeMs?: number
   heartbeatMs?: number
   requestTimeoutMs?: number
   wakeGraceMs?: number
 }): Promise<Relay> {
   // Only the tests set these; production reads the numbers both halves of the protocol agree on.
   const idleMs = options.sessionIdleMs ?? REMOTE_SESSION_IDLE_MS
+  const maxAgeMs = options.sessionMaxAgeMs ?? SESSION_MAX_AGE_MS
   const heartbeatMs = options.heartbeatMs ?? HEARTBEAT_MS
   const timeoutMs = options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS
   const graceMs = options.wakeGraceMs ?? WAKE_GRACE_MS
   const byToken = new Map<string, Endpoint>()
   const bySecret = new Map<string, Endpoint>()
   const registrations = new Map<string, { count: number; resetAt: number }>()
-  // Metrics for now are counters and nothing else: no endpoint is exposed to scrape them, so
-  // they surface once, on shutdown, where they cost nothing and answer "was anything dropped?".
+  // Metrics for now are counters and nothing else: no endpoint is exposed to scrape them, so they
+  // are emitted by the sweep when they move and once more on shutdown, and answer "was anything
+  // dropped?" for an operator who has only a journal.
   const counters = { registered: 0, requests: 0, refused: 0, waited: 0 }
+  const lastReported = { ...counters }
+  const refusalLog = new Map<number, { at: number; suppressed: number }>()
+
+  /**
+   * Every refusal leaves a line, once per status per second.
+   *
+   * Without this a 401 on a guessed endpoint token, a 404 on a guessed `/m/<secret>` and a
+   * registration flood were all silent: the counters existed but surfaced only in `close()`, which
+   * a `Restart=always` unit killed by a signal never reaches, so an operator could not see a brute
+   * force live or afterwards (ASVS 16.3.1). What is logged is the status, the refusal's own code,
+   * and the endpoint label where one was identified — never a payload, a secret, a path, a session
+   * id or a caller address. The payload-free discipline the sweep test enforces is the right one;
+   * this stops refusals being invisible without widening it by a single field.
+   *
+   * Rate-limited because the refusals worth seeing are the ones that arrive thousands at a time,
+   * and a line each would be a log flood attack rather than a record of one.
+   */
+  const logRefusal = (status: number, code: string, ep?: string): void => {
+    const now = Date.now()
+    const window = refusalLog.get(status)
+    if (window && now - window.at < REFUSAL_LOG_MS) {
+      window.suppressed += 1
+      return
+    }
+    refusalLog.set(status, { at: now, suppressed: 0 })
+    log('request.refused', {
+      status,
+      code,
+      ...(ep === undefined ? {} : { ep }),
+      ...(window && window.suppressed > 0 ? { also: window.suppressed } : {}),
+    })
+  }
 
   const register = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     // ponytail: a fixed in-memory window, keyed per caller. Good enough for one process; swap for
@@ -172,6 +249,7 @@ export async function startRelay(options: {
       heartbeat: undefined,
       lastPong: 0,
       lastSeen: now,
+      lastAttached: now,
       surface: [],
       sessions: new Map(),
       inFlight: new Set(),
@@ -253,7 +331,7 @@ export async function startRelay(options: {
     })
     host.setAttached(live(endpoint))
     host.pushSurface(endpoint.surface)
-    const session: Session = { last: now, host }
+    const session: Session = { last: now, created: now, host }
     endpoint.sessions.set(sid, session)
     return session
   }
@@ -317,7 +395,7 @@ export async function startRelay(options: {
       const presented = header.startsWith('Bearer ') ? header.slice(7) : ''
       if (!timingSafeEqual(sha256(presented), endpoint.bearerHash)) {
         res.setHeader('WWW-Authenticate', 'Bearer')
-        throw new Refusal(401, { error: 'unauthorized' })
+        throw new Refusal(401, { error: 'unauthorized' }, endpoint.label)
       }
     }
     endpoint.lastSeen = Date.now()
@@ -344,6 +422,9 @@ export async function startRelay(options: {
       if (!(error instanceof Refusal) || initializing || !answered) throw error
       if (!RPC_VISIBLE.has(error.status)) throw error
       counters.refused += 1
+      // Delivered as a 200 so the client renders it, but it is still a refusal and still logged:
+      // the reason it is invisible to the HTTP status is exactly why it needs the line.
+      logRefusal(error.status, String(error.payload['error']), error.ep)
       json(res, 200, { jsonrpc: '2.0', id: message.id, error: { code: -32_000, message: error.payload['message'] } })
     }
   }
@@ -365,7 +446,11 @@ export async function startRelay(options: {
       // orphaned: without this the previous host survives until the session idles out.
       closeSession(endpoint, header)
       if (endpoint.sessions.size >= REMOTE_MAX_SESSIONS) {
-        throw new Refusal(429, { error: 'rate_limited', message: 'Too many MCP sessions open for this endpoint.' })
+        throw new Refusal(
+          429,
+          { error: 'rate_limited', message: 'Too many MCP sessions open for this endpoint.' },
+          endpoint.label,
+        )
       }
       const sid = randomUUID()
       const session = openSession(endpoint, sid, started)
@@ -377,7 +462,9 @@ export async function startRelay(options: {
 
     // Streamable HTTP's own convention: an unknown session is a 404 and the client re-initializes.
     const session = endpoint.sessions.get(header)
-    if (!session) throw new Refusal(404, { error: 'no_session', message: 'This MCP session has expired.' })
+    if (!session) {
+      throw new Refusal(404, { error: 'no_session', message: 'This MCP session has expired.' }, endpoint.label)
+    }
     session.last = started
 
     if (!answered) {
@@ -390,10 +477,18 @@ export async function startRelay(options: {
     // Reusing an id that is still in flight would let one caller's answer settle another's request.
     const key = waiterKey(header, message.id)
     if (endpoint.inFlight.has(key)) {
-      throw new Refusal(409, { error: 'duplicate_id', message: 'A request with this id is already in flight.' })
+      throw new Refusal(
+        409,
+        { error: 'duplicate_id', message: 'A request with this id is already in flight.' },
+        endpoint.label,
+      )
     }
     if (endpoint.inFlight.size >= MAX_IN_FLIGHT) {
-      throw new Refusal(429, { error: 'rate_limited', message: 'Too many calls in flight for this endpoint.' })
+      throw new Refusal(
+        429,
+        { error: 'rate_limited', message: 'Too many calls in flight for this endpoint.' },
+        endpoint.label,
+      )
     }
     endpoint.inFlight.add(key)
     try {
@@ -421,7 +516,10 @@ export async function startRelay(options: {
   const server = createServer((req, res) => {
     void route(req, res).catch((error: unknown) => {
       counters.refused += 1
-      if (error instanceof Refusal) return json(res, error.status, error.payload)
+      if (error instanceof Refusal) {
+        logRefusal(error.status, String(error.payload['error']), error.ep)
+        return json(res, error.status, error.payload)
+      }
       log('relay.failed', { reason: (error as Error).name })
       json(res, 500, { error: 'relay_failed' })
     })
@@ -447,7 +545,11 @@ export async function startRelay(options: {
 
   wss.on('connection', (socket) => {
     let endpoint: Endpoint | null = null
-    const deadline = setTimeout(() => socket.close(1008, 'expected hello'), HELLO_TIMEOUT_MS)
+    const deadline = setTimeout(() => {
+      counters.refused += 1
+      logRefusal(1008, 'hello_timeout')
+      socket.close(1008, 'expected hello')
+    }, HELLO_TIMEOUT_MS)
     // ws raises 'error' on an abruptly dropped peer, and an unhandled one is an uncaughtException
     // — a single half-open extension connection would take the whole relay down with it.
     socket.on('error', () => socket.terminate())
@@ -472,6 +574,10 @@ export async function startRelay(options: {
         const found =
           frame.data.type === 'hello' && typeof token === 'string' ? byToken.get(sha256hex(token)) : undefined
         if (!found) {
+          // The one authentication failure that never reaches the HTTP layer, and the one a token
+          // guesser would spend all its attempts on. Rate-limited on the same window as the rest.
+          counters.refused += 1
+          logRefusal(1008, frame.data.type === 'hello' ? 'invalid_relay_token' : 'expected_hello')
           socket.close(1008, frame.data.type === 'hello' ? 'invalid relay token' : 'expected hello')
           return
         }
@@ -509,6 +615,7 @@ export async function startRelay(options: {
     endpoint.socket = socket
     endpoint.lastPong = Date.now()
     endpoint.lastSeen = endpoint.lastPong
+    endpoint.lastAttached = endpoint.lastPong
     endpoint.heartbeat = setInterval(() => {
       if (Date.now() - endpoint.lastPong > 2 * heartbeatMs) {
         socket.terminate()
@@ -524,22 +631,51 @@ export async function startRelay(options: {
     return endpoint
   }
 
+  /** Drops an endpoint and everything hanging off it. Whatever was parked is answered as offline. */
+  const reap = (endpoint: Endpoint, reason: string): void => {
+    byToken.delete(endpoint.tokenHash)
+    bySecret.delete(endpoint.secretHash)
+    const socket = endpoint.socket
+    endpoint.socket = null
+    if (socket) detach(endpoint, reason)
+    for (const sid of endpoint.sessions.keys()) closeSession(endpoint, sid)
+    wake(endpoint)
+    socket?.close(1000, reason)
+    log('endpoint.reaped', { ep: endpoint.label, reason })
+  }
+
   const sweep = setInterval(() => {
     const now = Date.now()
     // Both maps below only ever grew: a rate-limit bucket per peer address that outlived its
     // window, and an endpoint whose extension never dialled in and whose owner never called DELETE.
     for (const [ip, seen] of registrations) if (seen.resetAt <= now) registrations.delete(ip)
     for (const endpoint of byToken.values()) {
+      if (endpoint.socket) endpoint.lastAttached = now
       for (const [sid, session] of endpoint.sessions) {
-        if (session.last > now - idleMs) continue
+        // Inactivity OR age: a client polling every nine minutes refreshes `last` forever, and a
+        // session is a live capability over somebody's signed-in accounts. The ceiling is a
+        // re-initialize, which every target client already does on a 404, so the cost of being
+        // wrong is one extra round trip rather than a broken connector.
+        if (session.last > now - idleMs && session.created > now - maxAgeMs) continue
         closeSession(endpoint, sid)
-        log('session.expired', { ep: endpoint.label })
+        log('session.expired', { ep: endpoint.label, aged: session.created <= now - maxAgeMs ? 1 : 0 })
+      }
+      // Before the idle rule, and deliberately not conditioned on it: this is the one clock a
+      // platform's polling cannot move, so it is what stops a dead user's surface living forever.
+      if (now - endpoint.lastAttached > ENDPOINT_ATTACH_WINDOWS * idleMs) {
+        reap(endpoint, 'extension_gone')
+        continue
       }
       if (endpoint.socket || endpoint.sessions.size > 0) continue
       if (now - endpoint.lastSeen <= ENDPOINT_IDLE_WINDOWS * idleMs) continue
-      byToken.delete(endpoint.tokenHash)
-      bySecret.delete(endpoint.secretHash)
-      log('endpoint.reaped', { ep: endpoint.label })
+      reap(endpoint, 'unused')
+    }
+    // A `Restart=always` unit killed by a signal never reaches `close()`, so the counters it logs
+    // there would be the only record of a busy hour and would go with the process. Emitted on the
+    // sweep instead, and only when something moved, so an idle relay stays quiet.
+    if (counters.requests !== lastReported.requests || counters.refused !== lastReported.refused) {
+      log('relay.counters', counters)
+      Object.assign(lastReported, counters)
     }
   }, Math.min(SWEEP_MS, idleMs))
   sweep.unref()
@@ -584,7 +720,8 @@ export async function startRelay(options: {
  * names, no descriptions, no session ids, and no secret in any form — the sweep test in
  * relay.test.ts holds this line, and it matters more than it did in WO-014: the relay now holds a
  * whole tool surface in memory, so a careless log line would put a user's recipe names and
- * descriptions in an operator's journal forever. Counts and durations only.
+ * descriptions in an operator's journal forever. Counts, durations, statuses and refusal codes
+ * only — a refused request leaves a line (see `logRefusal`) carrying nothing the caller sent.
  */
 const log = (event: string, fields: Record<string, string | number> = {}): void => {
   const tail = Object.entries(fields)
