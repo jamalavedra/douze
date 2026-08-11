@@ -1,7 +1,8 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
-import { DouzeError, type RelayRequest, type RelayResponse, type SideEffect } from '@douze/shared'
+import { DouzeError, MAX_DESCRIPTION, type RelayRequest, type RelayResponse, type SideEffect } from '@douze/shared'
+import { AttachedTool } from '@douze/mcp-host'
 import {
   DEFAULT_TIMEOUT_MS,
   MAX_RESULT_BYTES,
@@ -106,6 +107,29 @@ describe('surface filtering at push time (T-015.9)', () => {
     expect(pushed?.description).toContain('Currently degraded and will refuse to run: the response shape moved')
     expect(attachedSurface([DESTRUCTIVE], 'local', true)[0]?.description).toContain('requires confirm=true')
   })
+
+  /**
+   * WO-016 #3 — `AttachedTool.description` is capped at MAX_DESCRIPTION and a host DROPS a frame
+   * it cannot parse. `surface.push` carries the whole surface in one frame, so one over-long
+   * description did not shorten one tool: it took every tool of every recipe off every hosted
+   * client, with nothing logged at either end. The recipe schema refuses to store text that long;
+   * this is the second half, because `describe()` concatenates two separately-bounded strings.
+   */
+  it('cuts a composed description to the wire cap rather than losing the whole surface', () => {
+    const long = tool('list', 'destructive', {
+      degraded: true,
+      degraded_reason: 'y'.repeat(1024),
+    })
+    long.tool.description = 'x'.repeat(MAX_DESCRIPTION)
+
+    const pushed = attachedSurface([long, READ], 'local', true)
+    expect(pushed[0]?.description.length).toBe(MAX_DESCRIPTION)
+    // The whole surface survives, and the other tool's text is untouched.
+    expect(names(pushed)).toEqual(['jira_list', 'jira_list'])
+    expect(pushed[1]?.description).toBe('list issues')
+    // Every pushed tool still satisfies the frame the host will parse.
+    for (const entry of pushed) expect(() => AttachedTool.parse(entry)).not.toThrow()
+  })
 })
 
 // --- the same table, enforced at call time --------------------------------
@@ -154,6 +178,49 @@ describe('call-time enforcement regardless of what was pushed (T-015.9)', () => 
     expect(refusal(() => checkPolicy(READ, { limit: '20' }, 'local', true)).message).toContain('limit must be integer')
     expect(refusal(() => checkPolicy(DESTRUCTIVE, { confirm: true }, 'local', true)).message).toContain(
       '"id" is required',
+    )
+  })
+
+  /**
+   * Inference derives `minimum`/`maximum` from what the site was observed doing, so that a
+   * recorded `limit=20` stops permitting `limit=1000000`. Until this was enforced the bound was
+   * declaration only: `check` understood `type`, `enum`, `items`, `properties` and `required` and
+   * silently ignored everything else, so every derived ceiling was decoration.
+   */
+  it('enforces the numeric bounds inference derives, on both sides', () => {
+    const bounded = tool(
+      'list',
+      'read',
+      {},
+      { input_schema: { type: 'object', properties: { limit: { type: 'integer', minimum: 1, maximum: 200 } } } },
+    )
+    expect(() => checkPolicy(bounded, { limit: 20 }, 'remote', false)).not.toThrow()
+    expect(() => checkPolicy(bounded, { limit: 1 }, 'remote', false)).not.toThrow()
+    expect(() => checkPolicy(bounded, { limit: 200 }, 'remote', false)).not.toThrow()
+
+    expect(refusal(() => checkPolicy(bounded, { limit: 1_000_000 }, 'remote', false)).message).toContain(
+      'limit must be at most 200',
+    )
+    expect(refusal(() => checkPolicy(bounded, { limit: 0 }, 'remote', false)).message).toContain(
+      'limit must be at least 1',
+    )
+  })
+
+  /**
+   * A caller that stringifies its query parameters is refused rather than coerced, and told so in
+   * a sentence it can act on. Coercing would mean the bound above has two representations to
+   * compare against, and `"1000000"` sails past a `maximum` that only compares numbers — one
+   * clear refusal beats a ceiling anyone can bypass with a pair of quotes.
+   */
+  it('refuses a numeric string for a bounded integer rather than coercing past the ceiling', () => {
+    const bounded = tool(
+      'list',
+      'read',
+      {},
+      { input_schema: { type: 'object', properties: { limit: { type: 'integer', maximum: 200 } } } },
+    )
+    expect(refusal(() => checkPolicy(bounded, { limit: '1000000' }, 'remote', false)).message).toContain(
+      'limit must be integer',
     )
   })
 

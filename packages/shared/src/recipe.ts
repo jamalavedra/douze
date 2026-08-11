@@ -7,6 +7,29 @@ export const RECIPE_VERSION = 1
 export const SideEffect = z.enum(['read', 'write', 'destructive'])
 
 /**
+ * The cap on a tool's model-facing text, matching `AttachedTool.description` in
+ * packages/mcp-host/src/protocol.ts.
+ *
+ * It has to be enforced HERE and not only there, because a host drops a frame it cannot parse and
+ * `surface.push` carries the whole surface in one frame: one recipe with a 5 KB description made
+ * every tool of every recipe vanish from every hosted client, with no error at either end. The
+ * recipe schema is the boundary the bad value has to fail at, since that is the only one an
+ * imported file passes through before it is stored.
+ *
+ * `describe()` (packages/extension/src/guards.ts) composes the pushed text out of the description
+ * plus the destructive and degraded sentences, so it cuts to this same number on the way out — a
+ * tool with a shortened description is a far smaller loss than a surface with no tools at all.
+ */
+export const MAX_DESCRIPTION = 4096
+
+/**
+ * Name lengths, for the same reason and with the same failure mode. `AttachedTool.name` is
+ * `/^[a-zA-Z0-9_-]{1,128}$/` and the pushed name is `<recipe>_<tool>`, so two unbounded names
+ * compose into a frame the host refuses — and takes the whole surface with it.
+ */
+export const MAX_NAME = 60
+
+/**
  * AC-REC-001.2 — a recipe records only where a credential comes from, never a value.
  * `cookie` needs nothing: the browser attaches it. `page_state` names the expression the
  * app itself uses, which the extension re-reads at call time (AC-EXE-001.3).
@@ -144,7 +167,8 @@ export const ToolFlags = z.object({
    * survives an export/import round trip.
    */
   degraded: z.boolean().default(false),
-  degraded_reason: z.string().optional(),
+  /** Bounded because `describe()` appends it to the pushed description — see MAX_DESCRIPTION. */
+  degraded_reason: z.string().max(1024).optional(),
   /** AC-REC-002.2 — fields the user hand-edited, protected from re-inference. */
   user_edited: z.array(z.string()).default([]),
   /** AC-REC-003.1 — inferred values that lost to a user edit, kept as suggestions. */
@@ -152,8 +176,8 @@ export const ToolFlags = z.object({
 })
 
 export const Tool = z.object({
-  name: z.string().regex(/^[a-z][a-z0-9_]*$/, 'tool names are snake_case'),
-  description: z.string(),
+  name: z.string().max(MAX_NAME).regex(/^[a-z][a-z0-9_]*$/, 'tool names are snake_case'),
+  description: z.string().max(MAX_DESCRIPTION),
   side_effect: SideEffect,
   /** REQ-INF-002 — 0..1 from observation count, schema stability, side-effect certainty. */
   confidence: z.number().min(0).max(1),
@@ -174,7 +198,7 @@ export const Tool = z.object({
 export const Recipe = z
   .object({
     version: z.number().int().positive(),
-    name: z.string().regex(/^[a-z][a-z0-9-]*$/, 'recipe names are kebab-case'),
+    name: z.string().max(MAX_NAME).regex(/^[a-z][a-z0-9-]*$/, 'recipe names are kebab-case'),
     enabled: z.boolean().default(true),
     /**
      * `z.url()` alone accepts `javascript:`, `data:` and `file:` — verified against zod 4.4.3.
@@ -212,8 +236,52 @@ export const Recipe = z
           message: `approved destructive tool "${tool.name}" must require a "confirm" parameter`,
         })
       }
+      /**
+       * A GraphQL document is a program, and `side_effect` next to it is a label the file asserts
+       * rather than anything derived from what the document does. Inference DOES derive it — a
+       * mutation is classified from `op.kind` (packages/studio/src/inference/engine.ts) — so this
+       * only ever fires on a recipe someone wrote or was sent: `mutation deleteEverything { … }`
+       * under `side_effect: read` is offered to a hosted assistant with no write opt-in and no
+       * `confirm`, which is every guard in the trust table laundered by one word of YAML.
+       *
+       * Refused rather than downgraded. A downgrade would quietly disagree with the description
+       * the same file wrote ("looks things up"), and the honest report is that the recipe is
+       * lying about itself.
+       */
+      if (tool.request.graphql && tool.side_effect === 'read' && graphqlHasMutation(tool.request.graphql.document)) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['tools', i, 'side_effect'],
+          message:
+            `tool "${tool.name}" replays a GraphQL mutation, so it cannot be side_effect "read" — ` +
+            `a mutation changes data`,
+        })
+      }
     }
   })
+
+/**
+ * Whether a GraphQL document defines a mutation operation.
+ *
+ * Brace depth rather than a bare `\bmutation\b`: `mutation` is an ordinary field name and a
+ * document that merely mentions one must not be refused. An operation definition can only appear
+ * at depth 0, so that is the only place the token counts. String literals and `#` comments are
+ * blanked first, because either can carry the word without defining anything.
+ *
+ * Every operation in the document is considered, not just the one `graphql.operation` names: the
+ * document is replayed verbatim (`buildRequest`), and a server that ignores `operationName` on a
+ * single-operation-looking document is not a thing to bet a delete on.
+ */
+export function graphqlHasMutation(document: string): boolean {
+  const stripped = document.replace(/"""[\s\S]*?"""|"(?:\\.|[^"\\\n])*"/g, '""').replace(/#[^\n]*/g, '')
+  let depth = 0
+  for (const [token] of stripped.matchAll(/[{}]|\bmutation\b/g)) {
+    if (token === '{') depth += 1
+    else if (token === '}') depth = Math.max(0, depth - 1)
+    else if (depth === 0) return true
+  }
+  return false
+}
 
 function hasConfirm(tool: z.infer<typeof Tool>): boolean {
   const schema = tool.request.input_schema as { required?: unknown }

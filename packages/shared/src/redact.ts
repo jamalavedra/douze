@@ -236,20 +236,26 @@ export function redactUrl(url: string, config: RedactionConfig = defaultRedactio
  * still catches is a document that reached a persistence boundary without passing through them.
  * Returns the JSON paths of anything suspicious; an empty array means the write may proceed.
  */
-export function findSurvivingSecrets(value: unknown, path = '$'): string[] {
+export function findSurvivingSecrets(value: unknown, path = '$', seen = new WeakSet<object>()): string[] {
   if (isPlaceholder(value)) return []
   if (typeof value === 'string') return looksLikeCredential(value) ? [path] : []
-  if (Array.isArray(value)) return value.flatMap((v, i) => findSurvivingSecrets(v, `${path}[${i}]`))
-  if (value !== null && typeof value === 'object') {
-    return Object.entries(value).flatMap(([k, v]) => [
-      // A key is as readable off disk as a value. `{"<jwt>": {...}}` is an ordinary shape for a
-      // map keyed by session or token, and walking values alone let one through both this gate
-      // and the redactors, which is the one thing this function exists to make impossible.
-      ...(looksLikeCredential(k) ? [`${path}.${k} (key)`] : []),
-      ...findSurvivingSecrets(v, `${path}.${k}`),
-    ])
-  }
-  return []
+  if (value === null || typeof value !== 'object') return []
+  /**
+   * A YAML anchor can make a document contain itself (`a: &x { b: *x }`), and a walk with no
+   * memory recurses on it until the stack goes — an unhandled RangeError where a sentence naming
+   * the file belongs. Visiting an object once is enough: the answer this function gives is whether
+   * ANY path holds a credential, and a second route to an object already walked cannot change it.
+   */
+  if (seen.has(value)) return []
+  seen.add(value)
+  if (Array.isArray(value)) return value.flatMap((v, i) => findSurvivingSecrets(v, `${path}[${i}]`, seen))
+  return Object.entries(value).flatMap(([k, v]) => [
+    // A key is as readable off disk as a value. `{"<jwt>": {...}}` is an ordinary shape for a
+    // map keyed by session or token, and walking values alone let one through both this gate
+    // and the redactors, which is the one thing this function exists to make impossible.
+    ...(looksLikeCredential(k) ? [`${path}.${k} (key)`] : []),
+    ...findSurvivingSecrets(v, `${path}.${k}`, seen),
+  ])
 }
 
 const JWT = /^ey[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+$/

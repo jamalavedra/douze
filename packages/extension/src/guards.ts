@@ -1,4 +1,4 @@
-import { DouzeError, findSurvivingSecrets, type RelayRequest, type RelayResponse } from '@douze/shared'
+import { DouzeError, findSurvivingSecrets, MAX_DESCRIPTION, type RelayRequest, type RelayResponse } from '@douze/shared'
 import type { AttachedTool, ToolFailure, Trust } from '@douze/mcp-host'
 import type { SurfaceTool } from './recipes.js'
 
@@ -111,7 +111,17 @@ export function describe(entry: SurfaceTool): string {
   if (entry.degraded) {
     parts.push(`Currently degraded and will refuse to run: ${entry.degraded_reason ?? 'contract drift'}.`)
   }
-  return parts.join(' ')
+  /**
+   * The composed text is what goes on the wire, and `AttachedTool.description` caps it at
+   * MAX_DESCRIPTION (packages/mcp-host/src/protocol.ts). `surface.push` carries every tool in ONE
+   * frame and a host drops a frame it cannot parse, so an over-long description here did not
+   * shorten one tool — it deleted the entire surface, every recipe, from every hosted client, with
+   * nothing logged at either end. The recipe schema now refuses to store text that long; this cut
+   * is the second half of the same fix, because the schema bounds the description and the degraded
+   * reason separately and the sentence below concatenates them.
+   */
+  const text = parts.join(' ')
+  return text.length <= MAX_DESCRIPTION ? text : `${text.slice(0, MAX_DESCRIPTION - 1)}…`
 }
 
 /**
@@ -246,6 +256,25 @@ const pageFilledParams = (entry: SurfaceTool): Set<string> =>
 function check(value: unknown, schema: Record<string, unknown>, path: string, exempt: ReadonlySet<string>): string[] {
   const type = schema['type']
   if (typeof type === 'string' && !isType(value, type)) return [`${path || 'the arguments'} must be ${type}`]
+  /**
+   * `minimum`/`maximum`, which inference now derives from what the site was actually observed
+   * doing (10× the largest observed value, symmetric). Until this was here the bound was
+   * declaration only: a recorded `limit=20` still permitted `limit=1000000`, which is the whole
+   * reason the bound exists.
+   *
+   * Numbers only, and deliberately: `isType` above refuses the string `"1000000"` for an `integer`
+   * parameter, so a caller that stringifies its query parameters is told to send a number rather
+   * than quietly slipping past a ceiling that only compares numbers. Accepting a numeric string
+   * here would mean coercing it before the comparison, and a validator with two representations
+   * of the same value is a validator with a hole in it — the alternative to one clear refusal the
+   * caller can act on ("limit must be integer") is a bound that anyone can bypass with a quote.
+   */
+  if (typeof value === 'number') {
+    const min = schema['minimum']
+    const max = schema['maximum']
+    if (typeof min === 'number' && value < min) return [`${path || 'the arguments'} must be at least ${min}`]
+    if (typeof max === 'number' && value > max) return [`${path || 'the arguments'} must be at most ${max}`]
+  }
   const allowed = schema['enum']
   if (Array.isArray(allowed) && !allowed.includes(value)) {
     return [`${path} must be one of ${allowed.map((option) => JSON.stringify(option)).join(', ')}`]

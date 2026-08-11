@@ -300,3 +300,117 @@ describe('a capture carrying a credential cannot become a recipe (TR-6)', () => 
     expect(storedFixtures()).toEqual([])
   })
 })
+
+/**
+ * WO-016 #1 — the other half of "an import lands unapproved". Forcing `approved: false` on import
+ * is only honest if there is somewhere for the reader to go, and every review route named a
+ * capture session while an imported recipe has no capture behind it. This is that route: the same
+ * page, the same tick boxes, the same `save()`.
+ */
+describe('reviewing an imported recipe (WO-016)', () => {
+  const IMPORTED = `version: 1
+name: shop
+target:
+  base_url: https://app.test
+tools:
+  - name: list_orders
+    description: Lists orders.
+    side_effect: read
+    confidence: 0.9
+    observations: 3
+    approved: false
+    request:
+      method: GET
+      path: /api/orders
+  - name: delete_order
+    description: Deletes an order.
+    side_effect: destructive
+    confidence: 0.9
+    observations: 1
+    approved: false
+    request:
+      method: DELETE
+      path: /api/orders/{id}
+`
+
+  const importIt = async (): Promise<RecipeStore> => {
+    const recipes = await RecipeStore.open()
+    const result = await recipes.importFiles([
+      { path: 'recipes/shop.yaml', content: IMPORTED },
+      {
+        path: 'fixtures/shop/list_orders.json',
+        content: JSON.stringify({
+          tool: 'list_orders',
+          recorded_at: '2026-01-01T00:00:00.000Z',
+          request: { method: 'GET', url: 'https://app.test/api/orders', headers: {} },
+          response: { status: 200, headers: {}, body: { orders: [{ id: 1, total: '12.00' }] } },
+        }),
+      },
+    ])
+    expect(result.ok, result.errors.join('; ')).toBe(true)
+    return recipes
+  }
+
+  it('shows the file’s own tools as candidates, with the fixture it shipped as the evidence', async () => {
+    const recipes = await importIt()
+    const review = await ReviewSession.openRecipe('shop', { recipes })
+
+    expect(review.site()).toBe('app.test')
+    expect(review.recipeName()).toBe('shop')
+    const candidates = review.candidates()
+    expect(candidates.map((c) => c.name)).toEqual(['list_orders', 'delete_order'])
+    // Nothing arrives ticked, and a destructive tool is never bulk-approvable (AC-REC-002.3).
+    expect(candidates.every((c) => c.approved)).toBe(false)
+    expect(candidates.map((c) => c.bulk_approvable)).toEqual([true, false])
+    expect(candidates[0]?.sample.response_body).toEqual({ orders: [{ id: 1, total: '12.00' }] })
+    // A tool the file shipped no example answer for still appears, saying what it would do.
+    expect(candidates[1]?.sample.status).toBe(0)
+    expect(candidates[1]?.sample.url).toContain('/api/orders/')
+  })
+
+  it('puts an imported tool on the surface only once it has been approved here', async () => {
+    const recipes = await importIt()
+    expect(recipes.surface().tools).toEqual([])
+
+    const review = await ReviewSession.openRecipe('shop', { recipes })
+    review.approve(['list_orders'])
+    await expect(review.save()).resolves.toMatchObject({ recipe: 'shop', tools: 1 })
+
+    expect(recipes.surface().tools.map((t) => t.qualified_name)).toEqual(['shop_list_orders'])
+    expect(recipes.recipe('shop')?.tools.find((t) => t.name === 'list_orders')?.approved).toBe(true)
+    // The one left unticked stays off, and stays present.
+    expect(recipes.recipe('shop')?.tools.find((t) => t.name === 'delete_order')?.approved).toBe(false)
+  })
+
+  /**
+   * `mergeRecipe` keeps `approved` from the stored side, because it exists to stop re-inference
+   * clobbering what is stored. Merging a recipe against ITSELF is not that: every tick the reader
+   * just made would be merged straight back out, and `save()` would report success having changed
+   * nothing. This is the regression test for that, not a restatement of the one above.
+   */
+  it('does not merge the reader’s approvals away against the recipe they came from', async () => {
+    const recipes = await importIt()
+    const review = await ReviewSession.openRecipe('shop', { recipes })
+    review.approve(['list_orders'])
+    await review.save()
+
+    // Re-open: the store is the only state that survived, and it must say list_orders is on.
+    const again = await ReviewSession.openRecipe('shop', { recipes })
+    expect(again.candidates().filter((c) => c.approved).map((c) => c.name)).toEqual(['list_orders'])
+  })
+
+  it('approving a destructive imported tool injects the confirm the schema demands (AC-REC-002.4)', async () => {
+    const recipes = await importIt()
+    const review = await ReviewSession.openRecipe('shop', { recipes })
+    review.approve(['delete_order'])
+    await expect(review.save()).resolves.toMatchObject({ recipe: 'shop' })
+
+    const tool = recipes.recipe('shop')?.tools.find((t) => t.name === 'delete_order')
+    expect((tool?.request.input_schema as { required?: string[] } | undefined)?.required).toContain('confirm')
+  })
+
+  it('refuses to review a recipe that is not there', async () => {
+    const recipes = await RecipeStore.open()
+    await expect(ReviewSession.openRecipe('nope', { recipes })).rejects.toThrow(/no recipe "nope"/)
+  })
+})

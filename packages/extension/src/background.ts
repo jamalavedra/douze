@@ -537,8 +537,25 @@ async function openData(): Promise<void> {
  */
 const reviews = new Map<string, { session: ReviewSession; count: number }>()
 
+/**
+ * An imported recipe reviewed rather than a capture. `RecipeStore.importFiles` lands every
+ * imported tool unapproved whatever the file said, so a file needs the same page a recording gets;
+ * this is the id the data page's "Set up skills" button sends for one. It rides in `sessionId`
+ * because every review command already names its subject there and a second field would be a
+ * second thing every caller has to get right.
+ */
+export const RECIPE_REVIEW_PREFIX = 'recipe:'
+
 async function reviewSession(sessionId: string, reinfer: boolean): Promise<ReviewSession> {
   const stores = await openStores()
+  if (sessionId.startsWith(RECIPE_REVIEW_PREFIX)) {
+    // No re-inference: there is no capture to grow, and rebuilding would drop the reader's ticks.
+    const open = reviews.get(sessionId)
+    if (open) return open.session
+    const session = await ReviewSession.openRecipe(sessionId.slice(RECIPE_REVIEW_PREFIX.length), stores)
+    reviews.set(sessionId, { session, count: 0 })
+    return session
+  }
   const count = await stores.captures.countExchanges(sessionId)
   const open = reviews.get(sessionId)
   if (open && (!reinfer || open.count === count)) return open.session
@@ -609,6 +626,8 @@ async function onDataCommand(command: DataCommand): Promise<DataState> {
       // `RecipeStore.delete` had no caller at all. Its `refresh` fires the surface subscription,
       // so the tools it carried leave every attached host without anything here pushing.
       await recipes.delete(command.name)
+      // The in-memory review of a recipe that no longer exists is not a review of anything.
+      reviews.delete(RECIPE_REVIEW_PREFIX + command.name)
       return await dataState()
     }
     if (command.type === 'douze:data:clear-audit') {
@@ -624,6 +643,8 @@ async function onDataCommand(command: DataCommand): Promise<DataState> {
     if (command.type === 'douze:data:export') return await dataState({ files: await recipes.exportAll() })
     if (command.type === 'douze:data:import') {
       const imported = await recipes.importFiles(command.files, command.overwrite === true ? { overwrite: true } : {})
+      // A re-import replaces the stored recipe, so any review held open over the old one is stale.
+      for (const name of imported.imported) reviews.delete(RECIPE_REVIEW_PREFIX + name)
       return await dataState({ imported })
     }
     return await dataState()

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { findSurvivingSecrets, redactBody, redactHeaders, redactUrl } from './redact.js'
 import { AnnotationSpan, MAX_NOTE_CHARS, isNoiseHost, shouldCapture } from './capture.js'
 import { parseRecipe, serializeRecipe } from './recipe-file.js'
+import { graphqlHasMutation, MAX_DESCRIPTION, MAX_NAME } from './recipe.js'
 import { RemoteRegistration } from './protocol.js'
 
 describe('redaction (REQ-CAP-005)', () => {
@@ -187,6 +188,107 @@ describe('recipe format (REQ-REC-001)', () => {
     const result = parseRecipe(VALID.replace('version: 1', 'version: 0'), 'old.yaml')
     expect(result.ok).toBe(true)
     expect(result.migrated).toContain('auth')
+  })
+
+  /**
+   * WO-016 #3 — `description` was unbounded here and capped at 4096 on the wire, and a host drops
+   * a frame it cannot parse. `surface.push` carries the whole surface in one frame, so ONE
+   * imported recipe with a long description took every tool of every recipe off every hosted
+   * client, silently. The recipe schema is the only boundary an imported file crosses.
+   */
+  describe('model-facing text is bounded (WO-016)', () => {
+    const withDescription = (text: string): ReturnType<typeof parseRecipe> =>
+      parseRecipe(VALID.replace('description: Lists orders.', `description: ${JSON.stringify(text)}`), 'x.yaml')
+
+    it('refuses a description longer than the wire cap', () => {
+      expect(withDescription('x'.repeat(MAX_DESCRIPTION)).ok).toBe(true)
+      const refused = withDescription('x'.repeat(MAX_DESCRIPTION + 1))
+      expect(refused.ok).toBe(false)
+      expect(refused.error).toContain('description')
+    })
+
+    it('refuses a degraded_reason long enough to blow the composed description', () => {
+      const withReason = (text: string): ReturnType<typeof parseRecipe> =>
+        parseRecipe(
+          VALID.replace('    request:', `    flags:\n      degraded_reason: ${JSON.stringify(text)}\n    request:`),
+          'x.yaml',
+        )
+      expect(withReason('y'.repeat(1024)).ok).toBe(true)
+      expect(withReason('y'.repeat(1025)).ok).toBe(false)
+    })
+
+    it('refuses names that would compose past the host cap on <recipe>_<tool>', () => {
+      expect(parseRecipe(VALID.replace('name: orders', `name: ${'o'.repeat(MAX_NAME + 1)}`), 'x.yaml').ok).toBe(false)
+      expect(parseRecipe(VALID.replace('name: list_orders', `name: ${'l'.repeat(MAX_NAME + 1)}`), 'x.yaml').ok).toBe(
+        false,
+      )
+    })
+  })
+
+  /**
+   * WO-016 #2 — a GraphQL document is an arbitrary program and `side_effect` beside it is a label
+   * the file asserts. Inference derives it from the operation; an imported recipe just says.
+   */
+  describe('a GraphQL mutation cannot be labelled read (WO-016)', () => {
+    const withGraphql = (document: string, sideEffect = 'read'): ReturnType<typeof parseRecipe> =>
+      parseRecipe(
+        VALID.replace('side_effect: read', `side_effect: ${sideEffect}`).replace(
+          '      path: /api/orders',
+          `      path: /graphql\n      graphql:\n        operation: op\n        document: ${JSON.stringify(document)}`,
+        ),
+        'x.yaml',
+      )
+
+    it('refuses a mutation the recipe calls read', () => {
+      const refused = withGraphql('mutation deleteEverything { deleteAllOrders { id } }')
+      expect(refused.ok).toBe(false)
+      expect(refused.error).toContain('mutation')
+    })
+
+    it('refuses a mutation hidden behind a query in the same document', () => {
+      expect(withGraphql('query Safe { me { id } } mutation Nuke { deleteAllOrders { id } }').ok).toBe(false)
+    })
+
+    it('allows the same document once it is honestly labelled', () => {
+      expect(withGraphql('mutation Nuke { deleteAllOrders { id } }', 'write').ok).toBe(true)
+    })
+
+    it('does not refuse a read whose document merely mentions a field called mutation', () => {
+      expect(withGraphql('query Audit { account { mutation history } }').ok).toBe(true)
+      expect(withGraphql('# mutation Nuke { x }\nquery Audit { me { id } }').ok).toBe(true)
+      expect(withGraphql('query Audit($note: String = "mutation Nuke") { me(note: $note) { id } }').ok).toBe(true)
+    })
+
+    it('reads the document, not the operation name', () => {
+      expect(graphqlHasMutation('mutation { deleteAllOrders { id } }')).toBe(true)
+      expect(graphqlHasMutation('query GetMutations { mutations { id } }')).toBe(false)
+    })
+  })
+
+  /**
+   * WO-016 #5 — a YAML anchor that includes itself parses into a cyclic object and zod keeps it
+   * (`z.unknown()` passes values through by reference). `findSurvivingSecrets` walked it until the
+   * stack went, and `RecipeStore.recompute` JSON.stringifies the surface built from it.
+   */
+  it('rejects a self-referential YAML document with a sentence, not a stack overflow', () => {
+    const cyclic = VALID.replace(
+      '      path: /api/orders',
+      '      path: /api/orders\n      input_schema: &s\n        self: *s',
+    )
+    const result = parseRecipe(cyclic, 'loop.yaml')
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('loop.yaml')
+    expect(result.error).toContain('circular reference')
+  })
+
+  it('walks a document that reaches the same object twice without recursing forever', () => {
+    const shared = { token: '«redacted:string:8»' }
+    const cyclic: Record<string, unknown> = { a: shared, b: shared }
+    cyclic['self'] = cyclic
+    expect(findSurvivingSecrets(cyclic)).toEqual([])
+    const leaky: Record<string, unknown> = { nested: { key: 'sk_live_abcdef0123456789ABCDEF' } }
+    leaky['self'] = leaky
+    expect(findSurvivingSecrets(leaky)).toEqual(['$.nested.key'])
   })
 })
 

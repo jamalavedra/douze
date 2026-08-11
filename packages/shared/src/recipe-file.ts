@@ -53,6 +53,21 @@ export function parseRecipe(source: string, filename: string): LoadResult {
     return { ok: false, error: `${filename}: ${issues}` }
   }
 
+  /**
+   * A YAML anchor that contains itself (`input_schema: &s { self: *s }`) parses into a cyclic
+   * object, and zod keeps it: `z.unknown()` passes a value through by reference. Everything
+   * downstream then fails in a way that names nothing — `RecipeStore.recompute` JSON.stringifies
+   * the surface and throws a raw TypeError, and a host frame carrying it cannot be serialised at
+   * all. A recipe is a data document; a cycle in one is not a recipe, and the reader deserves the
+   * sentence rather than the stack.
+   */
+  if (isCircular(parsed.data)) {
+    return {
+      ok: false,
+      error: `${filename}: contains a circular reference — a YAML anchor (&name/*name) that includes itself`,
+    }
+  }
+
   // AC-REC-001.2 / TR-6 — a recipe that carries a credential value is not loadable at all.
   const leaked = findSurvivingSecrets(parsed.data)
   if (leaked.length > 0) {
@@ -60,6 +75,17 @@ export function parseRecipe(source: string, filename: string): LoadResult {
   }
 
   return { ok: true, recipe: parsed.data, migrated }
+}
+
+/** The cheapest complete test for a cycle is the serialiser that will hit it first anyway. */
+function isCircular(value: unknown): boolean {
+  try {
+    JSON.stringify(value)
+    return false
+  } catch (cause) {
+    if (cause instanceof TypeError) return true
+    throw cause
+  }
 }
 
 export function serializeRecipe(recipe: Recipe): string {

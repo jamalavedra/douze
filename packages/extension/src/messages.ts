@@ -87,6 +87,9 @@ export type PopupCommand =
   /**
    * Open the review page for a finished session. The popup cannot do this itself: asking for a
    * permission closes it, and a closed popup runs no continuation.
+   *
+   * `recipe:<name>` names a stored recipe instead of a capture — an imported recipe lands with
+   * nothing approved and goes through this same page (`RECIPE_REVIEW_PREFIX`, background.ts).
    */
   | { type: 'douze:review'; sessionId: string }
   /** Open the page that shares Douze with a hosted assistant. Opened by the worker, for the same reason. */

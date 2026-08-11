@@ -1556,7 +1556,27 @@ describe('what Douze has stored, from the data page', () => {
     const imported = await data({ type: 'douze:data:import', files })
     expect(imported.imported?.ok).toBe(true)
     expect(imported.imported?.imported).toEqual(['shop'])
-    expect(imported.recipes).toEqual([{ name: 'shop', tools: 3 }])
+    expect(imported.imported?.fixtures).toEqual([
+      'shop/create_order.json',
+      'shop/delete_order.json',
+      'shop/list_orders.json',
+    ])
+
+    /**
+     * WO-016 #1 — every file crossed, and nothing is turned on. `approved` used to come out of the
+     * file, which made sending someone a .yaml the one way to put tools on their surface with no
+     * review page, no tick boxes and no moment where a human read what they do. `dataState` counts
+     * APPROVED tools, so this zero is the consent model holding — assert the approval itself as
+     * well, or a future zero for some unrelated reason would look like this test still passing.
+     */
+    expect(imported.recipes).toEqual([{ name: 'shop', tools: 0 }])
+    const stored = (await RecipeStore.open()).recipe('shop')
+    expect(stored?.tools.map((tool) => tool.name).sort()).toEqual(['create_order', 'delete_order', 'list_orders'])
+    expect(stored?.tools.map((tool) => tool.approved)).toEqual([false, false, false])
+    // Not merely filtered on the way out: what is stored says what is true.
+    expect(String(fake.local.get('recipe:shop'))).not.toContain('approved: true')
+    // The example answers still crossed, so a review of the import has its evidence to show.
+    expect(fake.local.get('fixture:shop/list_orders.json')).toBeDefined()
   })
 
   it('refuses an import that would overwrite a skill until it is told to, by name', async () => {
