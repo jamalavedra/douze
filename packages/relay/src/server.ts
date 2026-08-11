@@ -1,7 +1,14 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { WebSocketServer, type WebSocket } from 'ws'
-import { HEARTBEAT_MS, REMOTE_SESSION_IDLE_MS, RemoteDaemonMessage, type RemoteRelayMessage } from '@douze/shared'
+import {
+  HEARTBEAT_MS,
+  REMOTE_MAX_SESSIONS,
+  REMOTE_SESSION_IDLE_MS,
+  RemoteDaemonMessage,
+  RemoteRegistration,
+  type RemoteRelayMessage,
+} from '@douze/shared'
 
 /**
  * WO-014 T-014.5 — the relay: a stateless forwarder between a hosted MCP client (ChatGPT,
@@ -31,6 +38,16 @@ const HELLO_TIMEOUT_MS = 5_000
 const REGISTRATIONS_PER_HOUR = 10
 const REGISTRATION_WINDOW_MS = 3_600_000
 const SWEEP_MS = 30_000
+/** How long an over-cap body is read and discarded so its 413 can land. See readBody. */
+const LINGER_MS = 5_000
+/** An endpoint with no daemon and no session for this many idle windows is nobody's; reap it. */
+const ENDPOINT_IDLE_WINDOWS = 2
+/**
+ * Refusals a hosted MCP client would otherwise never show anyone: it renders a JSON-RPC error and
+ * drops an HTTP error body on the floor, so these are delivered as `200 {error:{code:-32000}}`
+ * instead. 401/404/413 keep their HTTP meaning — that is what makes a client re-auth or re-init.
+ */
+const RPC_VISIBLE = new Set([409, 429, 502, 503, 504])
 
 interface Endpoint {
   /** First 8 hex of the token hash — the only endpoint identifier that ever reaches a log line. */
@@ -41,6 +58,8 @@ interface Endpoint {
   socket: WebSocket | null
   heartbeat: NodeJS.Timeout | undefined
   lastPong: number
+  /** Last time a daemon or a platform client touched this endpoint, for the reaper below. */
+  lastSeen: number
   sessions: Map<string, { last: number }>
   pending: Map<string, { resolve: (message: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>
 }
@@ -63,7 +82,16 @@ const OFFLINE = {
     'your recipes and make sure the daemon is running, then try again.',
 }
 
-export async function startRelay(options: { port: number }): Promise<Relay> {
+const SESSION_REFUSED = {
+  error: 'session_refused',
+  message:
+    'Douze closed this session before answering it. That usually means too many assistants are ' +
+    'connected to this daemon at once; close one and try again.',
+}
+
+export async function startRelay(options: { port: number; sessionIdleMs?: number }): Promise<Relay> {
+  // Only the tests set this; production reads the one number both halves of the protocol agree on.
+  const idleMs = options.sessionIdleMs ?? REMOTE_SESSION_IDLE_MS
   const byToken = new Map<string, Endpoint>()
   const bySecret = new Map<string, Endpoint>()
   const registrations = new Map<string, { count: number; resetAt: number }>()
@@ -83,7 +111,17 @@ export async function startRelay(options: { port: number }): Promise<Relay> {
       throw new Refusal(429, { error: 'rate_limited', message: 'Too many registrations from this address.' })
     }
 
-    const body = await jsonBody<{ daemon_version?: string; bearer_token?: string }>(req)
+    // Unauthenticated input, so it is parsed rather than trusted: an unconstrained daemon_version
+    // would put an attacker-chosen newline into the log line below, and a non-string bearer_token
+    // would reach createHash().update() and take the request down with a TypeError.
+    const parsed = RemoteRegistration.safeParse(await jsonBody(req))
+    if (!parsed.success) {
+      throw new Refusal(400, {
+        error: 'bad_request',
+        message: 'Expected {daemon_version?: string, bearer_token?: string}.',
+      })
+    }
+    const body = parsed.data
     // Two independent randoms: the token authenticates the daemon's socket, the secret is the URL
     // the platform holds. Neither is recoverable from the other, so leaking one URL to a platform
     // log never yields the ability to impersonate the daemon.
@@ -97,6 +135,7 @@ export async function startRelay(options: { port: number }): Promise<Relay> {
       socket: null,
       heartbeat: undefined,
       lastPong: 0,
+      lastSeen: now,
       sessions: new Map(),
       pending: new Map(),
     }
@@ -156,9 +195,14 @@ export async function startRelay(options: { port: number }): Promise<Relay> {
   }
 
   /** Waits for the daemon's reply to one JSON-RPC request, correlated by session and id. */
-  const forward = (endpoint: Endpoint, sid: string, message: { id?: unknown }): Promise<unknown> =>
-    new Promise((resolve, reject) => {
-      const key = `${sid}:${String(message.id)}`
+  const forward = (endpoint: Endpoint, sid: string, message: { id?: unknown }): Promise<unknown> => {
+    const key = waiterKey(sid, message.id)
+    // Reusing an id that is still in flight would replace the first waiter rather than add one:
+    // the first call hangs to its 120s timeout and the in-flight cap never counts either of them.
+    if (endpoint.pending.has(key)) {
+      throw new Refusal(409, { error: 'duplicate_id', message: 'A request with this id is already in flight.' })
+    }
+    return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         endpoint.pending.delete(key)
         reject(new Refusal(504, { error: 'timeout', message: 'The daemon did not answer in time.' }))
@@ -176,6 +220,16 @@ export async function startRelay(options: { port: number }): Promise<Relay> {
       })
       send(endpoint, { type: 'mcp.message', sid, message })
     })
+  }
+
+  /** Everything still waiting on one session, once that session is known to be dead. */
+  const abandon = (endpoint: Endpoint, sid: string, refusal: Refusal): void => {
+    for (const [key, waiter] of endpoint.pending) {
+      if (!key.startsWith(`${sid}:`)) continue
+      endpoint.pending.delete(key)
+      waiter.reject(refusal)
+    }
+  }
 
   /**
    * The streamable-HTTP MCP endpoint. Everything a platform client touches lands here, and the
@@ -188,12 +242,19 @@ export async function startRelay(options: { port: number }): Promise<Relay> {
     if (endpoint.bearerHash) {
       const header = req.headers.authorization ?? ''
       const presented = header.startsWith('Bearer ') ? header.slice(7) : ''
-      if (!timingSafeEqual(sha256(presented), endpoint.bearerHash)) throw new Refusal(401, { error: 'unauthorized' })
+      if (!timingSafeEqual(sha256(presented), endpoint.bearerHash)) {
+        res.setHeader('WWW-Authenticate', 'Bearer')
+        throw new Refusal(401, { error: 'unauthorized' })
+      }
     }
+    endpoint.lastSeen = Date.now()
 
     // No server-initiated stream in v1: a daemon-side tool change reaches the platform when the
     // client next polls tools/list, which every target client does after a reconnect.
-    if (req.method === 'GET') throw new Refusal(405, { error: 'method_not_allowed' })
+    if (req.method !== 'POST' && req.method !== 'DELETE') {
+      res.setHeader('Allow', 'POST, DELETE')
+      throw new Refusal(405, { error: 'method_not_allowed' })
+    }
 
     if (req.method === 'DELETE') {
       const sid = String(req.headers['mcp-session-id'] ?? '')
@@ -201,9 +262,27 @@ export async function startRelay(options: { port: number }): Promise<Relay> {
       res.writeHead(204).end()
       return
     }
-    if (req.method !== 'POST') throw new Refusal(405, { error: 'method_not_allowed' })
 
     const message = await jsonBody<{ method?: unknown; id?: unknown }>(req)
+    const answered = 'id' in message && message.id !== null && message.id !== undefined
+    const initializing = message.method === 'initialize' && answered
+    try {
+      await exchange(endpoint, req, res, message)
+    } catch (error) {
+      if (!(error instanceof Refusal) || initializing || !answered) throw error
+      if (!RPC_VISIBLE.has(error.status)) throw error
+      counters.refused += 1
+      json(res, 200, { jsonrpc: '2.0', id: message.id, error: { code: -32_000, message: error.payload['message'] } })
+    }
+  }
+
+  /** One POST to `/m/<secret>`, from the in-flight cap down to the daemon's reply. */
+  const exchange = async (
+    endpoint: Endpoint,
+    req: IncomingMessage,
+    res: ServerResponse,
+    message: { method?: unknown; id?: unknown },
+  ): Promise<void> => {
     if (!endpoint.socket) throw new Refusal(503, OFFLINE)
     if (endpoint.pending.size >= MAX_IN_FLIGHT) {
       throw new Refusal(429, { error: 'rate_limited', message: 'Too many calls in flight for this endpoint.' })
@@ -211,8 +290,17 @@ export async function startRelay(options: { port: number }): Promise<Relay> {
     counters.requests += 1
     const started = Date.now()
     const answered = 'id' in message && message.id !== null && message.id !== undefined
+    const header = String(req.headers['mcp-session-id'] ?? '')
 
     if (message.method === 'initialize' && answered) {
+      // A client re-initializing over a session it already holds gets that one closed rather than
+      // orphaned: without this the previous MCP instance survives on the daemon until it idles out.
+      if (endpoint.sessions.delete(header)) send(endpoint, { type: 'session.close', sid: header })
+      // The daemon enforces this cap too, but a relay that mints sessions it knows will be refused
+      // is what let one endpoint hold hundreds of them.
+      if (endpoint.sessions.size >= REMOTE_MAX_SESSIONS) {
+        throw new Refusal(429, { error: 'rate_limited', message: 'Too many MCP sessions open for this endpoint.' })
+      }
       const sid = randomUUID()
       endpoint.sessions.set(sid, { last: started })
       send(endpoint, { type: 'session.open', sid })
@@ -223,18 +311,17 @@ export async function startRelay(options: { port: number }): Promise<Relay> {
     }
 
     // Streamable HTTP's own convention: an unknown session is a 404 and the client re-initializes.
-    const sid = String(req.headers['mcp-session-id'] ?? '')
-    const session = endpoint.sessions.get(sid)
+    const session = endpoint.sessions.get(header)
     if (!session) throw new Refusal(404, { error: 'no_session', message: 'This MCP session has expired.' })
     session.last = started
 
     if (!answered) {
-      send(endpoint, { type: 'mcp.message', sid, message })
+      send(endpoint, { type: 'mcp.message', sid: header, message })
       log('mcp.notified', { ep: endpoint.label })
       res.writeHead(202).end()
       return
     }
-    const reply = await forward(endpoint, sid, message)
+    const reply = await forward(endpoint, header, message)
     log('mcp.answered', { ep: endpoint.label, ms: Date.now() - started })
     json(res, 200, reply)
   }
@@ -272,8 +359,10 @@ export async function startRelay(options: { port: number }): Promise<Relay> {
     log('daemon.detached', { ep: endpoint.label, reason })
   }
 
-  const wss = new WebSocketServer({ server, path: '/ws' })
-  wss.on('error', (error) => log('relay.failed', { reason: error.message }))
+  // maxPayload matches the HTTP body cap; ws defaults to 100MB, which no frame here ever needs.
+  const wss = new WebSocketServer({ server, path: '/ws', maxPayload: MAX_BODY_BYTES })
+  // The name, not the message: an error string is the one unbounded value that could reach a line.
+  wss.on('error', (error) => log('relay.failed', { reason: error.name }))
 
   wss.on('connection', (socket) => {
     let endpoint: Endpoint | null = null
@@ -318,6 +407,9 @@ export async function startRelay(options: { port: number }): Promise<Relay> {
           return
         case 'session.closed':
           endpoint.sessions.delete(frame.data.sid)
+          // The daemon refused or tore down this session, so nothing waiting on it will ever be
+          // answered — including the `initialize` that opened it, which would otherwise hang 120s.
+          abandon(endpoint, frame.data.sid, new Refusal(503, SESSION_REFUSED))
           return
         default:
           return
@@ -335,6 +427,7 @@ export async function startRelay(options: { port: number }): Promise<Relay> {
     }
     endpoint.socket = socket
     endpoint.lastPong = Date.now()
+    endpoint.lastSeen = endpoint.lastPong
     endpoint.heartbeat = setInterval(() => {
       if (Date.now() - endpoint.lastPong > 2 * HEARTBEAT_MS) {
         socket.terminate()
@@ -347,7 +440,7 @@ export async function startRelay(options: { port: number }): Promise<Relay> {
   }
 
   const settle = (endpoint: Endpoint, sid: string, message: unknown): void => {
-    const key = `${sid}:${String((message as { id?: unknown } | null)?.id)}`
+    const key = waiterKey(sid, (message as { id?: unknown } | null)?.id)
     const waiter = endpoint.pending.get(key)
     if (!waiter) {
       // A server-initiated notification (tools/list_changed and friends) with no request waiting
@@ -361,16 +454,24 @@ export async function startRelay(options: { port: number }): Promise<Relay> {
   }
 
   const sweep = setInterval(() => {
-    const cutoff = Date.now() - REMOTE_SESSION_IDLE_MS
+    const now = Date.now()
+    // Both maps below only ever grew: a rate-limit bucket per peer address that outlived its
+    // window, and an endpoint whose daemon never dialled in and whose owner never called DELETE.
+    for (const [ip, seen] of registrations) if (seen.resetAt <= now) registrations.delete(ip)
     for (const endpoint of byToken.values()) {
       for (const [sid, session] of endpoint.sessions) {
-        if (session.last > cutoff) continue
+        if (session.last > now - idleMs) continue
         endpoint.sessions.delete(sid)
         send(endpoint, { type: 'session.close', sid })
         log('session.expired', { ep: endpoint.label })
       }
+      if (endpoint.socket || endpoint.sessions.size > 0) continue
+      if (now - endpoint.lastSeen <= ENDPOINT_IDLE_WINDOWS * idleMs) continue
+      byToken.delete(endpoint.tokenHash)
+      bySecret.delete(endpoint.secretHash)
+      log('endpoint.reaped', { ep: endpoint.label })
     }
-  }, SWEEP_MS)
+  }, Math.min(SWEEP_MS, idleMs))
   sweep.unref()
 
   // 0.0.0.0, and deliberately no TLS here: the relay is deployed behind a terminator (Fly, Render,
@@ -393,7 +494,9 @@ export async function startRelay(options: { port: number }): Promise<Relay> {
       // wss.close() only stops new upgrades; a connected daemon otherwise holds the process open.
       for (const client of wss.clients) client.terminate()
       wss.close()
-      server.closeIdleConnections()
+      // All, not just idle: a client mid-upload holds a connection that is anything but idle, and
+      // server.close() would wait on it for as long as that client cared to keep it open.
+      server.closeAllConnections()
       await new Promise<void>((resolve) => server.close(() => resolve()))
       log('relay.stopped', counters)
     },
@@ -411,6 +514,13 @@ const log = (event: string, fields: Record<string, string | number> = {}): void 
     .join('')
   process.stderr.write(`${new Date().toISOString()} ${event}${tail}\n`)
 }
+
+/**
+ * JSON-RPC ids keep their type, so `1` and `"1"` are two different calls and two objects are not
+ * the same call just because both stringify to `[object Object]`. Correlating on the string alone
+ * hands one caller's result to another.
+ */
+const waiterKey = (sid: string, id: unknown): string => `${sid}:${typeof id}:${String(id)}`
 
 const sha256 = (value: string): Buffer => createHash('sha256').update(value).digest()
 const sha256hex = (value: string): string => createHash('sha256').update(value).digest('hex')
@@ -440,22 +550,39 @@ const jsonBody = async <T>(req: IncomingMessage): Promise<T> => {
   return body as T
 }
 
-/** null once the cap is passed. The rest is drained rather than destroyed, so the 413 arrives. */
+/**
+ * null once the cap is passed, and owed to the caller right then rather than at the end of the
+ * upload: nothing past 1MB is ever held, and a client that promises 20MB and then dawdles cannot
+ * keep the handler waiting on a body nobody is going to read.
+ *
+ * What is left flowing is the socket, not a buffer. Pausing or destroying it here is what breaks:
+ * closing a connection with unread data in its receive queue sends an RST, and the RST discards
+ * the 413 the caller is in the middle of writing — the client sees EPIPE and never learns why.
+ * So the rest is read and dropped on the floor (nginx calls this lingering close) for a bounded
+ * few seconds, which is long enough for the refusal to land and short enough to not be a handle
+ * anyone can hold.
+ */
 const readBody = (req: IncomingMessage): Promise<Buffer | null> =>
   new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
     let size = 0
     let over = false
     req.on('data', (chunk: Buffer) => {
+      if (over) return
       size += chunk.length
       if (size > MAX_BODY_BYTES) {
         over = true
         chunks.length = 0
+        const linger = setTimeout(() => req.destroy(), LINGER_MS)
+        linger.unref()
+        req.on('close', () => clearTimeout(linger))
+        resolve(null)
         return
       }
       chunks.push(chunk)
     })
-    req.on('end', () => resolve(over ? null : Buffer.concat(chunks)))
-    // An aborted upload never emits 'end'; without this the handler awaits forever.
+    req.on('end', () => resolve(Buffer.concat(chunks)))
+    // An aborted upload never emits 'end'; without these the handler awaits forever.
+    req.on('close', () => resolve(null))
     req.on('error', reject)
   })

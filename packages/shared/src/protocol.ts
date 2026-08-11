@@ -134,6 +134,20 @@ export const RemoteRelayMessage = z.discriminatedUnion('type', [
 export type RemoteDaemonMessage = z.infer<typeof RemoteDaemonMessage>
 export type RemoteRelayMessage = z.infer<typeof RemoteRelayMessage>
 
+/**
+ * WO-014 — the body of `POST /register`, the one relay route anyone on the internet can reach
+ * unauthenticated. `daemon_version` reaches a relay log line, so it is held to a character set
+ * that cannot carry a newline and forge an entry of its own.
+ */
+export const RemoteRegistration = z.object({
+  daemon_version: z
+    .string()
+    .regex(/^[\w.-]{1,32}$/)
+    .optional(),
+  bearer_token: z.string().max(512).optional(),
+})
+export type RemoteRegistration = z.infer<typeof RemoteRegistration>
+
 /** WO-014 — concurrent platform sessions the daemon serves before refusing another. */
 export const REMOTE_MAX_SESSIONS = 4
 

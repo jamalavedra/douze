@@ -1,14 +1,16 @@
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { WebSocketServer, type WebSocket as RelaySocket } from 'ws'
 import type { RegistryState, SurfaceTool } from '@douze/douzed'
-import type { Tool } from '@douze/shared'
+import { REMOTE_MAX_SESSIONS, type Tool } from '@douze/shared'
 import type { DaemonClient } from './daemon-client.js'
 import {
   filterRemoteRegistry,
   gateResult,
+  readRelayConfig,
+  relayConfigPath,
   startRemoteBridge,
   websocketUrl,
   type RelayConfig,
@@ -178,6 +180,36 @@ const initialize = (id: number): unknown => ({
 
 const daemon = { registry: async () => state } as unknown as DaemonClient
 
+describe('readRelayConfig (T-014.2)', () => {
+  const home = mkdtempSync(join(tmpdir(), 'douze-relayconf-'))
+
+  beforeAll(() => {
+    process.env['DOUZE_HOME'] = home
+  })
+  afterAll(() => {
+    delete process.env['DOUZE_HOME']
+  })
+
+  it('reads a pairing this daemon wrote', () => {
+    const config: RelayConfig = { url: 'https://relay.test', token: 't', mcp_path: '/m/s', allow_writes: true }
+    writeFileSync(relayConfigPath(), JSON.stringify(config))
+    expect(readRelayConfig()).toEqual(config)
+  })
+
+  it('refuses a relay.json that is not a pairing rather than casting it', () => {
+    // This file decides which tools a hosted assistant can reach; a shape nobody checked is not
+    // something to carry on with.
+    writeFileSync(relayConfigPath(), JSON.stringify({ url: 'https://relay.test', token: 5, allow_writes: 'yes' }))
+    expect(() => readRelayConfig()).toThrow(/not a valid Douze relay pairing/)
+  })
+
+  it('is null when nothing is configured', () => {
+    process.env['DOUZE_HOME'] = mkdtempSync(join(tmpdir(), 'douze-relayconf-'))
+    expect(readRelayConfig()).toBeNull()
+    process.env['DOUZE_HOME'] = home
+  })
+})
+
 describe('remote bridge session lifecycle (T-014.2)', () => {
   let relay: FakeRelay
   let bridge: RemoteBridge
@@ -237,12 +269,13 @@ describe('remote bridge session lifecycle (T-014.2)', () => {
   })
 
   it('refuses a session past the concurrency cap', async () => {
-    for (const sid of ['s2', 's3', 's4']) relay.send({ type: 'session.open', sid })
-    relay.send({ type: 'session.open', sid: 's5' })
+    // s1 is already open, so this fills the cap exactly, and then asks for one more.
+    for (let i = 2; i <= REMOTE_MAX_SESSIONS; i++) relay.send({ type: 'session.open', sid: `s${i}` })
+    relay.send({ type: 'session.open', sid: 'over' })
 
-    expect(await relay.next((f) => f.type === 'session.closed' && f.sid === 's5')).toBeTruthy()
-    // The four inside the cap stayed open.
-    expect(relay.seen((f) => f.type === 'session.closed' && f.sid !== 's5')).toBe(false)
+    expect(await relay.next((f) => f.type === 'session.closed' && f.sid === 'over')).toBeTruthy()
+    // Everything inside the cap stayed open.
+    expect(relay.seen((f) => f.type === 'session.closed' && f.sid !== 'over')).toBe(false)
   }, 20_000)
 
   it('closes a session on request', async () => {
@@ -267,4 +300,57 @@ describe('remote bridge session lifecycle (T-014.2)', () => {
     const frame = await relay.next((f) => f.type === 'mcp.message' && f.sid === 's6' && f.message?.id === 3)
     expect(frame.message?.result).toMatchObject({ serverInfo: { name: 'douze' } })
   }, 30_000)
+})
+
+/**
+ * Its own bridge, because the assertion is "nothing is left running", and that can only be made
+ * where every session is one this test opened.
+ */
+describe('a repeated session.open (T-014.2)', () => {
+  let relay: FakeRelay
+  let bridge: RemoteBridge
+  let registryCalls = 0
+
+  beforeAll(async () => {
+    relay = new FakeRelay()
+    const port = await relay.listening()
+    const counting = {
+      registry: async () => {
+        registryCalls++
+        return state
+      },
+    } as unknown as DaemonClient
+    const config: RelayConfig = {
+      url: `http://127.0.0.1:${port}`,
+      token: 'relay-token',
+      mcp_path: '/mcp/secret',
+      allow_writes: false,
+    }
+    bridge = startRemoteBridge(counting, config, '0.1.0')
+    await relay.next((f) => f.type === 'hello')
+    relay.send({ type: 'welcome', heartbeat_ms: 20_000 })
+  }, 20_000)
+
+  afterAll(() => {
+    bridge?.close()
+    relay?.close()
+  })
+
+  it('does not leave a second MCP instance running behind the one it kept', async () => {
+    relay.send({ type: 'session.open', sid: 'a' })
+    relay.send({ type: 'mcp.message', sid: 'a', message: initialize(1) })
+    await relay.next((f) => f.type === 'mcp.message' && f.sid === 'a' && f.message?.id === 1)
+
+    // The repeat used to overwrite the map entry, orphaning an instance nothing could ever close
+    // — it kept polling the daemon forever, and sessions.size never moved, so the cap missed it.
+    relay.send({ type: 'session.open', sid: 'a' })
+    relay.send({ type: 'session.close', sid: 'a' })
+    await relay.next((f) => f.type === 'session.closed' && f.sid === 'a')
+
+    // Every session this bridge had is closed, so nothing should still be asking for a registry.
+    await sleep(200)
+    const settled = registryCalls
+    await sleep(2500)
+    expect(registryCalls).toBe(settled)
+  }, 20_000)
 })

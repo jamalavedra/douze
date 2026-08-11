@@ -1,5 +1,7 @@
+import { connect as connectTcp } from 'node:net'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { WebSocket } from 'ws'
+import { REMOTE_MAX_SESSIONS } from '@douze/shared'
 import { startRelay, type Relay } from './server.js'
 
 let relay: Relay
@@ -73,13 +75,22 @@ const initialize = (path: string, init: RequestInit = {}): Promise<Response> =>
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }),
   })
 
-const call = (path: string, sid: string, id: number, init: RequestInit = {}): Promise<Response> =>
+const call = (path: string, sid: string, id: unknown, init: RequestInit = {}): Promise<Response> =>
   fetch(url(path), {
     ...init,
     method: 'POST',
     headers: { 'Mcp-Session-Id': sid, ...((init.headers ?? {}) as Record<string, string>) },
     body: JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'orders_list' } }),
   })
+
+/** A daemon that completes the handshake and then never answers another thing. */
+const mute = (m: { id?: unknown; method?: unknown }): unknown =>
+  m.method === 'initialize' ? { jsonrpc: '2.0', id: m.id, result: {} } : undefined
+
+const opened = async (path: string, token: string): Promise<{ daemon: FakeDaemon; sid: string }> => {
+  const daemon = await connect(token, mute)
+  return { daemon, sid: (await initialize(path)).headers.get('Mcp-Session-Id') ?? '' }
+}
 
 describe('the round trip', () => {
   it('initializes a session and routes follow-up calls by its header', async () => {
@@ -242,9 +253,15 @@ describe('isolation and failure', () => {
     await vi.waitFor(() => expect(daemon.frames.filter((f) => f.type === 'mcp.message')).toHaveLength(2))
     daemon.socket.close()
 
+    // The call carried an id, so the reason reaches the model as a JSON-RPC error rather than an
+    // HTTP body no MCP client renders.
     const res = await inflight
-    expect(res.status).toBe(502)
-    expect(await res.json()).toMatchObject({ error: 'daemon_offline' })
+    expect(res.status).toBe(200)
+    expect(await res.json()).toMatchObject({
+      jsonrpc: '2.0',
+      id: 20,
+      error: { code: -32_000, message: expect.stringContaining('douze status') },
+    })
   })
 
   it('refuses a call with no daemon, an unknown session, and an oversize body', async () => {
@@ -263,6 +280,213 @@ describe('isolation and failure', () => {
     })
     expect(huge.status).toBe(413)
   })
+})
+
+describe('registration input', () => {
+  it('refuses a daemon_version that would forge a log line of its own', async () => {
+    const forged = '0.1.0\n2026-01-01T00:00:00.000Z endpoint.registered ep=deadbeef daemon=FORGED'
+    const lines: string[] = []
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+      lines.push(String(chunk))
+      return true
+    })
+    try {
+      const res = await fetch(url('/register'), { method: 'POST', body: JSON.stringify({ daemon_version: forged }) })
+      expect(res.status).toBe(400)
+      expect(lines.join('')).not.toContain('FORGED')
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('refuses a bearer_token that is not a string instead of failing the request', async () => {
+    const res = await fetch(url('/register'), { method: 'POST', body: JSON.stringify({ bearer_token: 123 }) })
+    // The unguarded version reached createHash().update(123) and answered 500 relay_failed.
+    expect(res.status).toBe(400)
+    expect(await res.json()).toMatchObject({ error: 'bad_request' })
+  })
+
+  it('refuses an oversize bearer_token', async () => {
+    const res = await fetch(url('/register'), {
+      method: 'POST',
+      body: JSON.stringify({ bearer_token: 'x'.repeat(513) }),
+    })
+    expect(res.status).toBe(400)
+  })
+})
+
+describe('correlation', () => {
+  it('refuses a second request reusing an id that is still in flight', async () => {
+    const { token, mcp_path } = await enroll()
+    const { daemon, sid } = await opened(mcp_path, token)
+
+    const first = call(mcp_path, sid, 5)
+    await vi.waitFor(() => expect(daemon.frames.filter((f) => f.type === 'mcp.message')).toHaveLength(2))
+
+    // Without the guard this replaced the first waiter: that call hung to its 120s timeout, and
+    // pending.size never grew, so the in-flight cap could not see either of them.
+    const second = await call(mcp_path, sid, 5)
+    expect(second.status).toBe(200)
+    expect(await second.json()).toMatchObject({
+      id: 5,
+      error: { message: expect.stringContaining('already in flight') },
+    })
+
+    daemon.socket.close()
+    await first
+  })
+
+  it('keeps ids of different JSON types apart', async () => {
+    const { token, mcp_path } = await enroll()
+    await connect(token, (m) => ({ jsonrpc: '2.0', id: m.id, result: { typed: typeof m.id } }))
+    const sid = (await initialize(mcp_path)).headers.get('Mcp-Session-Id') ?? ''
+
+    // `1` and `"1"` are two different calls. Keyed on String(id) alone they share one waiter.
+    const [numeric, string] = await Promise.all([call(mcp_path, sid, 1), call(mcp_path, sid, '1')])
+    expect(await numeric.json()).toEqual({ jsonrpc: '2.0', id: 1, result: { typed: 'number' } })
+    expect(await string.json()).toEqual({ jsonrpc: '2.0', id: '1', result: { typed: 'string' } })
+  })
+
+  it('refuses the ninth call in flight and forwards the eight below it', async () => {
+    const { token, mcp_path } = await enroll()
+    const { daemon, sid } = await opened(mcp_path, token)
+
+    const inflight = Array.from({ length: 8 }, (_, i) => call(mcp_path, sid, 100 + i))
+    // The initialize plus all eight: none was refused below the cap.
+    await vi.waitFor(() => expect(daemon.frames.filter((f) => f.type === 'mcp.message')).toHaveLength(9))
+
+    const refused = await call(mcp_path, sid, 200)
+    expect(await refused.json()).toMatchObject({
+      id: 200,
+      error: { message: expect.stringContaining('in flight') },
+    })
+
+    daemon.socket.close()
+    await Promise.all(inflight)
+  })
+})
+
+describe('sessions', () => {
+  it('answers at once when the daemon refuses the session', async () => {
+    const { token, mcp_path } = await enroll()
+    const daemon = await connect(token, mute)
+    // The daemon is already at REMOTE_MAX_SESSIONS and closes the session it was asked to open.
+    daemon.socket.on('message', (raw) => {
+      const frame = JSON.parse(String(raw)) as { type: string; sid?: string }
+      if (frame.type === 'session.open') daemon.socket.send(JSON.stringify({ type: 'session.closed', sid: frame.sid }))
+    })
+
+    // Without rejecting the session's waiters this sat on the initialize for the full 120s.
+    const res = await initialize(mcp_path)
+    expect(res.status).toBe(503)
+    expect(await res.json()).toMatchObject({ error: 'session_refused' })
+  })
+
+  it('refuses a session past the per-endpoint cap', async () => {
+    const { token, mcp_path } = await enroll()
+    await connect(token)
+    for (let i = 0; i < REMOTE_MAX_SESSIONS; i++) expect((await initialize(mcp_path)).status).toBe(200)
+
+    const refused = await initialize(mcp_path)
+    expect(refused.status).toBe(429)
+    expect(await refused.json()).toMatchObject({ error: 'rate_limited' })
+  })
+
+  it('closes the session named in the header when a client re-initializes', async () => {
+    const { token, mcp_path } = await enroll()
+    const daemon = await connect(token)
+    const first = (await initialize(mcp_path)).headers.get('Mcp-Session-Id') ?? ''
+
+    const second = (await initialize(mcp_path, { headers: { 'Mcp-Session-Id': first } })).headers.get('Mcp-Session-Id')
+    expect(second).not.toBe(first)
+    await vi.waitFor(() => expect(daemon.frames.some((f) => f.type === 'session.close' && f.sid === first)).toBe(true))
+    expect((await call(mcp_path, first, 60)).status).toBe(404)
+  })
+
+  it('expires a session left idle and tells the daemon to drop its instance', async () => {
+    await relay.close()
+    relay = await startRelay({ port: 0, sessionIdleMs: 60 })
+    const { token, mcp_path } = await enroll()
+    const daemon = await connect(token)
+    const sid = (await initialize(mcp_path)).headers.get('Mcp-Session-Id') ?? ''
+
+    await vi.waitFor(() => expect(daemon.frames.some((f) => f.type === 'session.close' && f.sid === sid)).toBe(true))
+    expect((await call(mcp_path, sid, 70)).status).toBe(404)
+  })
+
+  it('reaps a registration whose daemon never dialled in', async () => {
+    await relay.close()
+    relay = await startRelay({ port: 0, sessionIdleMs: 60 })
+    const { mcp_path } = await enroll()
+    expect((await initialize(mcp_path)).status).toBe(503)
+
+    // No socket and no session for two idle windows, and — because a request refreshes the
+    // endpoint — nobody asking for it either. Then it is gone, not merely quiet.
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    expect((await initialize(mcp_path)).status).toBe(404)
+  })
+})
+
+describe('the daemon socket', () => {
+  it('closes a socket that never says hello', async () => {
+    const socket = new WebSocket(`ws://127.0.0.1:${relay.port}/ws`)
+    const code = await new Promise<number>((resolve) => socket.once('close', resolve))
+    expect(code).toBe(1008)
+  }, 15_000)
+
+  it('replaces a previous socket when the daemon redials', async () => {
+    const { token, mcp_path } = await enroll()
+    const first = await connect(token)
+    const closed = new Promise<number>((resolve) => first.socket.once('close', resolve))
+
+    await connect(token)
+    expect(await closed).toBe(1000)
+    // The endpoint is served by the new socket, not left pointing at the dead one.
+    expect((await initialize(mcp_path)).status).toBe(200)
+  })
+})
+
+describe('HTTP semantics', () => {
+  it('requires the bearer on DELETE and GET, not only on POST', async () => {
+    const { token, mcp_path } = await enroll({ bearer_token: 'dust-static-secret' })
+    await connect(token)
+    const authorized = { authorization: 'Bearer dust-static-secret' }
+    const sid = (await initialize(mcp_path, { headers: authorized })).headers.get('Mcp-Session-Id') ?? ''
+
+    const deleted = await fetch(url(mcp_path), { method: 'DELETE', headers: { 'Mcp-Session-Id': sid } })
+    expect(deleted.status).toBe(401)
+    expect(deleted.headers.get('WWW-Authenticate')).toBe('Bearer')
+    expect((await fetch(url(mcp_path))).status).toBe(401)
+
+    // The session survived the refused DELETE.
+    expect((await call(mcp_path, sid, 80, { headers: authorized })).status).toBe(200)
+  })
+
+  it('names the methods it accepts when refusing one', async () => {
+    const { token, mcp_path } = await enroll()
+    await connect(token)
+    const res = await fetch(url(mcp_path), { method: 'PUT', body: '{}' })
+    expect(res.status).toBe(405)
+    expect(res.headers.get('Allow')).toBe('POST, DELETE')
+  })
+
+  it('answers 413 without waiting for the rest of the upload', async () => {
+    const { mcp_path } = await enroll()
+    const socket = connectTcp({ port: relay.port, host: '127.0.0.1' })
+    await new Promise((resolve) => socket.once('connect', resolve))
+
+    // Promises 20MB and sends 2MB, then nothing. The version that waited for 'end' hung here and
+    // read whatever else the client cared to send; this one answers at the cap and stops pulling.
+    socket.write(
+      `POST ${mcp_path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n` +
+        `Content-Length: 20000000\r\n\r\n`,
+    )
+    socket.write('x'.repeat(2_000_000))
+
+    const head = await new Promise<string>((resolve) => socket.once('data', (chunk: Buffer) => resolve(String(chunk))))
+    expect(head).toContain('413')
+    socket.destroy()
+  }, 15_000)
 })
 
 describe('the log', () => {

@@ -2,7 +2,7 @@ import { appendFileSync, chmodSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createInterface } from 'node:readline'
 import { PassThrough } from 'node:stream'
-import { Cli } from 'incur'
+import { Cli, z } from 'incur'
 import { douzeHome, ensureHome, type RegistryState } from '@douze/douzed'
 import { REMOTE_MAX_SESSIONS, RemoteRelayMessage, findSurvivingSecrets, type RemoteDaemonMessage } from '@douze/shared'
 import type { DaemonClient } from './daemon-client.js'
@@ -20,20 +20,21 @@ import { ToolSurfaceBuilder } from './surface.js'
  * `findSurvivingSecrets` before it leaves this machine.
  */
 
-export interface RelayConfig {
+export const RelayConfig = z.object({
   /** Relay base URL, no trailing slash — `https://relay.example`. */
-  url: string
+  url: z.string(),
   /** Authenticates this daemon's WebSocket. Written by `douze connect`. */
-  token: string
+  token: z.string(),
   /** Path half of the platform-facing MCP URL; the secret is in the path. */
-  mcp_path: string
+  mcp_path: z.string(),
   /** T-014.3 — write tools are off the remote surface unless this is set. */
-  allow_writes: boolean
+  allow_writes: z.boolean(),
   /** Whether a bearer token was sent at registration. The value itself is never stored. */
-  bearer?: boolean
+  bearer: z.boolean().optional(),
   /** T-014.4 — qualified tool names exempt from the outbound secret gate. */
-  expose?: string[]
-}
+  expose: z.array(z.string()).optional(),
+})
+export type RelayConfig = z.infer<typeof RelayConfig>
 
 export interface AuditEntry {
   ts: string
@@ -44,9 +45,22 @@ export interface AuditEntry {
 export const relayConfigPath = (): string => join(douzeHome(), 'relay.json')
 const auditPath = (): string => join(douzeHome(), 'remote-audit.jsonl')
 
+/**
+ * No relay configured is `null`; a relay.json that is there but not a pairing is an error. This
+ * file decides which of your tools a hosted assistant can reach, so a shape nobody checked is not
+ * something to shrug at and carry on with.
+ */
 export function readRelayConfig(): RelayConfig | null {
   const parsed = safeJson(readText(relayConfigPath()))
-  return parsed === undefined ? null : (parsed as RelayConfig)
+  if (parsed === undefined) return null
+  const config = RelayConfig.safeParse(parsed)
+  if (!config.success) {
+    throw new Error(
+      `${relayConfigPath()} is not a valid Douze relay pairing (${config.error.issues[0]?.message ?? 'bad shape'}` +
+        ` at ${config.error.issues[0]?.path.join('.') || 'the root'}). Delete it and re-run \`douze connect <url>\`.`,
+    )
+  }
+  return config.data
 }
 
 export function writeRelayConfig(config: RelayConfig): void {
@@ -82,6 +96,9 @@ export function filterRemoteRegistry(state: RegistryState, config: Pick<RelayCon
 const BACKOFF_MIN_MS = 1000
 const BACKOFF_MAX_MS = 30_000
 
+/** What one session may have queued for its MCP instance: the relay's own 8 × 1MB ceiling. */
+const MAX_QUEUED_BYTES = 8 * 1024 * 1024
+
 interface Session {
   input: PassThrough
   /** In-flight `tools/call` ids and the tool each named, for the result gate and the audit. */
@@ -113,6 +130,9 @@ export function startRemoteBridge(daemon: DaemonClient, config: RelayConfig, ver
   }
 
   const openSession = (sid: string): void => {
+    // A repeat for a live sid would replace the map entry and orphan its MCP instance — unclosed,
+    // still polling the daemon, and invisible to the cap below because sessions.size never moved.
+    if (sessions.has(sid)) return
     // AC-014 — the cap is the daemon's, not the relay's; an excess session is refused, not queued.
     if (sessions.size >= REMOTE_MAX_SESSIONS) {
       send({ type: 'session.closed', sid })
@@ -166,6 +186,15 @@ export function startRemoteBridge(daemon: DaemonClient, config: RelayConfig, ver
       case 'mcp.message': {
         const session = sessions.get(frame.sid)
         if (!session) return
+        // The MCP instance reads at its own pace. An honest relay caps itself at 8 in-flight 1MB
+        // messages, so it never reaches this; a relay flooding the socket is refused rather than
+        // buffered into this daemon's heap without limit.
+        if (session.input.writableLength > MAX_QUEUED_BYTES) {
+          warn(`remote session ${frame.sid} is not draining; closing it`)
+          closeSession(frame.sid)
+          send({ type: 'session.closed', sid: frame.sid })
+          return
+        }
         record(frame.sid, frame.message, session.calls)
         session.input.write(`${JSON.stringify(frame.message)}\n`)
         return

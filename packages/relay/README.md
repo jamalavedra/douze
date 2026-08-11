@@ -21,7 +21,7 @@ hash prefix per endpoint — never a payload, a tool name, a session id, or a se
 
 | Route | Auth | Purpose |
 | --- | --- | --- |
-| `POST /register` | none, 10/hour per IP | `{daemon_version, bearer_token?}` → `201 {token, mcp_path}` |
+| `POST /register` | none, 10/hour per peer address | `{daemon_version, bearer_token?}` → `201 {token, mcp_path}` |
 | `POST /rotate` | `x-douze-relay-token` | new token and path; the old pair dies immediately |
 | `DELETE /register` | `x-douze-relay-token` | drops the endpoint, closes the socket, expires sessions |
 | `GET /health` | none | `{ok: true}` |
@@ -29,10 +29,20 @@ hash prefix per endpoint — never a payload, a tool name, a session id, or a se
 | `POST /m/<secret>` | the secret, plus `Authorization: Bearer` if one was registered | the MCP endpoint |
 | `DELETE /m/<secret>` | same | closes the session named by `Mcp-Session-Id` |
 
+The registration limit counts per peer address, which behind the TLS terminator below is the
+terminator — so all users of one deployment share a single bucket. Reading a trusted
+`X-Forwarded-For` under an explicit `TRUST_PROXY` setting is the upgrade path when that matters.
+
 `initialize` mints a session and returns it in `Mcp-Session-Id`; every later request must carry
 that header, and an unknown one gets a 404 so the client re-initializes. Requests cap at 1 MB,
-8 in flight per endpoint, and 120s each. `GET /m/<secret>` is 405 — there is no server-initiated
-stream in v1, so clients see tool changes when they next poll `tools/list`.
+8 in flight per endpoint, 4 sessions per endpoint, and 120s each; reusing a JSON-RPC id that is
+still in flight is a 409. `GET /m/<secret>` is 405 — there is no server-initiated stream in v1,
+so clients see tool changes when they next poll `tools/list`.
+
+A refusal that a hosted client would otherwise swallow — offline, timeout, in flight, duplicate
+id — comes back as `200 {"jsonrpc":"2.0","id":…,"error":{"code":-32000,"message":…}}`, because an
+MCP client renders a JSON-RPC error and drops an HTTP error body. `initialize`, notifications, and
+401/404/413 keep their HTTP status, which is what makes a client re-authenticate or re-initialize.
 
 When the daemon socket drops, in-flight requests fail immediately with `502 daemon_offline`
 rather than waiting out their timeout, and the endpoint's sessions are gone with it.
