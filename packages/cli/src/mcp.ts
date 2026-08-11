@@ -142,6 +142,24 @@ export async function serveMcp(options: McpOptions): Promise<McpHandle> {
   // can still ask Douze what state it is in.
   sync()
 
+  /**
+   * The SDK declares the tools capability and installs the `tools/list` and `tools/call` handlers
+   * lazily, on the first `registerTool`. A surface that is empty at this point therefore connects
+   * with no tools capability at all and answers `tools/list` with "Method not found" for the life
+   * of the session — which is what a remote session sees when a hosted client is attached before
+   * the first site is recorded, because the remote surface carries recipe tools and nothing else.
+   * Registering one tool and removing it installs the handlers around an empty list, which is the
+   * honest answer to `tools/list` and the one a client can recover from once a recipe lands.
+   */
+  if (registered.size === 0) {
+    const placeholder = server.registerTool(
+      'douze_no_tools_yet',
+      { description: 'Placeholder, removed before this server accepts a connection.' },
+      () => ({ content: [] }),
+    ) as RegisteredTool
+    placeholder.remove()
+  }
+
   // AC-RUN-002.4 — a client that ignores listChanged still gets the current surface here, at
   // startup, because the surface is rebuilt from the registry rather than cached from install.
   const poll = setInterval(() => {

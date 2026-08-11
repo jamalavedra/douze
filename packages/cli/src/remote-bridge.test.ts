@@ -112,7 +112,7 @@ interface Frame {
   type: string
   sid?: string
   token?: string
-  message?: { id?: number; result?: unknown }
+  message?: { id?: number; result?: unknown; error?: { code: number; message: string } }
 }
 
 class FakeRelay {
@@ -300,6 +300,51 @@ describe('remote bridge session lifecycle (T-014.2)', () => {
     const frame = await relay.next((f) => f.type === 'mcp.message' && f.sid === 's6' && f.message?.id === 3)
     expect(frame.message?.result).toMatchObject({ serverInfo: { name: 'douze' } })
   }, 30_000)
+})
+
+/**
+ * Its own bridge, because the registry has to be empty: the remote surface carries recipe tools
+ * and nothing else, so a daemon with no approved recipes serves a session with no tools at all.
+ * Found in live use against the deployed relay — the MCP SDK installs the tools handlers on the
+ * first registerTool, so an empty surface used to connect with no tools capability and answer
+ * `tools/list` with "Method not found" for the life of the session. Anyone who attaches a hosted
+ * client before recording their first site hits exactly this.
+ */
+describe('a session whose registry has no approved tools yet', () => {
+  let relay: FakeRelay
+  let bridge: RemoteBridge
+
+  beforeAll(async () => {
+    relay = new FakeRelay()
+    const port = await relay.listening()
+    const empty = { registry: async () => ({ tools: [], errors: [], revision: 1 }) } as unknown as DaemonClient
+    bridge = startRemoteBridge(empty, {
+      url: `http://127.0.0.1:${port}`,
+      token: 'relay-token',
+      mcp_path: '/mcp/secret',
+      allow_writes: false,
+    }, '0.1.0')
+    await relay.next((f) => f.type === 'hello')
+    relay.send({ type: 'welcome', heartbeat_ms: 20_000 })
+  }, 20_000)
+
+  afterAll(() => {
+    bridge?.close()
+    relay?.close()
+  })
+
+  it('answers tools/list with an empty list rather than "Method not found"', async () => {
+    relay.send({ type: 'session.open', sid: 'empty' })
+    relay.send({ type: 'mcp.message', sid: 'empty', message: initialize(1) })
+    const init = await relay.next((f) => f.type === 'mcp.message' && f.sid === 'empty' && f.message?.id === 1)
+    // The capability has to be declared in the handshake or a client never asks in the first place.
+    expect((init.message?.result as { capabilities?: { tools?: unknown } })?.capabilities?.tools).toBeTruthy()
+
+    relay.send({ type: 'mcp.message', sid: 'empty', message: { jsonrpc: '2.0', id: 2, method: 'tools/list' } })
+    const listed = await relay.next((f) => f.type === 'mcp.message' && f.sid === 'empty' && f.message?.id === 2)
+    expect(listed.message?.error).toBeUndefined()
+    expect((listed.message?.result as { tools: unknown[] })?.tools).toEqual([])
+  }, 20_000)
 })
 
 /**

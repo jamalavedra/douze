@@ -430,10 +430,42 @@ account's stored browser profile into an issue.
 - The README release link still uses the `OWNER` placeholder and no release has been tagged, so
   install verification from published artifacts is not yet possible.
 - The browser harness assumes the fixed macOS Helium path and cannot run headless.
-- The remote relay (section D) has never been run against a real platform: no ChatGPT, claude.ai,
-  or Dust attach has been performed, no relay has been deployed, and the TLS-terminating deployment
-  it assumes is unverified. Its unit tests use a local relay process and a fake daemon socket.
-  There is also no server-initiated stream on that surface — `GET /m/<secret>` is 405 and a
+- The remote relay (section D) has never been attached to a real platform. A relay is now deployed
+  (see below) and the whole path has been exercised by a hand-written client speaking the same
+  streamable HTTP a platform speaks, but no ChatGPT, claude.ai, or Dust connector has been added,
+  so their client-side behaviour — whether they accept a non-SSE JSON response, how they render a
+  JSON-RPC error, what they do with a 404 session — is still assumption.
+- There is no server-initiated stream on the remote surface: `GET /m/<secret>` is 405 and a
   `notifications/tools/list_changed` arriving with no request waiting is counted and dropped, so a
   remote client sees new tools only when it next polls `tools/list`. That is a weaker guarantee
   than C-2 requires of the local path.
+- Cloudflare closes a proxied request at ~100 s while the relay holds one for 120 s, so a tool call
+  slower than that returns a Cloudflare error page instead of a JSON-RPC error the client can read.
+  Untested, because no call has yet taken that long.
+
+## Deployed relay (2026-08-11)
+
+One relay runs at `https://douze.jamalavedra.com`, a Cloudflare tunnel in front of a systemd user
+unit on `coolify-fsn1` bound to `127.0.0.1:9787` with `TRUST_PROXY=1`. It serves one bundled file,
+`~/douze-relay/index.js`, built by `pnpm --filter @douze/relay build`.
+
+Verified against it from a second machine, with a scratch `DOUZE_HOME` and a real daemon:
+
+| Check | Result |
+|---|---|
+| `POST /register`, `DELETE /register` over HTTPS | 201 then 204 |
+| WebSocket upgrade through Cloudflare | connected in 189 ms; `welcome` received |
+| `initialize` platform → relay → daemon | 164 ms, real `serverInfo`, session id issued |
+| `tools/list` routed by `Mcp-Session-Id` | answered from the daemon |
+| Unknown session, wrong secret path | 404 each, so a client re-initializes |
+| `daemon_version` carrying a newline | 400; nothing forged reached the log |
+| Daemon socket dropped | 503 immediately, no hang |
+| Remote surface with read + write + destructive approved | only the read tool listed |
+| `tools/call` on the destructive tool with `confirm: true` | refused, no target request |
+
+The relay log through all of it carried event names, durations, and endpoint hash prefixes only.
+
+That run found one defect, now fixed: the MCP SDK installs its tool handlers on the first
+`registerTool`, so a session whose registry had no approved tools connected with no tools
+capability and answered `tools/list` with "Method not found" for the life of the session — which
+is what a hosted client hits when it is attached before the first site is recorded.
