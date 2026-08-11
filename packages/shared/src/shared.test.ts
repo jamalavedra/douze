@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { findSurvivingSecrets, redactBody, redactHeaders, redactUrl } from './redact.js'
-import { isNoiseHost, shouldCapture } from './capture.js'
+import { AnnotationSpan, MAX_NOTE_CHARS, isNoiseHost, shouldCapture } from './capture.js'
 import { parseRecipe, serializeRecipe } from './recipe-file.js'
 import { RemoteRegistration } from './protocol.js'
 
@@ -391,6 +391,25 @@ describe('review findings — redaction gaps', () => {
 
   it('leaves a non-form string body alone', () => {
     expect(redactBody('just some prose')).toBe('just some prose')
+  })
+})
+
+describe('annotation length (WO-016)', () => {
+  const span = (note: string) => ({ id: 'a1', session_id: 's1', note, start_position: 0, end_position: 1 })
+
+  it('refuses a note long enough to make the tool surface undeliverable', () => {
+    expect(AnnotationSpan.safeParse(span('cancels the order and refunds the customer')).success).toBe(true)
+    expect(AnnotationSpan.safeParse(span('x'.repeat(MAX_NOTE_CHARS))).success).toBe(true)
+    // A note becomes sentence one of a tool description verbatim; the attachment protocol caps a
+    // description at 4096 characters and a host DROPS a frame it cannot parse, so an unbounded note
+    // is a surface that silently never arrives.
+    expect(AnnotationSpan.safeParse(span('x'.repeat(MAX_NOTE_CHARS + 1))).success).toBe(false)
+    expect(AnnotationSpan.safeParse(span('x'.repeat(5000))).success).toBe(false)
+    expect(MAX_NOTE_CHARS).toBeLessThan(4096)
+  })
+
+  it('still refuses an empty note', () => {
+    expect(AnnotationSpan.safeParse(span('')).success).toBe(false)
   })
 })
 

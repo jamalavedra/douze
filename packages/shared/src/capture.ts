@@ -62,11 +62,24 @@ export const Exchange = z.object({
   credentials: z.array(CredentialHint).default([]),
 })
 
-/** REQ-CAP-007 — a note covering every exchange captured since the previous note. */
+/**
+ * REQ-CAP-007 — a note covering every exchange captured since the previous note.
+ *
+ * The cap is a trust boundary, not tidiness. A note becomes sentence one of the tool description
+ * verbatim, the attachment protocol caps a tool description at 4096 characters, and a host DROPS a
+ * frame that fails to parse — so an unbounded note is an unbounded description is a surface that
+ * silently never arrives and a client that sees no tools and no error. Refused here at the point of
+ * entry, where the user is still looking at what they typed; the description path truncates as
+ * well, because this is not the only way text reaches it.
+ *
+ * 500 characters is several sentences of intent, which is all a note is for.
+ */
+export const MAX_NOTE_CHARS = 500
+
 export const AnnotationSpan = z.object({
   id: z.string(),
   session_id: z.string(),
-  note: z.string().min(1),
+  note: z.string().min(1).max(MAX_NOTE_CHARS),
   start_position: z.number().int().nonnegative(),
   /** `end < start` denotes an empty span — a note attached with nothing captured since the last. */
   end_position: z.number().int().min(-1),

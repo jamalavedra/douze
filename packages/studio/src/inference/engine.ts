@@ -5,7 +5,7 @@ import { disambiguate, nameCandidate } from '../descriptions/naming.js'
 import { score } from './confidence.js'
 import { graphqlVariables, hasGraphqlErrors, isGraphqlExchange, splitOperations } from './graphql.js'
 import { detectPagination, primaryPayloadPath, resolvePath, withRawParam } from './payload.js'
-import { inferSchema, mergeSchemas, stability } from './schema.js'
+import { coerceNumericValues, inferSchema, mergeSchemas, stability } from './schema.js'
 import { classify } from './side-effects.js'
 import { addressesOneRecord, groupEndpoints, queryParams, type EndpointGroup } from './templating.js'
 
@@ -53,7 +53,12 @@ function restCandidate(group: EndpointGroup, spans: AnnotationSpan[]): Candidate
   const inputSchema = withRawParam(
     // The pagination parameter is driven by the runtime, so it is never required of the caller
     // even when every observation happened to carry it (AC-INF-005.2).
-    optional(mergeSchemas(pathParamSchema(params), inferSchema(queries), inferSchema(bodies)), pagination?.param),
+    optional(
+      // A query value is a string in the URL and a number in the schema when it plainly is one,
+      // which is what gives `limit` a ceiling at all.
+      mergeSchemas(pathParamSchema(params), inferSchema(queries.map(coerceNumericValues)), inferSchema(bodies)),
+      pagination?.param,
+    ),
   )
   const payloadPath = primaryPayloadPath(responses)
   const outputSchema = inferSchema(responses.map((body) => resolvePath(body, payloadPath)))
