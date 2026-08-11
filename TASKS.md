@@ -401,6 +401,77 @@ per-client adapters.
 
 ---
 
+## WO-015 — Extension-only: the extension becomes the whole product (PLANNED)
+
+Decided 2026-08-11. A consumer with no terminal has nothing that starts douzed: the `.mcpb` was
+doing that job by proxy, because Claude Desktop spawns `douze --mcp` and that process hosts the
+daemon. Dropping `.mcpb` therefore means dropping the daemon, and the extension — which already
+captures, redacts, and executes — takes over storage, recipes, inference, review, and the relay
+connection. One Web Store install, no Node, no terminal, no launcher, no code signing.
+
+### What three spikes established (2026-08-11)
+
+- **The MCP SDK runs under MV3.** It selects ajv (which uses `new Function`) only under Node export
+  conditions; a browser-target bundle resolves `@cfworker/json-schema`, a pure interpreter. Verified
+  by bundling `McpServer` for the browser and running initialize/tools/list/tools/call under
+  `node --disallow-code-generation-from-strings`, which imposes MV3's restriction. ~230 KB minified
+  (~530 KB if `incur` comes along, which it need not — the extension can register tools straight
+  from the registry). Guard the build with a grep for `new Function` in the worker bundle: a
+  bundler config that forces Node conditions would silently swap ajv back in.
+- **Session state cannot live in the worker.** Chrome evicts service workers at will and an
+  incoming WebSocket frame cannot wake a dead one — only extension events can, and `chrome.alarms`
+  has a 30-second floor. An in-flight call cannot be persisted. **Therefore the relay owns MCP
+  sessions**: it terminates `initialize` and `tools/list` from a tool surface the extension pushes
+  on connect, and forwards only `tools/call`. The extension stays a stateless executor that
+  reconnects, which is what its 20 s heartbeat and reconnect alarm already do. This also fixes a
+  user-visible case: a connector added while Chrome is closed would otherwise list zero tools.
+  Consequence to disclose: **the relay now holds tool names, descriptions, and schemas** per user,
+  which its log discipline deliberately excludes today.
+- **Most logic is portable.** Inference is pure TS. Descriptions already default to a deterministic
+  template with no model call (Q3: the offline proxy scores 96.4% against a ≥90% bar; the model
+  path's headroom is 100%), so shipping template-only is defensible and the model path can return
+  behind an options page. The review UI is one self-contained HTML string and becomes an extension
+  page, which deletes the expired-link failure mode entirely.
+
+### What it costs, recorded before starting rather than discovered later
+
+- **Local stdio MCP dies.** An extension cannot speak stdio or listen on a port, and native
+  messaging needs a local binary — a daemon by another name. Claude Desktop, Claude Code, Cursor,
+  VS Code and Windsurf would attach through the relay instead, inheriting WO-014's scoping: reads
+  always, writes only on `--allow-writes`, **destructive never, with no configuration that puts
+  them back**, plus a third party in the data path where there was a 1.2 ms loopback hop. This is
+  the sharpest regression in the port and it lands on the audience that exists today.
+- **Gone outright:** headless mode (definitionally — it exists to run with Chrome closed), the CLI,
+  `.mcpb`, eject as it stands, hand-editable git-diffable recipe YAML, `tail`-able audit files, and
+  doctor's git-commit patches.
+- **Needs replacement, not porting:** SQLite → IndexedDB, the recipes directory → extension
+  storage, JSONL audit → a stored ring buffer with a viewer.
+- **Test blast radius:** ~190 unit tests and all 51 e2e specs are invalidated or need a new
+  extension-only harness. The current architecture has never passed C-1 either, so this rewrites the
+  local half before the product has been proven once against a real dashboard.
+
+### The variant that keeps the developer path (decide at the end of phase 1, not now)
+
+Phase 1 is identical either way, so it does not block: the extension becomes self-sufficient and
+consumers install nothing else. Afterwards the daemon can either be deleted outright, or shrink to
+a **thin transport shim** — no storage, no registry, no inference, ~200 lines — that a developer
+installs deliberately and the extension dials on loopback exactly as it dials the relay, restoring
+local stdio MCP with full trust and no cloud in the path. That is a smaller daemon, not a second
+implementation of anything.
+
+### Tasks
+
+- [ ] T-015.1 — Extension storage: IndexedDB for sessions/exchanges/annotations replacing `capture-store.ts`, keeping **one** write path that re-applies redaction and throws on `findSurvivingSecrets` — the gate exists because HAR import bypasses the extension's own redaction, so any future ingest must route through it too.
+- [ ] T-015.2 — Recipes and fixtures in extension storage replacing `registry.ts`, with `storage.onChanged` as the hot-reload signal and `parseRecipe` unchanged.
+- [ ] T-015.3 — Port the inference engine and deterministic descriptions into the extension; model descriptions behind an options page, absent by default.
+- [ ] T-015.4 — Review as an extension page reusing `app.ts`; the connect page from the abandoned no-terminal branch (`worktree-agent-ac11a15a706492d83`) ports here.
+- [ ] T-015.5 — Extension-side execution guards: destructive confirm, degraded refusal, per-tool rate limit, timeout, session-expiry classification, result shaping, audit — all currently daemon-owned and all of which must run before dispatch on every inbound path.
+- [ ] T-015.6 — Relay-owned sessions: the relay answers `initialize`/`tools/list` from a surface the extension pushes on connect and forwards `tools/call`; extension bridge with reconnect on `chrome.alarms`; relay grace period (~35–45 s) for a waking worker, and **never** auto-re-execute a call in flight at disconnect.
+- [ ] T-015.7 — Pairing without a terminal: connect/rotate/disconnect from an extension page, credential in extension storage.
+- [ ] T-015.8 — New e2e harness driving the extension with no daemon, replacing the 51 specs that boot douzed.
+
+---
+
 ## Open Questions (PRD 5.3 — resolve during implementation)
 
 - [x] Q1 — **RESOLVED (verified)**: incur's `Mcp.serve()` does NOT support mid-session re-registration — `collectTools` snapshots once at connect. The escape hatch works and was executed end-to-end: `Cli.toCommands` (live Map) + `Mcp.collectTools` + `Mcp.callTool` + own `McpServer`, whose `registerTool()` handle fires `notifications/tools/list_changed` automatically. Original question: Does incur support re-registering tools mid-session and emitting `listChanged`? Spike in M0 (T-008.1). Fallback: a thin wrapper that re-emits `tools/list` on reload.
