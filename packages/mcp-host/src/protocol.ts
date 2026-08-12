@@ -20,7 +20,7 @@ import { HEARTBEAT_MS, SideEffect } from '@douze/shared'
  * The extension deliberately does NOT take this off the frame. It derives its own level from what
  * it dialled, because a host that lies would otherwise talk itself into destructive tools; this
  * field tells the extension what the host believes, and the guards decide anyway. See the trust
- * table in TASKS.md.
+ * table in packages/extension/src/guards.ts.
  */
 export const Trust = z.enum(['local', 'remote'])
 export type Trust = z.infer<typeof Trust>

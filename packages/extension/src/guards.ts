@@ -16,7 +16,7 @@ import type { SurfaceTool } from './recipes.js'
  * policy: a pipe that grew policy would be a second copy of it. This module is its only home, and
  * the trust it reads is the one `attach.ts` derived from what it dialled — never the frame's.
  *
- * The trust table (TASKS.md, WO-015) is enforced twice, and both halves are required:
+ * The trust table is enforced twice, and both halves are required:
  *
  * | | `remote` | `local` |
  * |---|---|---|

@@ -126,6 +126,12 @@ Click the Douze icon, then **Connect**. The page gives you one URL with a copy b
 | claude.ai | Settings → Connectors → Add custom connector |
 | Dust | Admin → Tools → Add MCP server |
 
+**The relay Douze offers by default is not a company.** It is `https://douze.jamalavedra.com`, a
+personal server run by Jaume Alavedra, who wrote Douze — no organisation behind it and no agreement.
+Whoever runs a relay can read and alter every message that crosses it, which for Douze means your
+tool arguments and your full result bodies. Run your own and type its address into the connect page
+if that matters to you; `packages/relay/README.md` is the whole of what you need.
+
 Where the client asks how to sign in, choose **no authentication**. ChatGPT's dialog offers OAuth
 first and it will not work — the relay has no OAuth endpoints and nothing to log in to. The URL is
 the whole credential.
@@ -150,6 +156,10 @@ If an assistant says it has no tool for something you just recorded, tell it to 
 skills and then run it*. That works with no refresh, on either platform. It is not a way around
 anything: a skill run this way goes through the same trust table as a direct call — reads always,
 changes only if you allowed them, deleting never from a hosted assistant.
+
+Douze bundles the ChatGPT, Claude and Dust marks to label those instructions, and self-hosts them so
+that opening the page tells nobody you did. Those marks belong to OpenAI, Anthropic and Dust; Douze
+is not affiliated with, endorsed by, or connected to any of them.
 
 **That URL is the password.** Anyone holding it can call your tools. The relay keeps only a hash of
 it, and Douze sends it nowhere else — but a URL in a chat log or a screenshot is a URL someone else
@@ -450,5 +460,10 @@ Terminate TLS in front of it — it speaks plain HTTP and assumes anything reach
 already inside the terminator. `packages/relay/README.md` has the HTTP API, the env vars, the
 session rules, and what the logs are allowed to carry.
 
-See `TASKS.md` for the task and verification tracker, and `INTERN_VERIFICATION.md` for how to verify
-a build.
+To verify a build yourself: `pnpm -r test` for the unit suites and `pnpm verify:e2e` for the
+end-to-end ones, which drive a real browser against a fixture app — `e2e/README.md` explains what
+each spec proves.
+
+## Licence
+
+MIT — see [LICENSE](LICENSE).
