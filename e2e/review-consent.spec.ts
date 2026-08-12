@@ -8,7 +8,6 @@ import { launchHelium } from './harness.js'
  */
 test('the consent panel is collapsed and stays inside its box', async () => {
   const browser = await launchHelium()
-  const out = '/private/tmp/claude-501/-Users-jamalavedra-Projects-douze/0ec78a82-671d-4570-8f84-6e9a441c83c0/scratchpad'
   const tab = await browser.context.newPage()
   await tab.goto(`chrome-extension://${browser.extensionId}/review.html?session=x`)
   const value =
@@ -29,7 +28,7 @@ test('the consent panel is collapsed and stays inside its box', async () => {
   const collapsed = await tab.evaluate(() => (document.getElementById('credentials') as HTMLDetailsElement).open)
   expect(collapsed).toBe(false)
   await tab.setViewportSize({ width: 420, height: 900 })
-  await tab.screenshot({ path: `${out}/consent-collapsed.png`, fullPage: true })
+  await tab.screenshot({ path: test.info().outputPath('consent-collapsed.png'), fullPage: true })
 
   await tab.evaluate(() => ((document.getElementById('credentials') as HTMLDetailsElement).open = true))
   await tab.waitForTimeout(300)
@@ -40,7 +39,7 @@ test('the consent panel is collapsed and stays inside its box', async () => {
     return { value: row.getBoundingClientRect().right, panel: box.getBoundingClientRect().right }
   })
   expect(overflow.value).toBeLessThanOrEqual(overflow.panel)
-  await tab.screenshot({ path: `${out}/consent-open.png`, fullPage: true })
+  await tab.screenshot({ path: test.info().outputPath('consent-open.png'), fullPage: true })
 
   // --- a skill description written from the recorded site --------------------
   /**
@@ -68,7 +67,7 @@ test('the consent panel is collapsed and stays inside its box', async () => {
   }))
   expect(laidOut.scroll).toBeLessThanOrEqual(laidOut.client)
   expect(laidOut.card).toBeLessThanOrEqual(laidOut.main + 1)
-  await tab.screenshot({ path: `${out}/skills-wrapped.png`, fullPage: true })
+  await tab.screenshot({ path: test.info().outputPath('skills-wrapped.png'), fullPage: true })
 
   await browser.dispose()
 })

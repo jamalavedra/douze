@@ -40,11 +40,11 @@ With `RELAY_STATE` set, one JSON file, mode `0600`, holding one row per endpoint
 | `tokenHash` | SHA-256 of the endpoint token. Not the token. |
 | `secretHash` | SHA-256 of the URL secret. Not the secret, so the file cannot be turned into a working link. |
 | `bearerHash` | SHA-256 of the optional platform bearer, base64, or `null`. |
-| `label` | The first 8 hex of `tokenHash` — the same identifier the log uses. |
-| `lastAttached` | When the extension was last seen, so the reaper starts from something sane. |
 
-Nothing else. No tool names, no descriptions, no schemas, no session ids, no payloads, no caller
-addresses. Every credential is stored as the digest it is held as in memory, so the file yields no
+Nothing else — three hashes per endpoint and no fourth field. No tool names, no descriptions, no
+schemas, no session ids, no payloads, no caller addresses. The label the log prints is derived from
+`tokenHash` at load rather than stored, and the reaper starts every restored endpoint from now, so
+neither needed keeping. Every credential is stored as the digest it is held as in memory, so the file yields no
 more to an attacker who reads it than a memory dump does — which is the property the paragraph
 above claims, now applying to both.
 

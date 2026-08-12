@@ -41,10 +41,13 @@ export const CredentialSource = z.discriminatedUnion('kind', [
    * x.com's `authorization` bearer is the case: a public application constant in its JS bundle,
    * identical for every visitor, and without it every call is refused 403.
    *
-   * This is the one credential source that stores a VALUE, so two things follow. A skill using one
-   * stops working if the site rotates it, and re-recording is the fix. And the value is in the
-   * recipe: `exportAll` will write it to a file, so such a file is yours and not something to send
-   * anyone — which is why nothing offers to share it.
+   * A skill using one stops working if the site rotates the token, and re-recording is the fix.
+   *
+   * Nothing that RECORDS a site puts one here: the extension keeps an approved value per origin in
+   * `auth:literals` and re-reads it at call time (`approvedLiterals` in extension/src/relay.ts), so
+   * an exported skills file still carries no credential. This slot exists for a recipe written or
+   * imported by hand, which is the one path that can carry a value — and the write gate exempts
+   * exactly this field for it (`APPROVED_LITERAL` in redact.ts).
    */
   z.object({
     kind: z.literal('literal'),

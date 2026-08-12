@@ -254,10 +254,7 @@ async function load(): Promise<void> {
   state = await send<ReviewState>({ type: 'douze:review:load', sessionId: SESSION })
   const names = new Set(state.candidates.map((candidate) => candidate.name))
   for (const name of chosen) if (!names.has(name)) chosen.delete(name)
-  // Seed once so an edit/reload does not undo a choice the user already made.
-  //
-  // Reads only. Pre-selecting everything meant one click on the primary button approved a delete
-  // the user had never read — the same thing AC-REC-002.3 refuses to do through the bulk API.
+  // Seed once so an edit or a reload does not undo a choice the user already made.
   if (!seeded) {
     seeded = true
     /**

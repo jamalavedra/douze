@@ -42,3 +42,8 @@ jobs:
 
       - name: Test
         run: pnpm -r test
+
+      # Built here as well as at tag time: without this a build break reaches a release without any
+      # pull request going red, because `release.yml` is the only other place that builds.
+      - name: Build
+        run: pnpm -r build

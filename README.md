@@ -24,7 +24,8 @@ This is the part worth reading carefully.
   stores them: while you record, full request and response bodies go into the extension's own
   database, and turning a skill on keeps one complete exchange as that skill's example answer.
   Passwords, cookies, tokens and anything else shaped like a credential are stripped before
-  anything is written. A customer's name, their email address, their order — those are not, and
+  anything is written — with one exception, which Douze always shows you and asks about by name.
+  See *A token the site hardcodes* below. A customer's name, their email address, their order — those are not, and
   they stay in this browser until you delete the recording on the Douze data page. Only the
   inferred schema is a "shape"; the example is the real thing.
 - **Where a site keeps its tokens, Douze learns the LOCATION, never the value.** Many sites need a
@@ -66,9 +67,11 @@ This is the part worth reading carefully.
   themselves, so every result a tool hands them goes on to their own model provider — at full
   trust, destructive results included. What stays on your computer is Douze. What your assistant
   does with an answer is your assistant's business, wherever it runs.
-- **Nothing runs without your say-so.** Actions are off until you turn them on, one at a time.
-  Anything that deletes or refunds asks you to confirm every single time — and a hosted assistant
-  cannot run one at all.
+- **You choose what it may do, and deleting is the line.** A hosted assistant can look things up
+  and make changes on the sites you recorded from the moment you connect it; set that link back to
+  read-only whenever you like. Deleting is never possible from one at all. An app paired on this
+  computer can delete, and the confirmation that guards it comes from the app doing the calling
+  rather than from a dialog Douze shows you — so pair only apps you trust with that.
 
 ## Setting it up
 
@@ -160,9 +163,9 @@ action in Douze that sends your data off the machine.
 | | Hosted assistant (relay) | Local app (bridge) |
 |---|---|---|
 | look things up | always | always |
-| make changes | only if you turn it on, per link | always |
+| make changes | **yes, from the start** — turn it off per link if you would rather not | always |
 | delete or destroy things | **never**, and no setting turns it on | allowed, with `confirm: true` |
-| results that look like credentials | withheld unless you allow that tool | withheld unless you allow that tool |
+| results that look like credentials | the value is masked, the rest of the answer goes through | same |
 
 The asymmetry is deliberate. A destructive tool protects itself by demanding a `confirm: true`
 argument — but an argument is something any caller can send, so it is consent, not a lock, and it
@@ -275,7 +278,7 @@ loopback bridge the user paired is `local`; everything else is `remote`.
 | | `remote` (relay) | `local` (bridge) |
 |---|---|---|
 | read tools | always | always |
-| write tools | opt-in per attachment | always |
+| write tools | on by default per attachment, revocable | always |
 | destructive tools | never, no setting restores them | allowed, `confirm: true` required |
 | result secret gate | enforced, per-tool `expose` to exempt | enforced, per-tool `expose` to exempt |
 
@@ -383,7 +386,7 @@ tools:
       primary_payload_path: $.data.orders
 ```
 
-Constraints the schema enforces on load: no credential value may appear anywhere in the document,
+Constraints the schema enforces on load: no credential value may appear anywhere in the document except an `auth.credential_source` entry of `kind: literal`, which exists to carry a token the site hardcodes,
 tool names are unique within a recipe, every approved tool references at least one fixture, and an
 approved `destructive` tool must require a `confirm` parameter. A recipe that fails to parse never
 reaches storage, and the last good version keeps serving.
