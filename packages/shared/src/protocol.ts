@@ -83,18 +83,23 @@ export class DouzeError extends Error {
  * WO-015 T-015.13 — the opaque `mcp.message` frames this file used to carry alongside it are
  * gone with the daemon. `@douze/mcp-host` owns the attachment protocol that replaced them, and
  * owns it in one place precisely so the relay and the bridge cannot drift apart.
+ *
+ * `daemon_version` is REQUIRED, and it is what separates our registration from somebody else's:
+ * `/register` is the path an MCP client falls back to for OAuth dynamic client registration when
+ * discovery finds nothing, so a body without it is an OAuth client and not a Douze one.
  */
 export const RemoteRegistration = z.object({
-  daemon_version: z
-    .string()
-    .regex(/^[\w.+-]{1,32}$/)
-    .optional(),
+  daemon_version: z.string().regex(/^[\w.+-]{1,32}$/),
   bearer_token: z.string().max(512).optional(),
 })
 export type RemoteRegistration = z.infer<typeof RemoteRegistration>
 
-/** WO-014 — concurrent platform sessions the relay serves per endpoint before refusing another. */
-export const REMOTE_MAX_SESSIONS = 4
+/**
+ * Concurrent platform sessions per endpoint; at the cap the relay evicts the least recently used
+ * one rather than refusing the new client, because refusing deadlocks a client whose session has
+ * expired. Eight, not four: one link pasted into two assistants reached four within seconds.
+ */
+export const REMOTE_MAX_SESSIONS = 8
 
 /** WO-014 — the relay drops a platform session idle for this long. */
 export const REMOTE_SESSION_IDLE_MS = 600_000

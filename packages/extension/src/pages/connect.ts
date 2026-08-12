@@ -1,4 +1,5 @@
 import type { ConnectCommand, ConnectState } from '../messages.js'
+import { applyTheme, mountThemeSwitch } from './theme.js'
 
 /**
  * WO-015 T-015.4/10 — #ConnectPage, and the whole reason the extension-only port exists: somebody
@@ -115,10 +116,14 @@ let state: ConnectState = {
   tools: [],
   exposed: { local: [], remote: [] },
   bridge: 'unpaired',
+  stale: false,
 }
 let pending: ConfirmSpec | null = null
 
 const byId = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T
+
+applyTheme()
+mountThemeSwitch(document.getElementById('theme'))
 const fail = (sentence: string): void => {
   byId('error').textContent = sentence
 }
@@ -168,9 +173,13 @@ function render(): void {
   byId('writes').textContent = state.allow_writes ? 'Go back to read-only' : 'Allow changes too'
   byId('link-state').textContent = !state.configured
     ? 'Not shared with anything yet.'
-    : state.connected
-      ? 'Shared, and Douze has a live connection right now.'
-      : 'Shared, but Douze has no connection at the moment. It keeps trying on its own; the link stays the same.'
+    : state.stale
+      ? // Not "no connection at the moment": the relay has forgotten this endpoint, Douze has
+        // stopped dialling it, and no amount of waiting brings it back. Only a new link does.
+        'This link no longer works — the relay has forgotten it. Get a new one and paste it in again.'
+      : state.connected
+        ? 'Shared, and Douze has a live connection right now.'
+        : 'Shared, but Douze has no connection at the moment. It keeps trying on its own; the link stays the same.'
   byId('bridge-state').textContent = BRIDGE_SENTENCE[state.bridge]
   // Nothing to withdraw when nothing was ever granted. `refused` still has a stored block to clear.
   byId<HTMLButtonElement>('unpair').disabled = state.bridge === 'unpaired'
@@ -206,6 +215,8 @@ function renderExposed(): void {
   const none = state.tools.length === 0
   select.disabled = none
   select.hidden = none
+  // With the box gone, its label was left naming a control that is not there.
+  byId('expose-tool-label').hidden = none
   byId('expose-empty').hidden = !none
   byId<HTMLButtonElement>('expose-local').disabled = none
   byId<HTMLButtonElement>('expose-remote').disabled = none

@@ -25,7 +25,13 @@ export const CREDENTIAL_HEADERS = [
 
 /** AC-CAP-005.2 — body keys whose values are always replaced, matched case-insensitively. */
 export const SECRET_FIELDS = [
+  // Matching is `normalized.includes(entry)`, which runs the wrong way for an abbreviation — so
+  // `pwd` needs its own entry, and the spelled-out forms below avoid colliding with ordinary
+  // fields (`pin` is inside `shipping_address`). A human password has no shape the value rules
+  // catch, so the field name is all that stands here.
   'password',
+  'pwd',
+  'passwd',
   'token',
   'secret',
   'apikey',
@@ -36,6 +42,14 @@ export const SECRET_FIELDS = [
   'private_key',
   'session',
   'credential',
+  // One-time codes and card data: short, all digits, invisible to an entropy rule that wants a
+  // letter. Normalisation drops `-` and `_`, so `pincode` still catches `pin_code`.
+  'otp',
+  'mfa',
+  'cvv',
+  'cvc',
+  'pincode',
+  'cardnumber',
 ]
 
 export interface RedactionConfig {
@@ -102,6 +116,17 @@ export function redactHeaders(
  */
 const FORM_BODY = /^(?:[\w.[\]%+-]+=[^&]*)(?:&[\w.[\]%+-]+=[^&]*)*$/
 
+/**
+ * `FORM_BODY` alone matches padded base64 — `GjgK…==` is a "field" with an empty value — and that
+ * cost more than a false positive. Treated as a form, an opaque blob was walked field by field,
+ * nothing matched, and it was neither redacted nor flagged: a credential-shaped value would have
+ * been persisted verbatim, where before this it was at least refused.
+ *
+ * Base64 padding only ever trails, so a string whose only `=` is at the end is not a form. One
+ * field (`q=hello`) still is, and so is a trailing empty field (`a=b&c=`).
+ */
+const isFormBody = (value: string): boolean => FORM_BODY.test(value) && value.replace(/=+$/, '').includes('=')
+
 export function redactFormBody(body: string, config: RedactionConfig = defaultRedaction()): string {
   const params = new URLSearchParams(body)
   let changed = false
@@ -117,9 +142,7 @@ export function redactFormBody(body: string, config: RedactionConfig = defaultRe
 
 /** Walks any JSON value, replacing values whose *key* matches the secret-field list. */
 export function redactBody(body: unknown, config: RedactionConfig = defaultRedaction()): unknown {
-  if (typeof body === 'string' && body.includes('=') && FORM_BODY.test(body)) {
-    return redactFormBody(body, config)
-  }
+  if (typeof body === 'string' && isFormBody(body)) return redactFormBody(body, config)
   // A credential under an innocuous key name — `publishableKey`, `clientId`, an id field holding
   // a JWT. Redacting by key alone left these in place and the write gate then REFUSED the whole
   // exchange, so a dashboard that hands out API keys (which is most developer consoles) recorded
@@ -236,9 +259,22 @@ export function redactUrl(url: string, config: RedactionConfig = defaultRedactio
  * still catches is a document that reached a persistence boundary without passing through them.
  * Returns the JSON paths of anything suspicious; an empty array means the write may proceed.
  */
+/**
+ * The two fields that legitimately hold a credential VALUE, and the only exemption in this file.
+ *
+ * Some sites authorise a request with a token that lives nowhere Douze can re-read — x.com hardcodes
+ * its `authorization` bearer in its own JavaScript bundle. The only way to send one is to keep it,
+ * so `kind: 'literal'` does, and these gates must not then refuse the document that carries it.
+ *
+ * Matched on the PATH rather than on a `kind` key, so a captured response body that happens to
+ * contain `{kind:'literal',value:'…'}` cannot hide a token from the gate: only a credential source
+ * or a capture hint, at its own index, is exempt.
+ */
+const APPROVED_LITERAL = /(?:\.credentials|\.credential_source)\[\d+\]\.value$/
+
 export function findSurvivingSecrets(value: unknown, path = '$', seen = new WeakSet<object>()): string[] {
   if (isPlaceholder(value)) return []
-  if (typeof value === 'string') return looksLikeCredential(value) ? [path] : []
+  if (typeof value === 'string') return looksLikeCredential(value) && !APPROVED_LITERAL.test(path) ? [path] : []
   if (value === null || typeof value !== 'object') return []
   /**
    * A YAML anchor can make a document contain itself (`a: &x { b: *x }`), and a walk with no
@@ -253,7 +289,13 @@ export function findSurvivingSecrets(value: unknown, path = '$', seen = new Weak
     // A key is as readable off disk as a value. `{"<jwt>": {...}}` is an ordinary shape for a
     // map keyed by session or token, and walking values alone let one through both this gate
     // and the redactors, which is the one thing this function exists to make impossible.
-    ...(looksLikeCredential(k) ? [`${path}.${k} (key)`] : []),
+    //
+    // The key is REPLACED in the path it reports. These strings name where a secret was found,
+    // and the caller puts that name in the refusal it sends back — `gateResult` in the
+    // extension's guards.ts hands it to a hosted assistant over the relay. Reporting the key
+    // verbatim meant the gate transmitted, to a remote party, the exact credential it had just
+    // refused to send. The path has to stay useful to a human without carrying the value.
+    ...(looksLikeCredential(k) ? [`${path}.${placeholder(k)} (key)`] : []),
     ...findSurvivingSecrets(v, `${path}.${k}`, seen),
   ])
 }
@@ -309,12 +351,36 @@ function looksLikeCredential(value: string): boolean {
     const parsed = parseJson(value)
     if (parsed !== undefined) return findSurvivingSecrets(parsed).length > 0
   }
-  // A long, unbroken, mixed-alphabet run with no spaces reads as a token rather than prose.
+  /**
+   * A form-encoded body, judged by its fields for that same reason and the third case of it. This
+   * was missing, and it is what made the redactor and this function disagree: `redactBody` treats
+   * such a string as a form, so `user=ada&session=«redacted…»` came back with the secret gone — and
+   * this function then read the whole line as one value, tripped the entropy rule, and refused the
+   * exchange anyway. Every X GraphQL POST landed here.
+   */
+  if (isFormBody(value)) {
+    // The same condition `redactFormBody` applies, `isPlaceholder` included — a `session` field
+    // whose value has already been replaced is not a survivor, and treating the key name alone as
+    // one refused the very exchange redaction had just cleaned.
+    return [...new URLSearchParams(value)].some(
+      ([key, field]) => (matches(key, SECRET_FIELDS) || looksLikeCredential(field)) && !isPlaceholder(field),
+    )
+  }
+  // A long, unbroken, mixed-alphabet run with no spaces reads as a token rather than prose —
+  // unless it is a UUID, which is a published identifier and the single most common shape of one.
+  // `pol_4f8a2c1e-9b3d-4a7f-8e21-77c0d5b6a913` is 40 characters of mixed alphabet with no spaces,
+  // so the rule below caught every row a REST list endpoint returned, and the gate withheld whole
+  // tool results over the `id` field. A credential that happens to be a UUID is still caught, by
+  // its key: `session`, `token` and the rest are matched by name before any value is judged.
+  if (UUIDISH.test(value)) return false
   if (value.length >= 40 && !/\s/.test(value) && /[A-Za-z]/.test(value) && /\d/.test(value)) {
     return shannonEntropy(value) > 3.5
   }
   return false
 }
+
+/** A UUID, with or without the short resource prefix APIs put in front of one. */
+const UUIDISH = /^(?:[A-Za-z][A-Za-z0-9]{0,11}_)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 const decodePart = (part: string): string => {
   try {
@@ -361,6 +427,22 @@ function urlParts(parsed: URL): string[] {
     ...(parsed.password ? [decodePart(parsed.password)] : []),
     ...(fragment ? [...fragment.keys(), ...fragment.values()] : opaque ? [opaque] : []),
   ]
+}
+
+/**
+ * A route as `provenance` carries it: a path with no origin, `/projects/pk_live_…/settings`.
+ *
+ * `redactUrl` already replaces a credential-shaped path segment and says why, but it needs an
+ * absolute URL and returns a bare path untouched — and nothing redacted `provenance` at all while
+ * `findSurvivingSecrets` walked it like every other field. On a dashboard whose own URLs carry a
+ * project key that refused every exchange in a session, at `$.provenance.route`, silently.
+ */
+const ROUTE_BASE = 'https://route.invalid'
+
+export function redactRoute(route: string, config: RedactionConfig = defaultRedaction()): string {
+  const absolute = new URL(route, ROUTE_BASE)
+  const redacted = redactUrl(absolute.href, config)
+  return redacted.startsWith(ROUTE_BASE) ? redacted.slice(ROUTE_BASE.length) : redacted
 }
 
 function shannonEntropy(value: string): number {

@@ -27,6 +27,26 @@ This is the part worth reading carefully.
   anything is written. A customer's name, their email address, their order — those are not, and
   they stay in this browser until you delete the recording on the Douze data page. Only the
   inferred schema is a "shape"; the example is the real thing.
+- **Where a site keeps its tokens, Douze learns the LOCATION, never the value.** Many sites need a
+  token on every request beyond the cookie the browser sends. Douze can find one in a readable
+  cookie, in `localStorage`/`sessionStorage`, or in a `<meta name="csrf-token">` tag, and it records
+  *where* it lives so it can re-read the current value at the moment a skill runs. A site that
+  hardcodes a token in its own JavaScript — x.com does — is out of reach, and a skill that needs one
+  will be refused with a 403 that says so.
+- **A token the site hardcodes is kept only if you say so.** Some sites authorise every request with a
+  fixed token embedded in their own JavaScript — x.com does, and refuses every call without it. There
+  is nowhere to re-read that from, so using the site means keeping a copy. Douze will not do that
+  behind your back, because no rule can tell a public application token from your own session token:
+  both are just strings in an `authorization` header. So the value waits in memory, the review page
+  shows it to you in full, and you decide. Say no and it is gone when you close the browser. Say yes
+  and the copy is kept for that one site — never in a skills file, so what you export still contains
+  no credentials.
+- **One kind of cookie is read, and only its name is kept.** Some sites authorise a request with a
+  CSRF token they keep in a cookie the page itself can read — X does this, and refuses every call
+  whose `x-csrf-token` does not match its `ct0` cookie. Douze records *where* that value lives, by
+  name, and re-reads it from the page at the moment it runs. The cookie that actually carries your
+  session is `HttpOnly`: the browser sends it, and Douze cannot read it and never tries. What ends
+  up in a skill is `document.cookie["ct0"]`, never a value.
 - **Your password is never involved.** You never type it into Douze. Douze never asks for one.
 - **No cookie or login is stored, copied, or sent anywhere.** Not to us, not to the assistant, not
   to disk.
@@ -81,8 +101,9 @@ deleting it turns Douze off.
    order, file a ticket, whatever it is. Doing it twice or three times helps Douze get it right.
 4. Click **Done**. A review page opens.
 5. You'll see a plain-English list of what Douze saw, grouped into "Look things up", "Make changes"
-   and "Remove things". Turn on the ones you want allowed, and leave the rest off. Reads are the
-   only group Douze will bulk-enable for you.
+   and "Remove things". All of it is selected — turn off anything you would rather it could not do.
+   Anything that removes things still asks you to confirm every single time it runs, and a hosted
+   assistant cannot run one at all.
 
 That's it. The abilities are live in the extension from that moment; assistants pick them up within
 seconds without restarting anything.
@@ -98,9 +119,34 @@ Click the Douze icon, then **Connect**. The page gives you one URL with a copy b
 
 | Client | Where |
 |---|---|
-| ChatGPT | Settings → Connectors → Developer Mode → add a connector |
+| ChatGPT | Settings → Plugins → Developer mode, turn it on. Then Settings → Plugins → the **+** beside the search box |
 | claude.ai | Settings → Connectors → Add custom connector |
 | Dust | Admin → Tools → Add MCP server |
+
+Where the client asks how to sign in, choose **no authentication**. ChatGPT's dialog offers OAuth
+first and it will not work — the relay has no OAuth endpoints and nothing to log in to. The URL is
+the whole credential.
+
+### When a new skill doesn't show up
+
+Record a site and its tools are live in seconds — but ChatGPT and claude.ai both freeze a
+connector's tool list, so they may not notice. ChatGPT re-reads it only when you press **Refresh**
+on the app's details page (Settings → Plugins → Douze), and the new tools then arrive **switched
+off**, so you have to enable them. claude.ai has no working refresh at all today; its cached list
+survives disconnecting, deleting and re-adding the connector.
+
+So Douze always offers two tools whose names never change, which makes a frozen list permanently
+usable:
+
+| Tool | What it does |
+|---|---|
+| `douze_list_skills` | lists every skill available *right now* |
+| `douze_run_skill` | runs any skill by name, including one the assistant cannot see |
+
+If an assistant says it has no tool for something you just recorded, tell it to *list your Douze
+skills and then run it*. That works with no refresh, on either platform. It is not a way around
+anything: a skill run this way goes through the same trust table as a direct call — reads always,
+changes only if you allowed them, deleting never from a hosted assistant.
 
 **That URL is the password.** Anyone holding it can call your tools. The relay keeps only a hash of
 it, and Douze sends it nowhere else — but a URL in a chat log or a screenshot is a URL someone else

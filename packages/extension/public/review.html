@@ -41,6 +41,20 @@
         Turning a skill on keeps one complete example answer from this site in this browser, and
         sends live answers to whichever assistant you connect.
       </p>
+      <!--
+        A credential the site keeps nowhere Douze can re-read. The value is shown because nobody can
+        consent to keeping something they have not seen, and it sits above the skills because a skill
+        that cannot authenticate is not worth choosing.
+      -->
+      <details class="setting" id="credentials" hidden>
+        <summary id="credentials-summary"></summary>
+        <p class="sub">
+          Most sites hand Douze a token it can re-read from the page each time. This one does not, so
+          the only way to use it is to keep a copy. Douze will not do that unless you say so, and it
+          keeps the copy for this site alone &mdash; skills you export never contain it.
+        </p>
+        <ul class="steps" id="pending"></ul>
+      </details>
       <div id="groups"></div>
       <div class="actions" id="actions" hidden>
         <p>Runs only when you ask.</p>

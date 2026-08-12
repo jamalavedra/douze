@@ -238,11 +238,98 @@ async function pruneExposed(tools: readonly SurfaceTool[]): Promise<void> {
   await attachments.tick()
 }
 
+// --- credentials the page keeps nowhere readable ---------------------------
+
+/**
+ * Where an unlocatable credential header waits for a decision.
+ *
+ * `chrome.storage.session` is memory-backed and dies with the browser, so a value parked here is not
+ * at rest and is gone if nobody approves that site. The alternative — persisting every unlocatable
+ * credential header automatically — cannot be made safe: no rule separates x.com's public app bearer
+ * from somebody's own session token, because both are low-entropy strings in an `authorization`
+ * header. So the value is held just long enough for a person to see it on the review page.
+ *
+ * Approved ones move to `LITERALS_KEY`, keyed by ORIGIN rather than living in the recipe: a skills
+ * file then still contains no credential, and export stays safe to hand to somebody.
+ */
+const PENDING_KEY = 'auth:pending'
+export const LITERALS_KEY = 'auth:literals'
+
+type ParkedLiteral = { header: string; value: string; prefix: string }
+
+/** Strips the value out of a draft's hints and parks it, so nothing stored ever carries one. */
+async function parkLiteral(draft: ExchangeDraft): Promise<void> {
+  const carrying = (draft.credentials ?? []).filter((hint) => hint.value !== undefined && hint.header)
+  if (carrying.length === 0) return
+  const origin = originOf(draft.url)
+  const stored = await chrome.storage.session.get(PENDING_KEY)
+  const pending = (stored[PENDING_KEY] as Record<string, ParkedLiteral[]> | undefined) ?? {}
+  const forOrigin = pending[origin] ?? []
+  for (const hint of carrying) {
+    if (!forOrigin.some((entry) => entry.header === hint.header)) {
+      forOrigin.push({ header: hint.header as string, value: hint.value as string, prefix: hint.prefix })
+    }
+  }
+  pending[origin] = forOrigin
+  await chrome.storage.session.set({ [PENDING_KEY]: pending })
+}
+
+/** Flattened for the review page, which asks one question per origin and header. */
+async function pendingForReview(): Promise<{ origin: string; header: string; value: string }[]> {
+  const pending = await pendingLiterals()
+  return Object.entries(pending).flatMap(([origin, entries]) =>
+    entries.map((entry) => ({ origin, header: entry.header, value: `${entry.prefix}${entry.value}` })),
+  )
+}
+
+/** What the review page offers: every origin with a header nobody has decided about yet. */
+export async function pendingLiterals(): Promise<Record<string, ParkedLiteral[]>> {
+  const stored = await chrome.storage.session.get(PENDING_KEY)
+  return (stored[PENDING_KEY] as Record<string, ParkedLiteral[]> | undefined) ?? {}
+}
+
+/** The decision. Allowing one persists it for that origin; refusing forgets it. */
+export async function decideLiteral(origin: string, header: string, allow: boolean): Promise<void> {
+  const pending = await pendingLiterals()
+  const entry = (pending[origin] ?? []).find((candidate) => candidate.header === header)
+  pending[origin] = (pending[origin] ?? []).filter((candidate) => candidate.header !== header)
+  await chrome.storage.session.set({ [PENDING_KEY]: pending })
+  if (!allow || !entry) return
+  const stored = await chrome.storage.local.get(LITERALS_KEY)
+  const allowed = (stored[LITERALS_KEY] as Record<string, ParkedLiteral[]> | undefined) ?? {}
+  allowed[origin] = [...(allowed[origin] ?? []).filter((c) => c.header !== header), entry]
+  await chrome.storage.local.set({ [LITERALS_KEY]: allowed })
+}
+
 // --- capture --------------------------------------------------------------
+
+/** Origin and path, never the query: a query string carries tokens and no filter reads one. */
+const withoutQuery = (url: string): string => {
+  try {
+    const parsed = new URL(url)
+    return `${parsed.origin}${parsed.pathname}`
+  } catch {
+    return '(unparseable url)'
+  }
+}
 
 function emit(draft: ExchangeDraft): void {
   if (!recording) return
-  if (!admits(draft, noise)) return
+  if (!admits(draft, noise)) {
+    // The one drop with no trace anywhere: the counter does not move, no badge changes, nothing
+    // reaches the review page, and the user is left with "I made a request and Douze ignored it".
+    // The store's own refusal has said why since T-001; this is the same courtesy one step
+    // earlier. Method, origin and path only — a query string carries tokens, and no filter
+    // decision has ever depended on one.
+    console.debug(`Douze skipped ${draft.method} ${withoutQuery(draft.url)} (${draft.response_content_type ?? 'no body'})`)
+    return
+  }
+  // Parked and removed from the draft: `finalize` must never see a value, because what it produces
+  // is what reaches disk.
+  if ((draft.credentials ?? []).some((hint) => hint.value !== undefined)) {
+    void parkLiteral(draft)
+    draft = { ...draft, credentials: (draft.credentials ?? []).map(({ value: _v, ...rest }) => rest) }
+  }
   const gesture = draft.gesture ?? (draft.tab_id === undefined ? undefined : lastGesture.get(draft.tab_id))
   const exchange = finalize(
     draft,
@@ -567,7 +654,21 @@ async function reviewSession(sessionId: string, reinfer: boolean): Promise<Revie
 async function onReviewCommand(command: ReviewCommand): Promise<ReviewState | ReviewSaved | { ok: true }> {
   const session = await reviewSession(command.sessionId, command.type === 'douze:review:load')
   if (command.type === 'douze:review:load') {
-    return { site: session.site(), recipe: session.recipeName(), candidates: session.candidates() }
+    return {
+      site: session.site(),
+      recipe: session.recipeName(),
+      candidates: session.candidates(),
+      pending_credentials: await pendingForReview(),
+    }
+  }
+  if (command.type === 'douze:review:credential') {
+    await decideLiteral(command.origin, command.header, command.allow)
+    return {
+      site: session.site(),
+      recipe: session.recipeName(),
+      candidates: session.candidates(),
+      pending_credentials: await pendingForReview(),
+    }
   }
   if (command.type === 'douze:review:edit') {
     session.edit(command.name, command.field, command.value)
@@ -705,11 +806,12 @@ async function connectState(extra: Partial<ConnectState> = {}): Promise<ConnectS
     configured: relay !== undefined,
     url: relay?.url ?? DEFAULT_RELAY_URL,
     mcp_url: relay === undefined ? '' : `${relay.url}${relay.mcp_path}`,
-    allow_writes: relay?.allow_writes ?? false,
+    allow_writes: relay?.allow_writes ?? true,
     connected: attachments.connected(),
     tools: liveSurface.map((entry) => entry.qualified_name),
     exposed: { local: expose?.local ?? [], remote: expose?.remote ?? [] },
     bridge: bridgeState(bridge),
+    stale: attachments.relayRefused(),
     ...extra,
   }
 }
@@ -812,7 +914,11 @@ async function startLink(url: string | undefined): Promise<ConnectState> {
       url: base,
       token: registered.token,
       mcp_path: registered.mcp_path,
-      allow_writes: false,
+      // On from the start: a connector that can only read is not what anyone connects Douze for,
+      // and the read-only default meant every user met the feature as a tool that refused. What
+      // it costs is disclosed on the connect page before the link is minted rather than in a
+      // dialog nobody now sees; deleting stays impossible from a hosted assistant either way.
+      allow_writes: true,
     } satisfies RelayPairing,
   })
   return connectState()

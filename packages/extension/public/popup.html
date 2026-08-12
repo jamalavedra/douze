@@ -3,88 +3,49 @@
   <head>
     <meta charset="utf-8" />
     <title>Douze</title>
+    <!--
+      The popup shares page.css with the three full pages, so the palette, the type and the
+      controls are defined once. What is left here is only what a 320px panel needs and a page
+      does not: the width, the recording states, and the tool list's effect colours.
+    -->
+    <link rel="stylesheet" href="page.css" />
     <style>
-      /* The popup and review page share the same cyan/red brand palette. */
-      :root {
-        color-scheme: light dark;
-        --bg: light-dark(#ffffff, #080a0b);
-        --fg: light-dark(#080a0b, #ffffff);
-        --muted: light-dark(#596267, #aeb9bd);
-        --line: light-dark(#d8e5e8, #2a393e);
-        --accent: light-dark(#008bad, #56d9f5);
-        --brand-blue: #00bce8;
-        --safe: light-dark(#007d9e, #56d9f5);
-        --changes: light-dark(#d91b1b, #ff6b6b);
-        --danger: light-dark(#b70808, #ff6b6b);
-      }
-      * { box-sizing: border-box; }
-      body {
-        width: 320px;
-        margin: 0;
-        padding: 16px;
-        background: var(--bg);
-        color: var(--fg);
-        font: 13px/1.45 system-ui, sans-serif;
-      }
-      h1 { font-size: 15px; font-weight: 600; margin: 0 0 8px; }
-      .brand { align-items: center; display: flex; gap: 8px; margin-bottom: 14px; }
-      .brand img { height: 30px; object-fit: contain; width: 30px; }
-      .brand strong { font-size: 15px; }
-      p { margin: 0 0 12px; }
-      .lead { font-size: 13px; color: var(--muted); }
-      .site { font-size: 17px; font-weight: 600; margin: 0 0 12px; word-break: break-all; }
-      .muted { color: var(--muted); font-size: 11px; }
-      label { display: block; margin: 0 0 4px; font-size: 11px; color: var(--muted); }
-      input, textarea, button, summary { font: inherit; }
-      input[type='text'], textarea {
-        width: 100%;
-        padding: 6px 8px;
-        border: 1px solid var(--line);
-        border-radius: 6px;
-        background: transparent;
-        color: inherit;
-      }
-      button {
-        width: 100%;
-        padding: 8px;
-        margin-top: 12px;
-        border: 1px solid var(--line);
-        border-radius: 6px;
-        background: transparent;
-        color: inherit;
-        cursor: pointer;
-      }
-      button.primary { border-color: transparent; background: var(--brand-blue); color: #061014; font-weight: 600; }
-      button.quiet { margin-top: 8px; padding: 4px 8px; width: auto; font-size: 11px; color: var(--muted); }
-      :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-      .live { font-size: 11px; font-weight: 600; color: var(--danger); text-transform: uppercase; letter-spacing: 0.04em; }
+      body { padding: 14px; width: 320px; }
+      main { padding: 0; width: auto; }
+      h1 { font-size: 1.125rem; margin-bottom: 6px; }
+      .brand { margin-bottom: 14px; }
+      .site { font-family: var(--font-title); font-size: 1.125rem; font-weight: 500; margin: 0 0 12px; word-break: break-all; }
+      .lead { color: var(--ink-55); font-size: 0.875rem; }
+      /* Full-width stacked buttons: a 320px panel has no room for a row of them. */
+      .stack { display: grid; gap: 6px; }
+      .stack .primary, .stack .quiet { padding: 0.5rem 0.875rem; text-align: center; width: 100%; }
+      .note { color: var(--ink-40); font-size: 0.75rem; margin: 6px 0 0; }
+      .live { color: var(--danger); font-size: 0.75rem; font-weight: 550; letter-spacing: 0.04em; text-transform: uppercase; }
       .live::before { content: '\25CF'; margin-right: 4px; }
-      .count { font-size: 15px; margin: 0 0 12px; }
-      .tools { margin: 12px 0 0; padding: 0; list-style: none; }
-      .tools li { font-size: 11px; color: var(--muted); padding: 2px 0 2px 10px; border-left: 2px solid var(--line); }
+      .count { font-size: 0.9375rem; margin: 2px 0 12px; }
+      label { color: var(--ink-55); display: block; font-size: 0.8125rem; margin: 0 0 4px; }
+      textarea.field { font-family: var(--font); resize: vertical; }
+      .tools { gap: 2px; margin-top: 10px; }
+      .tools li { border: 0; border-left: 2px solid var(--line); border-radius: 0; color: var(--ink-55); font-size: 0.75rem; padding: 2px 0 2px 8px; }
       /* The word carries the meaning; the colour only reinforces it. */
-      .tools .kind { font-weight: 600; }
-      .tools li[data-effect='read'] { border-color: var(--safe); }
-      .tools li[data-effect='read'] .kind { color: var(--safe); }
+      .tools .kind { font-weight: 550; }
+      /* The one marker with no token behind it: a 25%-black rule is invisible on dark paper, and
+         read rows would lose the stripe that write and destructive rows keep. */
+      .tools li[data-effect='read'] { border-color: light-dark(rgba(0, 0, 0, 0.25), rgba(255, 255, 255, 0.3)); }
       .tools li[data-effect='write'] { border-color: var(--changes); }
       .tools li[data-effect='write'] .kind { color: var(--changes); }
       .tools li[data-effect='destructive'] { border-color: var(--danger); }
       .tools li[data-effect='destructive'] .kind { color: var(--danger); }
-      .hosted { border-top: 1px solid var(--line); margin-top: 16px; }
-      .hosted p { margin: 4px 0 0; }
-      .error { color: var(--danger); font-size: 11px; margin: 12px 0 0; }
-      .note { color: var(--muted); font-size: 11px; margin: 8px 0 0; }
-      details { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 8px; }
-      summary { cursor: pointer; font-size: 11px; color: var(--muted); }
-      details label { margin-top: 12px; }
-      .check { display: flex; gap: 8px; align-items: baseline; margin-top: 12px; }
-      .check label { margin: 0; font-size: 13px; color: inherit; }
+      .hosted { border-top: 1px solid var(--line-soft); margin-top: 16px; padding-top: 14px; }
+      details { margin-top: 16px; }
+      .check { align-items: baseline; display: flex; gap: 8px; margin-top: 12px; }
+      .check label { color: var(--ink); font-size: 0.8125rem; margin: 0; }
       .check input { margin: 0; }
     </style>
   </head>
   <body>
     <main>
-      <header class="brand"><img src="icon128.png" alt="" /><strong>Douze</strong></header>
+      <header class="brand"><img class="brand-icon" src="icon128.png" alt="" /><p class="eyebrow">Douze</p></header>
       <section id="unsupported" hidden>
         <p class="lead">Douze can't watch this page. Open the dashboard you want to use, then click Douze again.</p>
       </section>
@@ -92,8 +53,10 @@
       <section id="ready" hidden>
         <p class="site" id="hostname"></p>
         <label for="name">What should this site be called?</label>
-        <input id="name" type="text" autocomplete="off" />
-        <button class="primary" id="watch">Watch this site</button>
+        <input class="field" id="name" type="text" autocomplete="off" />
+        <div class="stack">
+          <button type="button" class="primary" id="watch">Watch this site</button>
+        </div>
         <!-- Chrome's own permission prompt fires on that click; this is the answer to it. -->
         <p class="note">Stays on this computer. Douze never sees your password.</p>
         <p class="note" id="tools-summary" hidden></p>
@@ -109,43 +72,56 @@
         <label for="note">What did you just do?</label>
         <!-- maxlength matches MAX_NOTE_CHARS: the note becomes the first sentence of a tool
              description, and an over-long one is refused by the store rather than stored. -->
-        <textarea id="note" rows="2" maxlength="500" placeholder="moved a task to Done"></textarea>
-        <button class="quiet" id="add-note">Add note</button>
+        <textarea class="field" id="note" rows="2" maxlength="500" placeholder="moved a task to Done"></textarea>
+        <div class="stack">
+          <button type="button" class="quiet" id="add-note">Add note</button>
+          <button type="button" class="primary" id="done">Done</button>
+        </div>
         <p class="note" id="noted" role="status" hidden>Noted.</p>
-        <button class="primary" id="done">Done</button>
       </section>
 
       <section id="finished" hidden>
         <p class="lead" id="finished-text"></p>
-        <button class="primary" id="finished-action"></button>
+        <div class="stack">
+          <button type="button" class="primary" id="finished-action"></button>
+        </div>
       </section>
 
-      <p class="error" id="error" role="alert" hidden></p>
+      <p id="error" role="alert" hidden></p>
 
       <!-- Outside the one-section-at-a-time switch above: sharing Douze with a hosted assistant
            has nothing to do with whether a site was just recorded. -->
       <section class="hosted" id="hosted">
-        <button id="connect">Use with ChatGPT or claude.ai</button>
-        <p class="muted">Opens a page that walks you through it.</p>
-        <!-- The recordings live in this browser until someone deletes them, so the door to
-             deleting one is offered wherever Douze is, not only after a recording. -->
-        <button id="stored">What Douze has stored</button>
-        <p class="muted">Recordings, skills, and importing a .har file.</p>
+        <div class="stack">
+          <button type="button" class="quiet" id="connect">Use with your AI</button>
+          <!-- The recordings live in this browser until someone deletes them, so the door to
+               deleting one is offered wherever Douze is, not only after a recording. -->
+          <button type="button" class="quiet" id="stored">What Douze has stored</button>
+        </div>
       </section>
-    </main>
 
-    <details>
-      <summary>Advanced</summary>
-      <div class="check">
-        <input type="checkbox" id="use-debugger" />
-        <label for="use-debugger">Thorough recording (Chrome will show a warning bar while it's on)</label>
-      </div>
-      <p class="muted">Only needed if Douze records nothing without it.</p>
-      <label for="noise">Ignore these sites</label>
-      <textarea id="noise" rows="3" placeholder="metrics.internal.example"></textarea>
-      <p class="muted">One address per line. Applies next time you record.</p>
-      <button class="quiet" id="save-noise">Save</button>
-    </details>
+      <!--
+        Settings, not Advanced: two options a default install never changes. Both were on screen
+        under a disclosure already; what changed is the name, and that the panel now says what it
+        holds rather than making you open it to find out.
+      -->
+      <details>
+        <summary>Settings</summary>
+        <p class="field-label">Colour scheme</p>
+        <div id="theme"></div>
+        <div class="check">
+          <input type="checkbox" id="use-debugger" />
+          <label for="use-debugger">Thorough recording</label>
+        </div>
+        <p class="note">Chrome shows a warning bar while it's on. Only needed if Douze records nothing without it.</p>
+        <label for="noise">Ignore these sites</label>
+        <textarea class="field" id="noise" rows="3" placeholder="metrics.internal.example"></textarea>
+        <p class="note">One address per line. Applies next time you record.</p>
+        <div class="stack">
+          <button type="button" class="quiet" id="save-noise">Save</button>
+        </div>
+      </details>
+    </main>
 
     <script type="module" src="popup.js"></script>
   </body>

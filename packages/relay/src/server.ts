@@ -1,4 +1,6 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
+import { renameSync, writeFileSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { WebSocketServer, type WebSocket } from 'ws'
 import { HEARTBEAT_MS, REMOTE_MAX_SESSIONS, REMOTE_SESSION_IDLE_MS, RemoteRegistration } from '@douze/shared'
@@ -20,12 +22,14 @@ import { ExtensionFrame, McpHost, welcome, type AttachedTool } from '@douze/mcp-
  * broken, and a call that arrives at a sleeping worker waits out WAKE_GRACE_MS for it to come back
  * rather than reporting a browser that is merely asleep as one that is gone.
  *
- * Still stateless in the sense that matters: every endpoint lives in the maps below and dies with
- * the process, nothing touches disk, and no payload is logged. What is new — and disclosed in the
- * README rather than softened — is that the relay now holds each endpoint's tool names,
- * descriptions and schemas in memory in order to answer `tools/list`. It stores hashes of the
- * endpoint token, the URL secret, and the optional platform bearer, so a memory dump still does
- * not hand over a credential that would reach a user's browser.
+ * Nearly stateless, and precise about the exception. No payload is logged, and the only thing that
+ * reaches disk is the endpoint registry — `RELAY_STATE`, hashes only — so that a restart stops
+ * invalidating every user's link. Tool names, descriptions and schemas are held in memory to
+ * answer `tools/list` and are never written; the extension re-pushes them on its next dial.
+ *
+ * The token, the URL secret and the platform bearer are SHA-256 digests wherever they are kept, in
+ * memory or in that file, so neither a memory dump nor the file yields a credential that would
+ * reach a user's browser.
  */
 
 export interface Relay {
@@ -40,6 +44,8 @@ const MAX_IN_FLIGHT = 8
 const HELLO_TIMEOUT_MS = 5_000
 const REGISTRATIONS_PER_HOUR = 10
 const REGISTRATION_WINDOW_MS = 3_600_000
+/** `POST /register` is the one unauthenticated route, and a registration is tens of bytes. */
+const REGISTER_MAX_BYTES = 4_096
 const SWEEP_MS = 30_000
 /** How long an over-cap body is read and discarded so its 413 can land. See readBody. */
 const LINGER_MS = 5_000
@@ -97,6 +103,8 @@ const SESSION_MAX_AGE_MS = 43_200_000
  * reported with the next one.
  */
 const REFUSAL_LOG_MS = 1_000
+/** Comfortably inside Cloudflare's 100 s idle close: a stream that dies silently is worse than none. */
+const STREAM_KEEPALIVE_MS = 25_000
 
 interface Session {
   last: number
@@ -104,6 +112,16 @@ interface Session {
   created: number
   /** Owns MCP for this session: initialize, tools/list, and the correlation of every tool.call. */
   host: McpHost
+  /**
+   * The client's open `GET` stream, when it has one, and the only way a server-initiated message
+   * reaches it. Without this `notifications/tools/list_changed` was generated and dropped: a skill
+   * recorded mid-conversation never appeared, because no target client polls `tools/list` — they
+   * read it once and cache it. ChatGPT asks for this stream on every session and got a 405 each
+   * time.
+   */
+  stream?: ServerResponse | undefined
+  /** Keeps the stream from being closed by an idle proxy. Cleared with the stream. */
+  keepalive?: NodeJS.Timeout | undefined
 }
 
 interface Endpoint {
@@ -160,6 +178,11 @@ export async function startRelay(options: {
    * Without it, every request behind a tunnel shares the proxy's one bucket.
    */
   trustProxy?: boolean
+  /**
+   * Where to keep the endpoint registry across restarts. Unset means the old behaviour — memory
+   * only, and every link dies with the process.
+   */
+  statePath?: string
   sessionIdleMs?: number
   sessionMaxAgeMs?: number
   heartbeatMs?: number
@@ -175,6 +198,51 @@ export async function startRelay(options: {
   const byToken = new Map<string, Endpoint>()
   const bySecret = new Map<string, Endpoint>()
   const registrations = new Map<string, { count: number; resetAt: number }>()
+
+  /**
+   * The endpoint registry, across restarts.
+   *
+   * Every link used to die with the process, so a deploy — or a crash on a `Restart=always` unit —
+   * silently invalidated every user's connector and made each of them re-pair the extension by
+   * hand and re-paste a new URL into ChatGPT. That is not a blip, and it happened on every
+   * release.
+   *
+   * WHAT IS WRITTEN IS ONLY HASHES. The token, the URL secret and the platform bearer are stored
+   * as SHA-256 digests, exactly as they are held in memory — the file cannot be turned back into a
+   * working link, which is the same property `README.md` claims for a memory dump. What is
+   * deliberately NOT written is the tool surface: names, descriptions and schemas are the user's
+   * own data, they are recoverable from the extension in under 30 seconds, and keeping them off
+   * disk means this file holds nothing that describes anybody's dashboards.
+   *
+   * So a restart costs `tools/list` returning empty until the extension's next dial — the same
+   * gap a cold start already had — instead of costing the link itself.
+   */
+  const statePath = options.statePath
+  interface StoredEndpoint {
+    tokenHash: string
+    secretHash: string
+    bearerHash: string | null
+  }
+
+  const save = (): void => {
+    if (statePath === undefined) return
+    const rows: StoredEndpoint[] = [...byToken.values()].map((endpoint) => ({
+      tokenHash: endpoint.tokenHash,
+      secretHash: endpoint.secretHash,
+      bearerHash: endpoint.bearerHash === null ? null : endpoint.bearerHash.toString('base64'),
+    }))
+    // Written to a temporary name and renamed over, so a crash mid-write leaves the previous file
+    // whole rather than a truncated one that would drop every endpoint at the next boot. Synchronous
+    // because it is sub-kilobyte and only a registration triggers it — and because two of those
+    // landing together must not interleave two writes of the same map.
+    try {
+      writeFileSync(`${statePath}.tmp`, JSON.stringify(rows), { mode: 0o600 })
+      renameSync(`${statePath}.tmp`, statePath)
+    } catch (error) {
+      // Never fatal: a relay that cannot write still serves every live link.
+      log('state.save_failed', { reason: (error as Error).name })
+    }
+  }
   // Metrics for now are counters and nothing else: no endpoint is exposed to scrape them, so they
   // are emitted by the sweep when they move and once more on shutdown, and answer "was anything
   // dropped?" for an operator who has only a journal.
@@ -215,23 +283,45 @@ export async function startRelay(options: {
   const register = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     // ponytail: a fixed in-memory window, keyed per caller. Good enough for one process; swap for
     // a shared store if the relay is ever replicated.
+    //
+    // Read before the body, charged after it — and the body itself capped at REGISTER_MAX_BYTES,
+    // which is what makes that split safe. Reading first would let a caller who never gets
+    // charged (an OAuth probe omits `daemon_version`) stream unbounded bytes into the parser for
+    // free; charging first would let claude.ai's own discovery exhaust a budget that is shared by
+    // every user behind the tunnel. Capping the read costs the attacker 256× and costs the probe
+    // nothing.
     const ip = callerAddress(req, options.trustProxy ?? false)
     const now = Date.now()
     const seen = registrations.get(ip)
-    if (!seen || seen.resetAt <= now) {
-      registrations.set(ip, { count: 1, resetAt: now + REGISTRATION_WINDOW_MS })
-    } else if (++seen.count > REGISTRATIONS_PER_HOUR) {
+    const fresh = seen === undefined || seen.resetAt <= now
+    if (!fresh && seen.count >= REGISTRATIONS_PER_HOUR) {
       throw new Refusal(429, { error: 'rate_limited', message: 'Too many registrations from this address.' })
     }
+    const raw = await jsonBody(req, REGISTER_MAX_BYTES)
+    // `/register` is also the default dynamic-client-registration path an MCP client falls back to
+    // when OAuth discovery 404s, and claude.ai does exactly that before it will connect. Answering
+    // one of those bodies with `201 {token, mcp_path}` told it the relay HAD a sign-in service, so
+    // it ran an OAuth flow against endpoints that do not exist and refused to connect at all —
+    // while quietly minting a Douze endpoint nobody would ever dial. A registration is ours only
+    // if it names a client; anything else gets the 404 that every other unknown path gets, which
+    // is what tells an MCP client there is no OAuth here and to connect unauthenticated.
+    if (!isRecord(raw) || typeof raw['daemon_version'] !== 'string') {
+      throw new Refusal(404, { error: 'not_found' })
+    }
+
+    // Charged here: past this line the caller is asking for an endpoint, which is the thing the
+    // hourly budget meters.
+    if (fresh) registrations.set(ip, { count: 1, resetAt: now + REGISTRATION_WINDOW_MS })
+    else seen.count += 1
 
     // Unauthenticated input, so it is parsed rather than trusted: an unconstrained daemon_version
     // would put an attacker-chosen newline into the log line below, and a non-string bearer_token
     // would reach createHash().update() and take the request down with a TypeError.
-    const parsed = RemoteRegistration.safeParse(await jsonBody(req))
+    const parsed = RemoteRegistration.safeParse(raw)
     if (!parsed.success) {
       throw new Refusal(400, {
         error: 'bad_request',
-        message: 'Expected {daemon_version?: string, bearer_token?: string}.',
+        message: 'Expected {daemon_version: string, bearer_token?: string}.',
       })
     }
     const body = parsed.data
@@ -257,8 +347,9 @@ export async function startRelay(options: {
     }
     byToken.set(endpoint.tokenHash, endpoint)
     bySecret.set(endpoint.secretHash, endpoint)
+    save()
     counters.registered += 1
-    log('endpoint.registered', { ep: endpoint.label, client: body.daemon_version ?? 'unknown' })
+    log('endpoint.registered', { ep: endpoint.label, client: body.daemon_version })
     json(res, 201, { token, mcp_path: `/m/${secret}` })
   }
 
@@ -290,6 +381,7 @@ export async function startRelay(options: {
       detach(endpoint, 'rotated')
       stale.close(1008, 'token rotated')
     }
+    save()
     log('endpoint.rotated', { ep: endpoint.label })
     json(res, 200, { token, mcp_path: `/m/${secret}` })
   }
@@ -298,6 +390,7 @@ export async function startRelay(options: {
     const endpoint = owner(req)
     byToken.delete(endpoint.tokenHash)
     bySecret.delete(endpoint.secretHash)
+    save()
     const socket = endpoint.socket
     endpoint.socket = null
     detach(endpoint, 'unregistered')
@@ -325,9 +418,13 @@ export async function startRelay(options: {
         if (!live(endpoint)) throw new Error('detached')
         endpoint.socket?.send(JSON.stringify(frame))
       },
-      // There is no server-initiated stream in v1 (GET is 405), so a list change is recorded and
-      // the client sees it the next time it polls tools/list — which every target client does.
-      notify: () => log('mcp.list_changed', { ep: endpoint.label }),
+      // Delivered down this session's open GET stream when it has one. A client with no stream is
+      // no worse off than before: it still sees the change on its next `tools/list`.
+      notify: (frame) => {
+        const open = endpoint.sessions.get(sid)?.stream
+        open?.write(`data: ${JSON.stringify(frame)}\n\n`)
+        log('mcp.list_changed', { ep: endpoint.label, delivered: open ? 'yes' : 'no' })
+      },
     })
     host.setAttached(live(endpoint))
     host.pushSurface(endpoint.surface)
@@ -336,10 +433,64 @@ export async function startRelay(options: {
     return session
   }
 
+  /** Ends the stream a session is holding, so a client whose session is gone re-initializes. */
+  const endStream = (session: Session): void => {
+    clearInterval(session.keepalive)
+    session.keepalive = undefined
+    const stream = session.stream
+    session.stream = undefined
+    if (stream && !stream.writableEnded) stream.end()
+  }
+
+  /**
+   * `GET /m/<secret>` — streamable HTTP's server-initiated half, which this relay used to answer
+   * 405. That was the whole reason a skill recorded mid-conversation never showed up: the host
+   * generated `notifications/tools/list_changed`, the callback above had nowhere to put it, and no
+   * target client polls `tools/list` — they read it once per connector and cache it. ChatGPT opens
+   * this stream on every session, so the refusal was visible in the log as a 405 beside every
+   * `mcp.notified`.
+   *
+   * One stream per session, replacing any earlier one: a client that reconnects its stream is the
+   * ordinary case, and keeping the old response object would leave a dead socket being written to.
+   */
+  const stream = (endpoint: Endpoint, req: IncomingMessage, res: ServerResponse): void => {
+    const sid = String(req.headers['mcp-session-id'] ?? '')
+    const session = endpoint.sessions.get(sid)
+    // Same answer as any other request naming a session that has gone: the client re-initializes.
+    if (!session) throw new Refusal(404, { error: 'no_session', message: 'This MCP session has expired.' }, endpoint.label)
+
+    endStream(session)
+    res.writeHead(200, {
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-store',
+      connection: 'keep-alive',
+      // Cloudflare and nginx both buffer a response without this, which holds every notification
+      // until the stream closes — the exact failure this route exists to fix, and a silent one.
+      'x-accel-buffering': 'no',
+    })
+    // A comment line is a valid SSE keepalive and no event, so a client parses nothing from it.
+    res.write(': open\n\n')
+    session.stream = res
+    session.keepalive = setInterval(() => {
+      if (res.writableEnded) return
+      res.write(': ping\n\n')
+    }, STREAM_KEEPALIVE_MS)
+    session.keepalive.unref()
+    // The client hanging up is normal — a closed tab, a finished conversation — and must not leave
+    // an interval running against a dead socket for the life of the session.
+    res.on('close', () => {
+      if (session.stream === res) endStream(session)
+    })
+    log('mcp.stream_open', { ep: endpoint.label })
+  }
+
   const closeSession = (endpoint: Endpoint, sid: string): boolean => {
     const session = endpoint.sessions.get(sid)
     if (!session) return false
     endpoint.sessions.delete(sid)
+    // Before the host closes: a client left holding a stream on a session that no longer exists
+    // would wait for notifications that can never arrive.
+    endStream(session)
     // Fails whatever that session had in flight instead of leaving it on a 120s timer.
     session.host.close()
     return true
@@ -400,10 +551,10 @@ export async function startRelay(options: {
     }
     endpoint.lastSeen = Date.now()
 
-    // No server-initiated stream in v1: a tool change reaches the platform when the client next
-    // polls tools/list, which every target client does after a reconnect.
+    // GET is the server-initiated half of streamable HTTP; see `stream`.
+    if (req.method === 'GET') return stream(endpoint, req, res)
     if (req.method !== 'POST' && req.method !== 'DELETE') {
-      res.setHeader('Allow', 'POST, DELETE')
+      res.setHeader('Allow', 'GET, POST, DELETE')
       throw new Refusal(405, { error: 'method_not_allowed' })
     }
 
@@ -445,12 +596,19 @@ export async function startRelay(options: {
       // A client re-initializing over a session it already holds gets that one closed rather than
       // orphaned: without this the previous host survives until the session idles out.
       closeSession(endpoint, header)
+      // At the cap, the OLDEST session is retired to make room rather than the new client being
+      // refused. Refusing was a deadlock, and a self-sustaining one: a client whose session the
+      // relay had forgotten got a 404, re-initialized exactly as streamable HTTP tells it to —
+      // with no session header, so nothing above reclaimed anything — and was met with a 429 it
+      // could do nothing about, because the four sessions blocking it were the abandoned ones.
+      // Every retry repeated the pair, and only the ten-minute idle sweep ever broke it. Two
+      // hosted clients on one link reach four sessions in seconds, so this was the normal case.
+      //
+      // The cap's job is bounding memory, and evicting bounds it just as well as refusing does.
       if (endpoint.sessions.size >= REMOTE_MAX_SESSIONS) {
-        throw new Refusal(
-          429,
-          { error: 'rate_limited', message: 'Too many MCP sessions open for this endpoint.' },
-          endpoint.label,
-        )
+        const [oldest] = [...endpoint.sessions.entries()].reduce((a, b) => (b[1].last < a[1].last ? b : a))
+        log('mcp.session_evicted', { ep: endpoint.label })
+        closeSession(endpoint, oldest)
       }
       const sid = randomUUID()
       const session = openSession(endpoint, sid, started)
@@ -545,6 +703,15 @@ export async function startRelay(options: {
 
   wss.on('connection', (socket) => {
     let endpoint: Endpoint | null = null
+    /**
+     * Unparseable frames counted rather than logged one by one. An unauthenticated socket could
+     * emit a line per frame here — this runs BEFORE the token is checked — and unlike every other
+     * refusal it bypassed `logRefusal`'s per-second cap. Measured at 20 000 lines from one socket
+     * that never authenticated, which is past journald's default burst: the flood evicts the
+     * `request.refused` lines an operator watches for somebody guessing endpoint secrets, so it
+     * was log evasion as well as disk fill. One line at close says the same thing.
+     */
+    let dropped = 0
     const deadline = setTimeout(() => {
       counters.refused += 1
       logRefusal(1008, 'hello_timeout')
@@ -555,6 +722,7 @@ export async function startRelay(options: {
     socket.on('error', () => socket.terminate())
     socket.on('close', () => {
       clearTimeout(deadline)
+      if (dropped > 0) log('extension.dropped_frames', { ep: endpoint?.label ?? 'unauthenticated', count: dropped })
       if (!endpoint || endpoint.socket !== socket) return
       endpoint.socket = null
       detach(endpoint, 'closed')
@@ -564,7 +732,7 @@ export async function startRelay(options: {
       const payload = parse(String(raw))
       const frame = ExtensionFrame.safeParse(payload)
       if (!frame.success) {
-        log('extension.dropped_frame', { bytes: String(raw).length })
+        dropped += 1
         return
       }
       if (!endpoint) {
@@ -635,6 +803,7 @@ export async function startRelay(options: {
   const reap = (endpoint: Endpoint, reason: string): void => {
     byToken.delete(endpoint.tokenHash)
     bySecret.delete(endpoint.secretHash)
+    save()
     const socket = endpoint.socket
     endpoint.socket = null
     if (socket) detach(endpoint, reason)
@@ -684,6 +853,44 @@ export async function startRelay(options: {
   // (a Cloudflare tunnel, Fly, a reverse proxy) that owns the certificate and reaches it over
   // localhost. Anything arriving on this port is already inside that boundary — which is only
   // true while it is not bound to a public interface, so widening `host` is opting out of it.
+  // Before the port opens, so no request can arrive against an empty registry and be told its
+  // perfectly good link does not exist.
+  if (statePath !== undefined) {
+    try {
+      const rows = JSON.parse(await readFile(statePath, 'utf8')) as StoredEndpoint[]
+      for (const row of Array.isArray(rows) ? rows : []) {
+        if (typeof row?.tokenHash !== 'string' || typeof row.secretHash !== 'string') continue
+        const endpoint: Endpoint = {
+          // Derived, never stored: it is this prefix by construction wherever a label is set.
+          label: row.tokenHash.slice(0, 8),
+          tokenHash: row.tokenHash,
+          secretHash: row.secretHash,
+          bearerHash: typeof row.bearerHash === 'string' ? Buffer.from(row.bearerHash, 'base64') : null,
+          socket: null,
+          heartbeat: undefined,
+          lastPong: 0,
+          // Restored as though the extension had just been seen, so the reaper does not delete a
+          // link the moment it is loaded because the file records an attachment from yesterday.
+          lastSeen: Date.now(),
+          lastAttached: Date.now(),
+          // Not persisted: the extension re-pushes it on its next dial, within 30 seconds of the
+          // browser being open. Keeping tool names and descriptions off disk is the point.
+          surface: [],
+          sessions: new Map(),
+          inFlight: new Set(),
+          waking: new Set(),
+        }
+        byToken.set(endpoint.tokenHash, endpoint)
+        bySecret.set(endpoint.secretHash, endpoint)
+      }
+      log('state.loaded', { endpoints: byToken.size })
+    } catch (error) {
+      // A missing file is the first boot and not a problem. Anything else is: starting with an
+      // empty registry silently invalidates every live link, so it is said out loud.
+      if ((error as { code?: string }).code !== 'ENOENT') log('state.load_failed', { reason: (error as Error).name })
+    }
+  }
+
   const port = await new Promise<number>((resolve, reject) => {
     const onError = (error: Error): void => reject(error)
     server.once('error', onError)
@@ -692,7 +899,7 @@ export async function startRelay(options: {
       resolve((server.address() as { port: number }).port)
     })
   })
-  log('relay.started', { port })
+  log('relay.started', { port, persisted: statePath === undefined ? 'no' : 'yes' })
 
   return {
     port,
@@ -777,10 +984,10 @@ const live = (endpoint: { socket: WebSocket | null }): boolean => endpoint.socke
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
 
-const jsonBody = async <T>(req: IncomingMessage): Promise<T> => {
-  const raw = await readBody(req)
+const jsonBody = async <T>(req: IncomingMessage, max = MAX_BODY_BYTES): Promise<T> => {
+  const raw = await readBody(req, max)
   if (raw === null) {
-    throw new Refusal(413, { error: 'payload_too_large', message: `The body exceeds ${MAX_BODY_BYTES} bytes.` })
+    throw new Refusal(413, { error: 'payload_too_large', message: `The body exceeds ${max} bytes.` })
   }
   const body = parse(raw.toString('utf8'))
   if (!isRecord(body)) {
@@ -801,7 +1008,7 @@ const jsonBody = async <T>(req: IncomingMessage): Promise<T> => {
  * few seconds, which is long enough for the refusal to land and short enough to not be a handle
  * anyone can hold.
  */
-const readBody = (req: IncomingMessage): Promise<Buffer | null> =>
+const readBody = (req: IncomingMessage, max = MAX_BODY_BYTES): Promise<Buffer | null> =>
   new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
     let size = 0
@@ -809,7 +1016,7 @@ const readBody = (req: IncomingMessage): Promise<Buffer | null> =>
     req.on('data', (chunk: Buffer) => {
       if (over) return
       size += chunk.length
-      if (size > MAX_BODY_BYTES) {
+      if (size > max) {
         over = true
         chunks.length = 0
         const linger = setTimeout(() => req.destroy(), LINGER_MS)

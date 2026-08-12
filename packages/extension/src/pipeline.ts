@@ -7,6 +7,7 @@ import {
   defaultRedaction,
   redactBody,
   redactHeaders,
+  redactRoute,
   redactUrl,
   shouldCapture,
 } from '@douze/shared'
@@ -124,10 +125,27 @@ const originOf = (url: string): string => {
  */
 export function admits(draft: ExchangeDraft, noise: NoiseConfig = defaultNoise()): boolean {
   return shouldCapture(
-    { url: draft.url, origin: originOf(draft.url), response_content_type: draft.response_content_type },
+    {
+      url: draft.url,
+      origin: originOf(draft.url),
+      // The method is what tells a bodiless 204 from a GET worth nothing (see `shouldCapture`).
+      method: draft.method,
+      response_content_type: draft.response_content_type,
+    },
     null,
     noise,
   )
+}
+
+/**
+ * The route is a path and is redacted as one; the name and title are page text, which carries a
+ * token often enough that the gate refuses on them — an "Invite accepted: <token>" heading is a
+ * real thing. Each is replaced only where it would be refused, so ordinary provenance survives
+ * intact and goes on naming the control the user clicked.
+ */
+function redactProvenance(provenance: UiProvenance, redaction: RedactionConfig): UiProvenance {
+  // The walk covers every field, including one added later; the route needs the path-aware pass.
+  return { ...(redactBody(provenance, redaction) as UiProvenance), route: redactRoute(provenance.route, redaction) }
 }
 
 /**
@@ -157,7 +175,10 @@ export function finalize(draft: ExchangeDraft, ctx: SessionContext, id: string):
     body_missing: draft.body_missing,
     ...(draft.body_missing_reason === undefined ? {} : { body_missing_reason: draft.body_missing_reason }),
     background: 'background' in provenance,
-    ...('provenance' in provenance ? { provenance: provenance.provenance } : {}),
+    // Redacted like every other field that reaches disk. It was the one that was not, while the
+    // write gate read it exactly like the rest — so a dashboard whose own routes carry a project
+    // key had every exchange refused at `$.provenance.route`.
+    ...('provenance' in provenance ? { provenance: redactProvenance(provenance.provenance, redaction) } : {}),
     source: draft.source,
     ...(draft.page_origin === undefined ? {} : { page_origin: draft.page_origin }),
     // Locations, not values: a storage key and a header name pass redaction untouched, which is

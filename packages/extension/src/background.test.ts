@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Recipe, codeKey, mintNonce, mintSalt, proof, secretHashKey, sha256Hex } from '@douze/shared'
 import type { RelayPairing } from './attach.js'
+import { DISPATCHERS } from './guards.js'
 import type { ConnectState, DataState, PageEvent, ReviewState } from './messages.js'
 import { RecipeStore } from './recipes.js'
 import { ReviewSession } from './review-session.js'
@@ -683,8 +684,12 @@ async function approveShop(): Promise<void> {
   await settle()
 }
 
+/** Recipe tool names per push; the dispatchers ride on every surface. See LIST_SKILLS in guards.ts. */
 const pushedNames = (socket: FakeSocket): string[][] =>
-  socket.frames('surface.push').map((frame) => (frame['tools'] as { name: string }[]).map((tool) => tool.name))
+  socket
+    .frames('surface.push')
+    .map((frame) => (frame['tools'] as { name: string }[]).map((tool) => tool.name))
+    .map((names) => names.filter((name) => !DISPATCHERS.includes(name)))
 
 /**
  * The bridge's half of the loopback handshake (T-015.12), computed the way a real bridge computes
@@ -872,7 +877,7 @@ describe('the trust table, enforced in the extension (T-015.9)', () => {
     expect(audit.calls[0]).toMatchObject({ tool: 'shop_list_orders', trust: 'remote', outcome: 'ok' })
   })
 
-  it('refuses a result carrying a credential, naming where it was, and never sends it', async () => {
+  it('masks a credential in a result and never sends it over the wire', async () => {
     const socket = await attach({ 'attach:relay': RELAY }, 'relay.test')
     await approveShop()
     fake.inject = async (url) => ({
@@ -885,9 +890,10 @@ describe('the trust table, enforced in the extension (T-015.9)', () => {
     socket.deliver(callFrame('r2', 'shop_list_orders', {}))
     await settle()
 
-    expect(failure(socket, 'r2').code).toBe('result_withheld')
-    expect(failure(socket, 'r2').message).toContain('$.session')
+    // The credential never crosses the socket — the property that matters — but the call now
+    // succeeds with the field masked rather than failing and returning nothing.
     expect(JSON.stringify(socket.sent)).not.toContain(JWT)
+    expect(JSON.stringify(socket.sent)).toContain('«redacted:')
   })
 
   it('refuses an argument the recipe never recorded before anything is fetched', async () => {
@@ -970,7 +976,11 @@ describe('the trust table, enforced in the extension (T-015.9)', () => {
     }
     live.deliver(callFrame('e2', 'shop_list_orders', {}))
     await settle()
-    expect(failure(live, 'e2').code).toBe('result_withheld')
+    // The namesake is gated again: its own result crosses with the credential masked, where the
+    // exempted tool's crossed with the credential intact.
+    const answer = JSON.stringify(resultFor(live, 'e2'))
+    expect(answer).not.toContain(JWT)
+    expect(answer).toContain('«redacted:')
   })
 
   it('exempts a tool from the gate at one trust level only', async () => {
@@ -991,7 +1001,8 @@ describe('the trust table, enforced in the extension (T-015.9)', () => {
     await settle()
     socket.deliver(callFrame('g1', 'shop_list_orders', {}))
     await settle()
-    expect(failure(socket, 'g1').code).toBe('result_withheld')
+    // Still masked on the remote pipe: the local exemption bought it nothing here.
+    expect(JSON.stringify(socket.sent)).not.toContain(JWT)
 
     await expose('remote')
     await settle()
@@ -1178,10 +1189,19 @@ describe('a host that refuses the pairing (T-015.8/12)', () => {
     expect(fake.notifications.at(-1)?.title).toBe('Douze lost its link')
     expect(FakeSocket.opened.length).toBe(before)
 
+    // The notification is a toast the user may never see, so the state has to reach the page too:
+    // `connected: false` alone reads as "idle, it keeps trying", which is what the connect page
+    // used to say about a link that was dead and a socket nothing was retrying.
+    expect(await sendFrom(extensionPage(), { type: 'douze:connect:status' })).toMatchObject({
+      configured: true,
+      stale: true,
+    })
+
     // A token written by the connect page is a different one, so dialling resumes on its own.
     await chrome.storage.local.set({ 'attach:relay': { ...RELAY, token: 'a-new-token' } })
     fake.onAlarm.emit({ name: 'douze-attach' })
     await settle()
+    expect(await sendFrom(extensionPage(), { type: 'douze:connect:status' })).toMatchObject({ stale: false })
     const retried = dialled('relay.test') as FakeSocket
     expect(retried).not.toBe(socket)
     retried.accept()
@@ -1350,17 +1370,18 @@ describe('sharing Douze with a hosted assistant (T-015.10)', () => {
     expect(relayCalls).toEqual([
       { url: 'https://douze.jamalavedra.com/register', method: 'POST', body: { daemon_version: '0.1.0' } },
     ])
-    // Exactly what `attach.ts` reads, including the write opt-in starting off.
+    // Exactly what `attach.ts` reads, including the write opt-in, which starts ON: a connector
+    // that can only read is not what anyone connects Douze for. Deleting stays impossible.
     expect(storedRelay()).toEqual({
       url: 'https://douze.jamalavedra.com',
       token: 'minted-token',
       mcp_path: '/m/minted',
-      allow_writes: false,
+      allow_writes: true,
     })
     expect(state.error).toBeUndefined()
     expect(state.configured).toBe(true)
     expect(state.mcp_url).toBe('https://douze.jamalavedra.com/m/minted')
-    expect(state.allow_writes).toBe(false)
+    expect(state.allow_writes).toBe(true)
   })
 
   it('registers with a relay the user runs themselves, trailing slash and all', async () => {
@@ -1408,7 +1429,7 @@ describe('sharing Douze with a hosted assistant (T-015.10)', () => {
       url: 'https://douze.jamalavedra.com',
       token: 'second-token',
       mcp_path: '/m/second',
-      allow_writes: false,
+      allow_writes: true,
     })
     expect(state.mcp_url).toBe('https://douze.jamalavedra.com/m/second')
     // The relay killed the old pair as it answered; nothing here may still be holding it.
@@ -1436,7 +1457,9 @@ describe('sharing Douze with a hosted assistant (T-015.10)', () => {
       token: 'minted-token',
     })
     expect(storedRelay()).toBeUndefined()
-    expect(state).toMatchObject({ configured: false, mcp_url: '', allow_writes: false })
+    // Nothing is shared, so the page shows what the NEXT link would carry rather than the dead
+    // pairing's setting.
+    expect(state).toMatchObject({ configured: false, mcp_url: '', allow_writes: true })
     expect(state.error).toBeUndefined()
     expect(state.warning).toBeUndefined()
   })
@@ -1500,11 +1523,14 @@ describe('sharing Douze with a hosted assistant (T-015.10)', () => {
       // Named before anything is shared, so the setup screen says where the link would come from.
       url: 'https://douze.jamalavedra.com',
       mcp_url: '',
-      allow_writes: false,
+      // Nothing is shared yet, and this is what a link would be minted with.
+      allow_writes: true,
       connected: false,
       tools: ['shop_list_orders', 'shop_create_order', 'shop_delete_order'],
       exposed: { local: [], remote: [] },
       bridge: 'unpaired',
+      // Nothing is shared, so there is no link for the relay to have forgotten.
+      stale: false,
     })
   })
 

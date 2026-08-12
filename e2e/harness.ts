@@ -245,8 +245,11 @@ export class McpClient {
     this.child.stdin!.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`)
   }
 
+  /** Recipe tool names; the dispatchers ride on every surface. See LIST_SKILLS in guards.ts. */
   async tools(): Promise<string[]> {
-    return ((await this.request('tools/list')).tools as { name: string }[]).map((t) => t.name)
+    return ((await this.request('tools/list')).tools as { name: string }[])
+      .map((t) => t.name)
+      .filter((name) => !DISPATCHERS.includes(name))
   }
 
   /** The description is where a degraded tool announces itself to a client (AC-RUN-001.5). */
@@ -397,6 +400,9 @@ export const pairingCode = (log: string): string | null => /Pairing code: ([\dA-
  * contract ChatGPT, claude.ai and Dust hold Douze to. Deliberately not the MCP SDK — an SDK that
  * papers over a missing header would hide the thing this is here to prove.
  */
+/** The two constant tool names. e2e imports nothing from packages, so this is its own copy. */
+export const DISPATCHERS = ['douze_list_skills', 'douze_run_skill']
+
 export class HttpMcp {
   private session = ''
   private nextId = 1
@@ -426,7 +432,12 @@ export class HttpMcp {
     return body
   }
 
+  /** Recipe tool names; `allTools` includes the dispatchers. See LIST_SKILLS in guards.ts. */
   async tools(): Promise<string[]> {
+    return (await this.allTools()).filter((name) => !DISPATCHERS.includes(name))
+  }
+
+  async allTools(): Promise<string[]> {
     const { body } = await this.rpc('tools/list')
     return ((body.result?.['tools'] as { name: string }[] | undefined) ?? []).map((tool) => tool.name)
   }

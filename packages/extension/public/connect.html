@@ -3,13 +3,19 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Use Douze with ChatGPT or claude.ai</title>
+    <title>Use Douze with your AI</title>
     <!--
       WO-015 T-015.4 — #ConnectPage, the no-terminal path to a hosted assistant. Everything
       `douze connect` printed in a terminal has to be readable here instead, including what it
       costs: the link is the password, and both the relay and the assistant's provider see live
       data from the user's own dashboards. That is why the trust section is on the page rather
       than behind a disclosure.
+
+      What IS behind a disclosure, and the whole shape of this page: anything a default install
+      never touches. Which relay to use, exempting a tool from the secret gate, and pairing an app
+      on this computer are three controls most people will never open, and they used to sit on
+      screen between the link and the disclosure that matters. They are one summary click away now;
+      the link, what a hosted assistant may do, and what you are trusting are not.
     -->
     <link rel="stylesheet" href="page.css" />
   </head>
@@ -21,30 +27,46 @@
           <p class="eyebrow">Douze</p>
         </div>
         <div aria-live="polite">
-          <h1>Use Douze with ChatGPT or claude.ai</h1>
+          <h1>Use Douze with your AI</h1>
           <p class="sub" id="link-state"></p>
         </div>
       </header>
+
       <section id="setup" hidden>
-        <p>
+        <p class="sub">
           ChatGPT, claude.ai and Dust run on someone else's computer, so they can't reach this one
           by themselves. Connecting gives them a web address to call instead. What they ask for is
           answered here, by the Douze already running in this browser, and nothing new starts
           listening on this computer.
         </p>
-        <label class="field-label" for="relay-url">The relay Douze will use</label>
-        <input class="field" id="relay-url" type="text" spellcheck="false" autocomplete="off" />
-        <p class="sub" id="relay">
-          Leave this as it is unless you run your own relay. The one Douze offers is run by Jaume
-          Alavedra, who wrote Douze, on a personal server &mdash; not a company, and with no
-          agreement behind it. Whoever runs a relay can read everything that crosses it &mdash; see
-          below.
+        <!--
+          Writes are on from the start, so what that means is said HERE. It used to be disclosed in
+          the confirm dialog that granted them, and with the grant no longer needing a click that
+          dialog is never seen — leaving the page silent about the one thing worth knowing before
+          the link exists.
+        -->
+        <p class="sub">
+          A hosted assistant will be able to look things up <strong>and make changes</strong> on the
+          sites you recorded. Deleting is never possible from one, whatever you set. You can go back
+          to read-only, or stop sharing, at any time.
         </p>
         <div class="actions">
           <p>You can stop sharing at any time.</p>
           <button type="button" class="primary" id="connect">Connect</button>
         </div>
+        <details class="setting">
+          <summary>Use a different relay</summary>
+          <label class="field-label" for="relay-url">The relay Douze will use</label>
+          <input class="field" id="relay-url" type="text" spellcheck="false" autocomplete="off" />
+          <p class="sub" id="relay">
+            Leave this as it is unless you run your own relay. The one Douze offers is run by Jaume
+            Alavedra, who wrote Douze, on a personal server &mdash; not a company, and with no
+            agreement behind it. Whoever runs a relay can read everything that crosses it &mdash; see
+            what you are trusting, below.
+          </p>
+        </details>
       </section>
+
       <section id="ready" hidden>
         <label class="field-label" for="mcp-url">Your private link</label>
         <div class="copy-row">
@@ -52,12 +74,47 @@
           <button type="button" class="primary" id="copy">Copy</button>
         </div>
         <p class="sub" id="copied" role="status" hidden></p>
+
         <h2 class="section-heading">Where to paste it</h2>
-        <ul class="steps">
-          <li><strong>ChatGPT</strong> &mdash; Settings &rarr; Connectors &rarr; Developer Mode &rarr; add a connector</li>
-          <li><strong>claude.ai</strong> &mdash; Settings &rarr; Connectors &rarr; Add custom connector</li>
-          <li><strong>Dust</strong> &mdash; Admin &rarr; Tools &rarr; Add MCP server</li>
-        </ul>
+        <!--
+          One disclosure per product, because nobody is pasting this into three of them: the two
+          they are not using are noise beside the one they are. The marks are files in this
+          extension, never a remote URL — MV3's CSP would refuse the load, and fetching a logo
+          would tell OpenAI, Anthropic and Dust that somebody opened this page. `alt` is empty
+          because the product's name is the next thing in the summary.
+        -->
+        <div class="providers">
+          <details class="provider">
+            <summary><img class="mark" src="chatgpt.svg" alt="" />Instructions for ChatGPT</summary>
+            <ol class="numbered">
+              <li>Settings &rarr; Plugins &rarr; Developer mode, and turn it on.</li>
+              <li>Back to Settings &rarr; Plugins, then the <strong>+</strong> beside the search box.</li>
+              <li>Paste the link as the server URL.</li>
+              <li>
+                Set Authentication to <strong>no authentication</strong>. It offers OAuth first, and
+                that cannot work &mdash; there is nothing here to log in to.
+              </li>
+            </ol>
+          </details>
+          <details class="provider">
+            <summary><img class="mark" src="claude.svg" alt="" />Instructions for claude.ai</summary>
+            <ol class="numbered">
+              <li>Settings &rarr; Connectors &rarr; Add custom connector.</li>
+              <li>Paste the link as the server URL.</li>
+              <li>Leave authentication empty. Claude checks for a sign-in service, finds none, and connects.</li>
+            </ol>
+          </details>
+          <details class="provider">
+            <summary><img class="mark" src="dust.png" alt="" />Instructions for Dust</summary>
+            <ol class="numbered">
+              <li>Admin &rarr; Tools &rarr; Add MCP server.</li>
+              <li>Paste the link as the server URL.</li>
+              <li>Leave authentication empty.</li>
+            </ol>
+          </details>
+        </div>
+        <p class="sub">The link is the whole credential. Nothing asks you to sign in to Douze.</p>
+
         <h2 class="section-heading">What a hosted assistant may do</h2>
         <p class="sub" id="writes-state"></p>
         <div class="actions">
@@ -65,57 +122,14 @@
           <button type="button" class="quiet" id="writes"></button>
         </div>
         <div class="actions">
-          <button type="button" class="quiet" id="rotate">Get a new link</button>
-          <button type="button" class="quiet danger" id="stop">Stop sharing</button>
+          <p>A new link retires the old one straight away.</p>
+          <span>
+            <button type="button" class="quiet" id="rotate">Get a new link</button>
+            <button type="button" class="quiet danger" id="stop">Stop sharing</button>
+          </span>
         </div>
       </section>
-      <section id="exposed">
-        <h2 class="section-heading">Results that look like passwords</h2>
-        <p class="sub">
-          When a tool's answer contains something shaped like a password, key or token, Douze holds
-          the whole answer back and says so. If a tool's answers always look like that and you meant
-          to send them, allow it here.
-        </p>
-        <p class="sub">
-          The two lists are kept apart on purpose: allowing a tool for an app on this computer does
-          not start sending that value to whoever runs the relay.
-        </p>
-        <h3>Apps on this computer</h3>
-        <ul class="steps" id="exposed-local"></ul>
-        <h3>Hosted assistants</h3>
-        <ul class="steps" id="exposed-remote"></ul>
-        <label class="field-label" for="expose-tool">Allow another tool's answers</label>
-        <select class="field" id="expose-tool"></select>
-        <p class="sub" id="expose-empty" hidden>Douze has no tools set up yet, so there is nothing to allow.</p>
-        <div class="actions">
-          <button type="button" class="quiet" id="expose-local">Allow for apps on this computer</button>
-          <button type="button" class="quiet" id="expose-remote">Allow for hosted assistants</button>
-        </div>
-      </section>
-      <section id="local">
-        <h2 class="section-heading">An app on this computer</h2>
-        <p class="sub" id="bridge-state"></p>
-        <p>
-          An app on this computer gets everything, including tools that delete things, so Douze will
-          not take one on trust just because it is running here: the app prints a short code, and
-          typing it in is you saying yes.
-        </p>
-        <p class="sub">
-          On this computer is not the same as staying on this computer. Claude Code, Cursor and
-          Claude Desktop are AI assistants too, so whatever a tool returns goes on to their own
-          model provider &mdash; including results from the tools that delete, which a hosted
-          assistant is never allowed to run.
-        </p>
-        <div class="copy-row">
-          <input class="field" id="pair-code" type="text" spellcheck="false" autocomplete="off"
-            aria-label="The code the app printed" />
-          <button type="button" class="primary" id="pair">Pair</button>
-        </div>
-        <div class="actions">
-          <p>Pairing lasts until you undo it here.</p>
-          <button type="button" class="quiet danger" id="unpair">Unpair</button>
-        </div>
-      </section>
+
       <section class="trust">
         <h2 class="section-heading">What you are trusting</h2>
         <ul>
@@ -129,10 +143,77 @@
           <li>Those result bodies are live data from your dashboards, fetched from your account just now.</li>
         </ul>
       </section>
+
+      <!--
+        Everything a default install never touches. Two controls that used to sit on screen for
+        everyone: the secret-gate exemptions, which only matter once a tool's answers are being
+        held back, and pairing an app on this computer, which most people never do at all.
+      -->
+      <details id="more">
+        <summary>Settings</summary>
+
+        <section>
+          <h3>Colour scheme</h3>
+          <div id="theme"></div>
+        </section>
+
+        <section id="exposed">
+          <h3>Results that look like passwords</h3>
+          <p class="sub">
+            When a tool's answer contains something shaped like a password, key or token, Douze holds
+            the whole answer back and says so. If a tool's answers always look like that and you meant
+            to send them, allow it here.
+          </p>
+          <p class="sub">
+            The two lists are kept apart on purpose: allowing a tool for an app on this computer does
+            not start sending that value to whoever runs the relay.
+          </p>
+          <h3>Apps on this computer</h3>
+          <ul class="steps" id="exposed-local"></ul>
+          <h3>Hosted assistants</h3>
+          <ul class="steps" id="exposed-remote"></ul>
+          <label class="field-label" id="expose-tool-label" for="expose-tool">Allow another tool's answers</label>
+          <select class="field" id="expose-tool"></select>
+          <p class="sub" id="expose-empty" hidden>Douze has no tools set up yet, so there is nothing to allow.</p>
+          <div class="actions">
+            <span>
+              <button type="button" class="quiet" id="expose-local">Allow for apps on this computer</button>
+              <button type="button" class="quiet" id="expose-remote">Allow for hosted assistants</button>
+            </span>
+          </div>
+        </section>
+
+        <section id="local">
+          <h3>An app on this computer</h3>
+          <p class="sub" id="bridge-state"></p>
+          <p class="sub">
+            An app on this computer gets everything, including tools that delete things, so Douze will
+            not take one on trust just because it is running here: the app prints a short code, and
+            typing it in is you saying yes.
+          </p>
+          <p class="sub">
+            On this computer is not the same as staying on this computer. Claude Code, Cursor and
+            Claude Desktop are AI assistants too, so whatever a tool returns goes on to their own
+            model provider &mdash; including results from the tools that delete, which a hosted
+            assistant is never allowed to run.
+          </p>
+          <div class="copy-row">
+            <input class="field" id="pair-code" type="text" spellcheck="false" autocomplete="off"
+              aria-label="The code the app printed" />
+            <button type="button" class="primary" id="pair">Pair</button>
+          </div>
+          <div class="actions">
+            <p>Pairing lasts until you undo it here.</p>
+            <button type="button" class="quiet danger" id="unpair">Unpair</button>
+          </div>
+        </section>
+      </details>
+
       <!--
         One dialog for the whole page, and outside every section that hides itself: it guards the
         write opt-in and the link controls, which live under "ready", and the secret-gate grant,
-        which is on screen whether or not anything is connected.
+        which is inside the Settings disclosure. A dialog nested in either would be unreachable
+        exactly when its own control was clicked.
       -->
       <dialog class="confirm" id="confirm">
         <p id="confirm-copy"></p>

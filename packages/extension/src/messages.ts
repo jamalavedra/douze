@@ -27,6 +27,12 @@ export interface CredentialHint {
   segment?: number
   expression: string
   prefix: string
+  /**
+   * The header value itself, and only when `expression` is empty because the page keeps it nowhere
+   * readable. The worker parks it in session memory and strips it before anything is stored — see
+   * `parkLiteral` in background.ts. It never reaches an Exchange.
+   */
+  value?: string
 }
 
 export interface RequestEvent {
@@ -141,12 +147,23 @@ export type ReviewCommand =
   | { type: 'douze:review:enable'; sessionId: string; names: string[] }
   | { type: 'douze:review:disable'; sessionId: string; names: string[] }
   | { type: 'douze:review:save'; sessionId: string }
+  /**
+   * The decision on a header the page keeps nowhere readable: keep a copy for this origin and
+   * resend it, or forget it. Asked per origin because that is the granularity of the trust.
+   */
+  | { type: 'douze:review:credential'; sessionId: string; origin: string; header: string; allow: boolean }
 
 /** What `douze:review:load` answers with — the shape douzed's `GET /api/review/:id` returned. */
 export interface ReviewState {
   site: string
   recipe: string
   candidates: CandidateView[]
+  /**
+   * Credential headers this capture used that Douze cannot re-read from the page, waiting for a
+   * decision. The value is shown, because a person cannot consent to keeping something they have
+   * not seen. Empty for every ordinary site.
+   */
+  pending_credentials: { origin: string; header: string; value: string }[]
 }
 
 /** What `douze:review:save` answers with: the tools now on the surface. */
@@ -264,6 +281,13 @@ export interface ConnectState {
    */
   exposed: { local: string[]; remote: string[] }
   bridge: BridgeState
+  /**
+   * The relay has forgotten this link — it answered 1008 for the stored token, which is what a
+   * relay says about every endpoint it held before it restarted. Distinct from `connected: false`,
+   * which is a link that is merely idle and will come back on its own. This one never will, so the
+   * page has to stop reassuring and say what fixes it.
+   */
+  stale: boolean
   /** Set when an action could not be carried out; the page shows it and changes nothing. */
   error?: string
   /** Set when the action WAS carried out but something about it did not work — see `stop`. */

@@ -1,4 +1,5 @@
 import type { CandidateView } from '@douze/studio/browser'
+import { applyTheme } from './theme.js'
 import type { ReviewCommand, ReviewSaved, ReviewState } from '../messages.js'
 
 /**
@@ -35,6 +36,8 @@ const el = (tag: string, props: Record<string, unknown> = {}, children: (Node | 
   return node
 }
 const byId = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T
+
+applyTheme()
 const fail = (sentence: string): void => {
   byId('error').textContent = sentence
 }
@@ -190,11 +193,49 @@ function syncButton(): void {
   byId<HTMLButtonElement>('none').disabled = count === 0
 }
 
+/**
+ * One row per header awaiting a decision, with the value in full. Two buttons and no default: a
+ * pre-ticked box is not consent, and this is the one control in Douze that persists a credential.
+ */
+function renderPending(): void {
+  const rows = state?.pending_credentials ?? []
+  byId('credentials').hidden = rows.length === 0
+  // Collapsed, but the summary has to carry the whole point on one line: a reader who never opens
+  // it should still know a skill here will not authenticate until they do.
+  byId('credentials-summary').textContent =
+    rows.length === 1
+      ? `This site needs a token Douze cannot look up — decide about ${rows[0]?.header}`
+      : `This site needs ${rows.length} tokens Douze cannot look up — decide about them`
+  byId<HTMLUListElement>('pending').replaceChildren(
+    ...rows.map((row) => {
+      const decide = (allow: boolean): void => {
+        void send({ type: 'douze:review:credential', sessionId: SESSION, origin: row.origin, header: row.header, allow })
+          .then((next) => {
+            state = next as ReviewState
+            render()
+          })
+          .catch(() => fail('Douze could not record that choice. Nothing was kept.'))
+      }
+      const allow = el('button', { type: 'button', className: 'primary', textContent: 'Keep it for this site' })
+      allow.addEventListener('click', () => decide(true))
+      const deny = el('button', { type: 'button', className: 'quiet', textContent: "Don't keep it" })
+      deny.addEventListener('click', () => decide(false))
+      return el('li', {}, [
+        el('p', { className: 'desc', textContent: `${row.header} on ${row.origin}` }),
+        el('p', { className: 'name', textContent: row.value }),
+        el('div', { className: 'decide' }, [allow, deny]),
+      ])
+    }),
+  )
+}
+
 function render(): void {
+  renderPending()
   if (!state) return
   byId('eyebrow').textContent = `Douze · ${state.site}`
   byId('title').textContent = 'Choose what to keep'
-  byId('sub').textContent = 'Everything that only reads is selected. Turn on anything that makes changes.'
+  byId('sub').textContent =
+    'Everything Douze found is selected. Turn off anything you would rather it could not do.'
   const groups = byId('groups')
   groups.textContent = ''
   for (const kind of ['read', 'write', 'destructive'] as const) {
@@ -219,7 +260,16 @@ async function load(): Promise<void> {
   // the user had never read — the same thing AC-REC-002.3 refuses to do through the bulk API.
   if (!seeded) {
     seeded = true
-    for (const candidate of state.candidates) if (candidate.bulk_approvable) chosen.add(candidate.name)
+    /**
+     * Everything, including the ones that change and remove things. Reads-only was the safer
+     * default and it made the common case wrong: somebody records a dashboard to get work done and
+     * then unticks nothing, so the friction bought nothing but a second pass.
+     *
+     * What still stands between a pre-ticked delete and a deleted thing: a destructive tool is never
+     * offered to a hosted assistant at all, and locally it refuses every call that does not carry
+     * `confirm: true`. The list is on screen, grouped, and each row says what it does.
+     */
+    for (const candidate of state.candidates) chosen.add(candidate.name)
   }
   render()
 }

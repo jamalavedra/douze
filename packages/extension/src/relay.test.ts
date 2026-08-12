@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { CROSS_ORIGIN_REFUSED, PERMISSION_MISSING } from './guards.js'
 import {
+  approvedLiterals,
   credentialHeaders,
   executeRelay,
   isExpired,
@@ -479,10 +480,167 @@ describe('isLoginRedirect (AC-EXE-002.1)', () => {
   })
 })
 
+/**
+ * X rejects any request whose `x-csrf-token` does not match its `ct0` cookie, with a 403, while the
+ * session is perfectly valid. That header is redacted at capture — it is a credential — so the only
+ * way a replay can carry it is to re-read it from the page, and discovery searched storage only.
+ */
+/**
+ * `<meta name="csrf-token">` is the Rails, Laravel and Django convention, and five of opencli's own
+ * site adapters read exactly it — which is a fair proxy for how common it is on ordinary
+ * dashboards. Reading the page's own DOM stores no value, the same property the cookie and storage
+ * expressions have.
+ */
+/**
+ * The last resort, and the only credential source that stores a value: a token the site hardcodes in
+ * its own JavaScript. x.com's `authorization` bearer is the case — measured against the live site,
+ * cookies alone give 403, cookies plus the CSRF cookie give 403, and adding this header gets past
+ * authentication. Nothing Douze can read from the page produces it.
+ */
+/**
+ * The consent store. A token the page keeps nowhere readable is parked in session memory, shown on
+ * the review page with its value, and persisted only if somebody allows that site — because no rule
+ * separates x.com's public app bearer from a personal session token: both are low-entropy strings in
+ * an `authorization` header.
+ */
+describe('a credential the user allowed Douze to keep', () => {
+  const store: Record<string, unknown> = {}
+  /** Restored after each case: leaving a fake `chrome` behind breaks every suite below this one. */
+  const withStore = (rows?: unknown): void => {
+    for (const key of Object.keys(store)) delete store[key]
+    if (rows !== undefined) store['auth:literals'] = rows
+    ;(globalThis as { chrome?: unknown }).chrome = {
+      storage: { local: { get: async (k: string) => ({ [k]: store[k] }) } },
+    }
+  }
+
+  it('sends nothing for an origin nobody approved', async () => {
+    withStore()
+    expect(await approvedLiterals('https://x.com')).toEqual({})
+  })
+
+  it('sends the allowed header, with its prefix, for that origin only', async () => {
+    withStore({ 'https://x.com': [{ header: 'authorization', value: 'APP-CONSTANT', prefix: 'Bearer ' }] })
+    expect(await approvedLiterals('https://x.com')).toEqual({ authorization: 'Bearer APP-CONSTANT' })
+    // Consent is per origin: another site gets nothing, however similar.
+    expect(await approvedLiterals('https://api.x.com')).toEqual({})
+  })
+
+  it('answers empty rather than failing the call when there is no store at all', async () => {
+    const saved = (globalThis as { chrome?: unknown }).chrome
+    ;(globalThis as { chrome?: unknown }).chrome = undefined
+    expect(await approvedLiterals('https://x.com')).toEqual({})
+    ;(globalThis as { chrome?: unknown }).chrome = saved
+  })
+})
+
+describe('a credential the site hardcodes', () => {
+  const BEARER = 'AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs'
+
+  it('sends the stored value with its prefix', () => {
+    const headers = credentialHeaders(
+      [{ kind: 'literal', value: BEARER, header: 'authorization', prefix: 'Bearer ' }],
+      [],
+    )
+    expect(headers).toEqual({ authorization: `Bearer ${BEARER}` })
+  })
+
+  /**
+   * The bug this shape invites: `values` is indexed by page-state source, because those are the only
+   * ones that were read from the page. A literal advancing that index would hand the NEXT header the
+   * previous one's value — a CSRF token sent as an authorization bearer, and both wrong.
+   */
+  it('does not consume a page-state read, whichever order they are in', () => {
+    const csrf = { kind: 'page_state' as const, expression: 'document.cookie["ct0"]', header: 'x-csrf-token', prefix: '' }
+    const bearer = { kind: 'literal' as const, value: BEARER, header: 'authorization', prefix: 'Bearer ' }
+    const expected = { 'x-csrf-token': 'live-ct0', authorization: `Bearer ${BEARER}` }
+    expect(credentialHeaders([bearer, csrf], ['live-ct0'])).toEqual(expected)
+    expect(credentialHeaders([csrf, bearer], ['live-ct0'])).toEqual(expected)
+  })
+
+  it('is not read from the page at all', () => {
+    // `pageStateSources` is what produces the reads, so a literal must not appear among them.
+    expect(pageStateSources([{ kind: 'literal', value: BEARER, header: 'authorization', prefix: '' }])).toEqual([])
+  })
+})
+
+describe('a credential the page publishes in its DOM', () => {
+  const withHead = (html: string): void => {
+    const tags = [...html.matchAll(/<meta ([\w:-]+)="([^"]*)" content="([^"]*)">/g)].map(([, attr, name, content]) => ({
+      attr,
+      name,
+      content,
+    }))
+    Object.defineProperty(globalThis, 'document', {
+      configurable: true,
+      value: {
+        querySelector: (selector: string) => {
+          const wanted = [...selector.matchAll(/meta\[(?:name|property)="([^"]+)"\]/g)].map(([, n]) => n)
+          const hit = tags.find((tag) => wanted.includes(tag.name))
+          return hit ? { getAttribute: (a: string) => (a === 'content' ? hit.content : null) } : null
+        },
+      },
+    })
+  }
+
+  it('reads a csrf token out of a meta tag', () => {
+    withHead('<meta name="csrf-token" content="qX7mN4pR8sT1vW6u">')
+    expect(readPageCredentials(['document.querySelector(\'meta[name="csrf-token"]\').content'])).toEqual([
+      'qX7mN4pR8sT1vW6u',
+    ])
+  })
+
+  it('answers null for a meta tag that is not there', () => {
+    withHead('<meta name="other" content="x">')
+    expect(readPageCredentials(['document.querySelector(\'meta[name="csrf-token"]\').content'])).toEqual([null])
+  })
+
+  /** Only `meta[...]` and only `.content`: a general selector plus a general property would be a
+   * page-scraping primitive rather than a credential lookup. */
+  it('refuses a selector that is not a meta tag', () => {
+    withHead('<meta name="csrf-token" content="secret">')
+    expect(readPageCredentials(['document.querySelector(\'input[name=token]\').value'])).toEqual([null])
+    expect(readPageCredentials(['document.querySelector(\'meta[name="csrf-token"]\').outerHTML'])).toEqual([null])
+  })
+})
+
+describe('a credential the page keeps in a cookie', () => {
+  const withCookie = (jar: string): void => {
+    Object.defineProperty(globalThis, 'document', { value: { cookie: jar }, configurable: true })
+  }
+
+  it('reads one named cookie, not the whole jar', () => {
+    withCookie('lang=en; ct0=9f3a1c0b7e2d4a6f8c1b3e5d7a9f0c2e; theme=dark')
+    expect(readPageCredentials(['document.cookie["ct0"]'])).toEqual(['9f3a1c0b7e2d4a6f8c1b3e5d7a9f0c2e'])
+  })
+
+  it('decodes the value and answers null for a cookie that is not there', () => {
+    withCookie('csrf=a%2Fb%2Bc')
+    expect(readPageCredentials(['document.cookie["csrf"]'])).toEqual(['a/b+c'])
+    expect(readPageCredentials(['document.cookie["absent"]'])).toEqual([null])
+  })
+
+  it('does not match a cookie whose name merely ends the same way', () => {
+    withCookie('not_ct0=wrong; ct0=right')
+    expect(readPageCredentials(['document.cookie["ct0"]'])).toEqual(['right'])
+  })
+
+  /** The whole-jar form still works, for a recipe recorded before the named form existed. */
+  it('keeps supporting the whole-jar expression', () => {
+    withCookie('a=1; b=2')
+    expect(readPageCredentials(['document.cookie'])).toEqual(['a=1; b=2'])
+  })
+})
+
 describe('isExpired', () => {
-  it('classifies 401 and 403 as expired', () => {
+  it('classifies a 401 as expired', () => {
     expect(isExpired(401, false)).toBe(true)
-    expect(isExpired(403, false)).toBe(true)
+  })
+
+  /** A 403 is a request understood and refused — a missing CSRF token, or a permission the
+   * account lacks. Notifying "you have been signed out" for one sent the user to sign in twice. */
+  it('does not treat a 403 as expired', () => {
+    expect(isExpired(403, false)).toBe(false)
   })
 
   it('classifies a login redirect as expired whatever the status', () => {

@@ -51,6 +51,40 @@ declare global {
   }
 
   function search(value: string): string | null {
+    /**
+     * A cookie the page can read. X keeps its CSRF token in `ct0` and rejects any request whose
+     * `x-csrf-token` header does not match it with a 403 — so with storage the only place searched,
+     * that header was redacted at capture, never re-read at replay, and every call failed while the
+     * user was perfectly signed in.
+     *
+     * `document.cookie` cannot see an `HttpOnly` cookie, which is the one that actually authorises
+     * the session: those are still sent by the browser and never read by Douze. What lands in the
+     * recipe is the cookie's NAME, exactly as the storage hints record a key.
+     */
+    try {
+      for (const pair of document.cookie.split('; ')) {
+        const split = pair.indexOf('=')
+        if (split <= 0) continue
+        if (decodeURIComponent(pair.slice(split + 1)) === value) {
+          return `document.cookie[${JSON.stringify(pair.slice(0, split))}]`
+        }
+      }
+    } catch {
+      // A sandboxed page throws on `document.cookie` outright.
+    }
+    /**
+     * `<meta name="csrf-token" content="…">` — the Rails/Laravel/Django convention, and how a great
+     * many dashboards authorise a write. Searched before storage because it is cheap and exact.
+     */
+    try {
+      for (const tag of document.querySelectorAll('meta[content]')) {
+        if (tag.getAttribute('content') !== value) continue
+        const name = tag.getAttribute('name') ?? tag.getAttribute('property')
+        if (name) return `document.querySelector('meta[name="${name}"]').content`
+      }
+    } catch {
+      // A document that is gone by the time a response resolves.
+    }
     for (const [name, store] of [
       ['localStorage', window.localStorage],
       ['sessionStorage', window.sessionStorage],
@@ -125,20 +159,35 @@ declare global {
     return found
   }
 
-  function credentialsIn(headers: Record<string, string>): { header: string; expression: string; prefix: string }[] {
-    const found: { header: string; expression: string; prefix: string }[] = []
+  /** Header names whose value authorises a request, and nothing else. */
+  const CREDENTIAL_HEADER = /^(authorization|x-csrf-token|x-xsrf-token|x-api-key|x-auth-token|x-access-token)$/i
+
+  function credentialsIn(
+    headers: Record<string, string>,
+  ): { header: string; expression: string; prefix: string; value?: string }[] {
+    const found: { header: string; expression: string; prefix: string; value?: string }[] = []
     for (const [header, value] of Object.entries(headers)) {
       if (typeof value !== 'string' || !value) continue
       const space = value.indexOf(' ')
       const candidates: [string, string][] =
         space > 0 && space < 12 ? [[value.slice(space + 1), value.slice(0, space + 1)], [value, '']] : [[value, '']]
+      let located = false
       for (const [token, prefix] of candidates) {
         const expression = locate(token)
         if (expression) {
           found.push({ header, expression, prefix })
+          located = true
           break
         }
       }
+      /**
+       * A credential header Douze cannot locate in the page. The value travels to the worker, which
+       * parks it in session memory and STRIPS it before anything is stored — see `parkLiteral`.
+       * Nothing persists it until a person has seen the value and allowed that site, because no rule
+       * can tell a public app constant from somebody's session token: `AAAA…` (x.com's, public) and
+       * `user-session-token-for-ada` (a secret) are both low-entropy strings in the same header.
+       */
+      if (!located && CREDENTIAL_HEADER.test(header)) found.push({ header, expression: '', prefix: '', value })
     }
     return found
   }

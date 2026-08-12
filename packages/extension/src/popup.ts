@@ -1,4 +1,5 @@
 import type { PopupCommand, PopupStatus, SiteTool, SiteToolsResult } from './messages.js'
+import { applyTheme, mountThemeSwitch } from './pages/theme.js'
 
 /**
  * T-001.8 — one screen, one primary button, no port and no token.
@@ -12,6 +13,10 @@ import type { PopupCommand, PopupStatus, SiteTool, SiteToolsResult } from './mes
  */
 
 const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T
+
+// Before anything is drawn: an override otherwise paints the other scheme first.
+applyTheme()
+mountThemeSwitch(document.getElementById('theme'))
 
 const el = {
   unsupported: $<HTMLElement>('unsupported'),

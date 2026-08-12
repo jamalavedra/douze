@@ -139,6 +139,9 @@ export async function importHar(har: unknown, name: string, captures: CaptureSto
     const candidate = {
       url: entry.request.url,
       origin: origin ?? '',
+      // Passed for the same reason live capture passes it: a bodiless write is kept, a bodiless
+      // GET is not. Leaving it out here is what makes the two paths drift (AC-CAP-006.1).
+      method: entry.request.method,
       response_content_type: entry.response.content?.mimeType,
     }
     if (origin === null || !shouldCapture(candidate, [primary])) {

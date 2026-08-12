@@ -1,114 +1,231 @@
 /*
- * WO-015 T-015.4 — the review and connect pages, byte-for-byte the `STYLE` constant studio's
- * `app.ts` inlines, only de-indented. Kept identical so a diff proves the pages still look the
- * same; it stops being a copy at all when T-015.13 deletes douzed and studio's page with it.
- * The `.notice` rules ride along for that reason: no page here uses them.
+ * The one stylesheet behind every Douze surface: the popup, review, connect and data.
+ *
+ * Ink on warm paper, a serif for the things you read and a small quiet sans for the things you
+ * operate. Flat throughout — hairline borders carry every edge, and nothing floats on a shadow.
+ *
+ * Both schemes come out of ONE palette: `light-dark()` resolves against the computed
+ * `color-scheme`, so the theme switch sets that single property on <html> and every token below
+ * flips with it. No second block to keep in sync, and no theme class threaded through any rule.
+ * Untouched, `color-scheme: light dark` means the OS decides — which is what a user who never
+ * opens the switch gets.
+ *
+ * ponytail: the type stack names Inter and IBM Plex Serif and falls through to system-ui and
+ * Georgia, which is what actually renders — no font binary ships with the extension. Bundle the
+ * two woff2 files here if the fallback ever reads wrong.
  */
 :root {
   color-scheme: light dark;
-  --bg: light-dark(#f7fbfc, #080a0b);
-  --surface: light-dark(#ffffff, #111517);
-  --surface-soft: light-dark(#edf7fa, #182124);
-  --fg: light-dark(#080a0b, #ffffff);
-  --muted: light-dark(#596267, #aeb9bd);
-  --line: light-dark(#d8e5e8, #2a393e);
-  --accent: light-dark(#008bad, #56d9f5);
-  --brand-blue: #00bce8;
-  --brand-red: #f31b1b;
-  --safe: light-dark(#007d9e, #56d9f5);
-  --changes: light-dark(#d91b1b, #ff6b6b);
-  --danger: light-dark(#b70808, #ff6b6b);
+  --paper: light-dark(#fdfdfc, #100f0e);
+  --card: light-dark(#ffffff, #191817);
+  --ink: light-dark(#111111, #edecea);
+  --on-ink: light-dark(#ffffff, #100f0e);
+  --ink-70: light-dark(rgba(0, 0, 0, 0.7), rgba(255, 255, 255, 0.72));
+  --ink-55: light-dark(rgba(0, 0, 0, 0.55), rgba(255, 255, 255, 0.56));
+  --ink-40: light-dark(rgba(0, 0, 0, 0.4), rgba(255, 255, 255, 0.42));
+  --line: light-dark(rgba(0, 0, 0, 0.1), rgba(255, 255, 255, 0.14));
+  --line-soft: light-dark(rgba(0, 0, 0, 0.06), rgba(255, 255, 255, 0.08));
+  --wash: light-dark(rgba(0, 0, 0, 0.03), rgba(255, 255, 255, 0.05));
+  --accent: light-dark(#4c74ff, #93a7ff);
+  --changes: light-dark(#b45309, #e0a163);
+  --danger: light-dark(#b91c1c, #f08a8a);
+  --font: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-title: "IBM Plex Serif", Georgia, "Times New Roman", serif;
+  --radius: 0.375rem;
+  --radius-lg: 0.5rem;
 }
+/* The switch writes one of these onto <html>; absent, the OS decides. */
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"] { color-scheme: dark; }
 * { box-sizing: border-box; }
 body {
-  background: var(--bg); color: var(--fg); margin: 0;
-  font: 15px/1.55 ui-rounded, system-ui, -apple-system, sans-serif;
+  background: var(--paper); color: var(--ink); margin: 0;
+  font: 15px/1.55 var(--font);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
-main { margin: 0 auto; padding: 52px 0 72px; width: min(620px, calc(100% - 32px)); }
-h1, h2, p { margin-top: 0; }
-h1 { font-size: clamp(28px, 6vw, 36px); letter-spacing: -.035em; line-height: 1.12; margin-bottom: 10px; }
-h2 { font-size: 16px; line-height: 1.35; margin-bottom: 3px; }
-.hero { margin-bottom: 28px; }
-.brand { align-items: center; display: flex; gap: 10px; margin-bottom: 14px; }
-.brand-icon { height: 42px; object-fit: contain; width: 42px; }
-.eyebrow { color: var(--brand-red); font-size: 13px; font-weight: 700; margin: 0; }
-.sub { color: var(--muted); font-size: 15px; margin: 0; max-width: 560px; }
-.toolbar { align-items: center; border-bottom: 1px solid var(--line); display: flex; gap: 16px; justify-content: space-between; margin-bottom: 30px; padding: 0 0 14px; }
-.toolbar p { margin: 0; }
-#total { color: var(--muted); margin-left: 5px; }
-.selection-actions { display: flex; gap: 4px; }
-.group { margin: 0 0 30px; }
-.group-heading { margin: 0 0 10px; }
-.group-heading p { color: var(--muted); font-size: 13px; margin: 0; }
-.group-count { color: var(--muted); font-size: 13px; font-weight: 500; }
-.group-hint { color: var(--muted); font-size: 12px; margin-top: 2px; }
-ul { display: grid; gap: 10px; list-style: none; margin: 0; padding: 0; }
-.skill { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; transition: background-color .18s ease, border-color .18s ease, opacity .18s ease; }
-.skill:has(input:checked) { border-color: light-dark(#a8dce8, #326372); }
-.skill:has(input:not(:checked)) { background: var(--surface-soft); opacity: .5; }
-.head { align-items: flex-start; display: grid; gap: 12px; grid-template-columns: 40px 1fr; }
-.skill-copy { padding-top: 6px; }
-.desc { font-size: 15px; font-weight: 650; margin: 0; }
-.full-desc { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
-.meta { align-items: baseline; color: var(--muted); display: flex; flex-wrap: wrap; font-size: 12px; gap: 6px 10px; margin: 8px 0 0; }
-.name { color: var(--muted); font-family: ui-monospace, monospace; font-size: 12px; font-weight: 400; }
-.warn, .consequence { font-size: 13px; margin: 5px 0 0; }
-.warn { color: var(--muted); }
+main { margin: 0 auto; padding: 44px 0 72px; width: min(600px, calc(100% - 32px)); }
+h1, h2, h3, p { margin-top: 0; }
+
+/* Serif, and the only thing on a page allowed to be large. */
+h1 { font-family: var(--font-title); font-size: 1.5rem; font-weight: 500; letter-spacing: -0.01em; line-height: 1.25; margin-bottom: 8px; }
+h2 { font-size: 1rem; font-weight: 550; letter-spacing: -0.005em; line-height: 1.35; margin-bottom: 3px; }
+h3 { color: var(--ink-70); font-size: 0.8125rem; font-weight: 500; letter-spacing: -0.005em; margin: 18px 0 8px; }
+/* A section label, not a heading you read: small, quiet, and it sits on a rule. */
+.section-heading {
+  border-top: 1px solid var(--line-soft); color: var(--ink-70);
+  font-family: var(--font); font-size: 0.8125rem; font-weight: 550; letter-spacing: -0.005em;
+  margin: 34px 0 12px; padding-top: 16px;
+}
+.hero { margin-bottom: 26px; }
+.brand { align-items: center; display: flex; gap: 8px; margin-bottom: 18px; }
+.brand-icon { height: 24px; object-fit: contain; width: 24px; }
+.eyebrow { color: var(--ink-40); font-size: 0.75rem; font-weight: 500; letter-spacing: 0.02em; margin: 0; }
+.sub { color: var(--ink-55); font-size: 0.875rem; margin: 0; max-width: 62ch; }
+/* Paragraphs set solid read as one paragraph; a label pressed against prose reads as its last
+   line. Everything that stacks in a section gets air, and only where something precedes it.
+   Specificity matters here: `.sub` sets margin: 0, so the pairs it takes part in must name it. */
+.sub + .sub, .sub + .field-label, p + p, p + .field-label, ul + .field-label, .field + .field-label { margin-top: 10px; }
+
+/* --- lists and cards ---------------------------------------------------- */
+ul { display: grid; gap: 6px; list-style: none; margin: 0; padding: 0; }
+.steps li, .skill {
+  background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
+  font-size: 0.875rem; overflow-wrap: anywhere; padding: 10px 12px;
+}
+.mark { border-radius: 4px; flex: 0 0 18px; height: 18px; width: 18px; }
+
+/* One folded row per product, drawn as a single bordered card of disclosures. */
+.providers { border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+.provider { border-top: 1px solid var(--line); margin: 0; padding: 0; }
+.provider:first-child { border-top: 0; }
+.provider > summary { color: var(--ink); font-size: 0.875rem; padding: 10px 12px; width: auto; }
+.provider > summary:hover { background: var(--wash); }
+.provider[open] > summary { border-bottom: 1px solid var(--line-soft); }
+.numbered { color: var(--ink-55); font-size: 0.8125rem; padding: 10px 12px 12px 32px; }
+.numbered li { margin-bottom: 6px; padding-left: 2px; }
+.numbered li:last-child { margin-bottom: 0; }
+.skill { padding: 12px 14px; transition: border-color 0.15s ease, opacity 0.15s ease; }
+.skill:has(input:checked) { border-color: light-dark(rgba(0, 0, 0, 0.22), rgba(255, 255, 255, 0.3)); }
+.skill:has(input:not(:checked)) { background: transparent; opacity: 0.55; }
+.head { align-items: flex-start; display: grid; gap: 10px; grid-template-columns: 24px 1fr; }
+/**
+ * `min-width: 0` and `anywhere` together, and both are needed.
+ *
+ * A description is written from a recorded site, so it carries that site's own URLs — X produces
+ * `/i/api/graphql/vrauE07yHNM5LYI2WBJ7lA/CommunitiesFetchOneQuery`, one unbreakable 60-character
+ * word. A grid child defaults to `min-width: auto`, so the `1fr` column was sized by that word, the
+ * card grew past 600px, and the whole page got a horizontal scrollbar with the text cut off.
+ * `break-word` does not fix it — only `anywhere` reduces the min-content width a grid track uses.
+ */
+.skill-copy { min-width: 0; padding-top: 1px; }
+.desc { font-size: 0.9375rem; font-weight: 550; margin: 0; overflow-wrap: anywhere; }
+.full-desc, .warn, .consequence { color: var(--ink-55); font-size: 0.8125rem; margin: 6px 0 0; overflow-wrap: anywhere; }
+.meta { align-items: baseline; color: var(--ink-40); display: flex; flex-wrap: wrap; font-size: 0.75rem; gap: 4px 10px; margin: 6px 0 0; }
+.name { color: var(--ink-40); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.75rem; }
+/* A token has no spaces, so without this it runs straight out of whatever contains it. */
+.name { overflow-wrap: anywhere; }
+/* Two answers to one question belong together; `.actions` spaces a caption from a button. */
+.decide { display: flex; gap: 6px; margin-top: 12px; }
 .write .consequence { color: var(--changes); }
 .destructive .consequence { color: var(--danger); }
-.toggle { align-items: center; cursor: pointer; display: inline-flex; flex: 0 0 40px; height: 40px; justify-content: center; }
-.toggle input { accent-color: var(--brand-blue); cursor: pointer; height: 22px; margin: 0; transition: transform .14s ease; width: 22px; }
-.toggle:active input { transform: scale(.9); }
-.sr-only { clip: rect(0, 0, 0, 0); clip-path: inset(50%); height: 1px; overflow: hidden; position: absolute; white-space: nowrap; width: 1px; }
-details { margin: 8px 0 0 52px; }
-details:not([open]) > :not(summary) { display: none; }
-details[open] > :not(summary) { animation: details-in .2s cubic-bezier(.2, .7, .2, 1) both; }
-summary { align-items: center; color: var(--muted); cursor: pointer; display: flex; font-size: 12px; min-height: 32px; width: fit-content; }
-pre { background: var(--surface-soft); border-radius: 8px; font-size: 12px; margin: 8px 0 0; max-height: 220px; overflow: auto; padding: 12px; }
-.actions { align-items: center; border-top: 1px solid var(--line); display: flex; gap: 20px; justify-content: space-between; margin-top: 10px; padding: 24px 2px 0; }
-.actions p { color: var(--muted); font-size: 13px; margin: 0; }
-.primary {
-  background: var(--brand-blue); border: 1px solid transparent; border-radius: 999px; color: #061014;
-  cursor: pointer; flex: 0 0 auto; font: inherit; font-weight: 700; min-height: 44px; padding: 9px 20px;
-  transition: filter .16s ease, transform .16s ease;
+.toggle { align-items: center; cursor: pointer; display: inline-flex; flex: 0 0 24px; height: 24px; justify-content: center; }
+.toggle input { accent-color: var(--accent); cursor: pointer; height: 16px; margin: 0; width: 16px; }
+
+/* --- groups and toolbar -------------------------------------------------- */
+.group { margin: 0 0 26px; }
+.group-heading { margin: 0 0 8px; }
+.group-heading p, .group-count { color: var(--ink-55); font-size: 0.8125rem; margin: 0; }
+.group-hint { color: var(--ink-40); font-size: 0.75rem; margin: 2px 0 0; }
+.toolbar { align-items: center; border-bottom: 1px solid var(--line-soft); display: flex; font-size: 0.8125rem; gap: 16px; justify-content: space-between; margin-bottom: 22px; padding-bottom: 10px; }
+.toolbar p { margin: 0; }
+.toolbar strong { font-weight: 550; }
+#total { color: var(--ink-40); margin-left: 5px; }
+.selection-actions { display: flex; gap: 2px; }
+
+/* --- controls ------------------------------------------------------------ */
+.actions { align-items: center; display: flex; flex-wrap: wrap; gap: 8px 14px; justify-content: space-between; margin-top: 14px; }
+.actions p { color: var(--ink-40); font-size: 0.8125rem; margin: 0; }
+.primary, .quiet {
+  border-radius: var(--radius); cursor: pointer; font-family: var(--font);
+  font-size: 0.8125rem; font-weight: 500; padding: 0.4375rem 0.875rem;
+  transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
 }
-.primary:not(:disabled):hover { filter: brightness(1.06); transform: translateY(-1px); }
-.primary:not(:disabled):active { transform: translateY(0) scale(.98); }
-.primary[disabled] { background: var(--surface-soft); border-color: var(--line); color: var(--muted); cursor: not-allowed; }
-.quiet { align-items: center; background: none; border: 0; color: var(--accent); cursor: pointer; display: inline-flex; font: inherit; font-size: 13px; min-height: 40px; padding: 8px; transition: color .16s ease, opacity .16s ease; }
-.quiet:hover { text-decoration: underline; }
-.quiet:disabled { color: var(--muted); cursor: default; text-decoration: none; }
-.section-heading { font-size: 16px; margin: 26px 0 10px; }
-.field-label { color: var(--muted); display: block; font-size: 13px; margin-bottom: 6px; }
-.copy-row { align-items: center; display: flex; gap: 8px; }
-.field { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; color: var(--fg); flex: 1 1 auto; font: inherit; font-family: ui-monospace, monospace; font-size: 13px; min-height: 44px; min-width: 0; padding: 10px 12px; }
-.steps li { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; }
-.trust { background: var(--surface-soft); border: 1px solid var(--line); border-radius: 18px; margin-top: 30px; padding: 4px 24px 22px; }
-.trust li { color: var(--muted); font-size: 13px; }
-.confirm { background: var(--surface); border: 1px solid var(--danger); border-radius: 12px; color: var(--fg); margin-top: 14px; max-width: 52ch; padding: 16px 18px; }
-.confirm p { font-size: 14px; }
+.primary { background: var(--ink); border: 1px solid var(--ink); color: var(--on-ink); }
+.primary:not(:disabled):hover { background: light-dark(#000000, #ffffff); border-color: light-dark(#000000, #ffffff); }
+.primary[disabled] { background: var(--card); border-color: var(--line); color: var(--ink-40); cursor: not-allowed; }
+.quiet { background: var(--card); border: 1px solid var(--line); color: var(--ink-55); }
+.quiet:hover:not(:disabled) { background: var(--wash); color: var(--ink-70); }
+.quiet:disabled { color: var(--ink-40); cursor: not-allowed; opacity: 0.6; }
 .quiet.danger { color: var(--danger); }
-.success, .notice { background: var(--surface); border: 1px solid var(--line); border-radius: 18px; padding: 24px; }
-.success { align-items: flex-start; display: flex; gap: 14px; }
-.success:not([hidden]) { animation: success-in .26s cubic-bezier(.2, .7, .2, 1) both; }
-.success h2 { font-size: 20px; margin-bottom: 5px; }
-.success p { color: var(--muted); margin-bottom: 10px; }
-.success-mark { align-items: center; background: var(--surface-soft); border-radius: 50%; color: var(--safe); display: inline-flex; flex: 0 0 34px; font-weight: 800; height: 34px; justify-content: center; }
-.notice-icon { display: block; height: 54px; margin-bottom: 16px; object-fit: contain; width: 54px; }
-#error { color: var(--danger); font-size: 13px; margin: 14px 0 0; }
+.quiet.danger:hover:not(:disabled) { color: var(--danger); }
+
+/* A joined group of buttons where exactly one is on: the theme switch's three states. */
+.segmented { display: inline-flex; }
+.segmented button {
+  background: var(--card); border: 1px solid var(--line); color: var(--ink-55); cursor: pointer;
+  font-family: var(--font); font-size: 0.75rem; font-weight: 500; margin-left: -1px;
+  padding: 0.375rem 0.75rem; transition: background-color 0.15s ease, color 0.15s ease;
+}
+.segmented button:first-child { border-radius: var(--radius) 0 0 var(--radius); margin-left: 0; }
+.segmented button:last-child { border-radius: 0 var(--radius) var(--radius) 0; }
+.segmented button:hover:not([aria-pressed="true"]) { background: var(--wash); color: var(--ink-70); }
+.segmented button[aria-pressed="true"] { background: var(--ink); border-color: var(--ink); color: var(--on-ink); position: relative; z-index: 1; }
+
+.field-label { color: var(--ink-55); display: block; font-size: 0.8125rem; margin-bottom: 5px; }
+.field {
+  background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); color: var(--ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8125rem;
+  padding: 0.4375rem 0.625rem; width: 100%;
+}
+.field:focus { border-color: var(--accent); }
+.copy-row { align-items: center; display: flex; gap: 6px; }
+.copy-row .field { flex: 1 1 auto; min-width: 0; }
+input[type="file"].field { font-family: var(--font); padding: 0.375rem; }
+
+/* --- disclosure: everything that is not the default ---------------------- */
+details { border-top: 1px solid var(--line-soft); margin-top: 28px; padding-top: 12px; }
+details[open] { padding-bottom: 8px; }
+summary {
+  align-items: center; color: var(--ink-55); cursor: pointer; display: flex; gap: 6px;
+  font-size: 0.8125rem; font-weight: 500; list-style: none; padding: 2px 0; width: fit-content;
+}
+summary::-webkit-details-marker { display: none; }
+summary::before { color: var(--ink-40); content: "›"; display: inline-block; transition: transform 0.15s ease; }
+details[open] > summary::before { transform: rotate(90deg); }
+summary:hover { color: var(--ink); }
+details[open] > :not(summary) { animation: reveal 0.18s ease both; }
+/* Nested inside a card or a section, the rule above would draw a second line under the first. */
+.skill details, details.setting { border-top: 0; margin-top: 14px; padding-top: 0; }
+/* The disclosure that holds whole sections: its children get room, its headings do not restart. */
+#more > section { margin-bottom: 26px; }
+
+/* --- panels -------------------------------------------------------------- */
+.trust, .notice, .success {
+  background: var(--card); border: 1px solid var(--line); border-radius: var(--radius-lg);
+  margin-top: 22px; padding: 16px 18px;
+}
+/* Inside a panel the label is the panel's first line, so it brings no rule of its own with it. */
+.trust .section-heading { border-top: 0; margin: 0 0 10px; padding-top: 0; }
+.trust ul { display: block; }
+.trust li { color: var(--ink-55); font-size: 0.8125rem; margin-bottom: 6px; padding-left: 14px; position: relative; }
+.trust li::before { color: var(--ink-40); content: "—"; left: 0; position: absolute; }
+.trust li:last-child { margin-bottom: 0; }
+.success { align-items: flex-start; display: flex; gap: 12px; }
+.success h2 { font-size: 0.9375rem; }
+.success p { color: var(--ink-55); font-size: 0.875rem; margin-bottom: 8px; }
+.success-mark { align-items: center; background: var(--wash); border-radius: 50%; color: var(--ink); display: inline-flex; flex: 0 0 24px; font-size: 0.75rem; height: 24px; justify-content: center; }
+/* review.ts wraps the group picker in this label; it was the one control with no rule at all. */
+.reclassify { align-items: center; color: var(--ink-55); display: flex; font-size: 0.8125rem; gap: 8px; margin-top: 10px; }
+.reclassify select {
+  background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
+  color: var(--ink); flex: 0 1 auto; font-family: var(--font); font-size: 0.8125rem;
+  padding: 0.25rem 0.5rem; width: auto;
+}
+/* A dialog on connect, a section on data — both are the same object to a reader. */
+.confirm {
+  background: var(--card); border: 1px solid var(--line); border-radius: var(--radius-lg);
+  color: var(--ink); margin: 14px 0 0; max-width: 46ch; padding: 16px 18px;
+}
+dialog.confirm { box-shadow: 0 8px 40px light-dark(rgba(0, 0, 0, 0.12), rgba(0, 0, 0, 0.5)); margin: auto; }
+dialog.confirm::backdrop { background: rgba(0, 0, 0, 0.28); }
+.confirm p { font-size: 0.875rem; margin-bottom: 14px; }
+.confirm button + button { margin-left: 6px; }
+
+pre { background: var(--wash); border-radius: var(--radius); font-size: 0.75rem; margin: 8px 0 0; max-height: 200px; overflow: auto; padding: 10px; }
+#error:not(:empty) { color: var(--danger); font-size: 0.8125rem; margin: 16px 0 0; }
+.sr-only { clip-path: inset(50%); height: 1px; overflow: hidden; position: absolute; white-space: nowrap; width: 1px; }
 [contenteditable] { border-bottom: 1px dashed transparent; cursor: text; outline: none; }
 [contenteditable]:hover { border-bottom-color: var(--line); }
 [contenteditable]:focus { border-bottom-color: var(--accent); border-bottom-style: solid; }
 :focus-visible { border-radius: 2px; outline: 2px solid var(--accent); outline-offset: 2px; }
 [hidden] { display: none !important; }
-@keyframes details-in { from { opacity: 0; transform: translateY(-4px); } }
-@keyframes success-in { from { opacity: 0; transform: translateY(6px); } }
+@keyframes reveal { from { opacity: 0; transform: translateY(-3px); } }
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; transition-duration: .01ms !important; }
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
 @media (max-width: 560px) {
-  main { padding-top: 34px; }
+  main { padding-top: 30px; }
   .actions { align-items: stretch; flex-direction: column; }
-  details { margin-left: 0; }
-  .primary { width: 100%; }
+  .primary, .quiet { width: 100%; }
 }

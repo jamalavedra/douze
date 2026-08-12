@@ -1,5 +1,6 @@
 import { test, expect } from '@playwright/test'
 import {
+  DISPATCHERS,
   FixtureApp,
   HttpMcp,
   RelayServer,
@@ -61,6 +62,24 @@ test('a hosted connector lists and calls through the relay, including with Chrom
   expect(first.status).toBe(200)
   expect(resultText(first.body)).toContain('widget')
   expect((await app.log()).filter((entry) => entry.path === '/api/orders')).toHaveLength(1)
+
+  // The path that survives a client freezing its catalogue. See LIST_SKILLS in guards.ts.
+  expect(await mcp.allTools()).toEqual(expect.arrayContaining(DISPATCHERS))
+  await app.reset()
+  const dispatched = await mcp.call('douze_run_skill', {
+    skill: 'orders_list_orders',
+    arguments: {},
+  })
+  expect(dispatched.status).toBe(200)
+  expect(resultText(dispatched.body)).toContain('widget')
+  expect((await app.log()).filter((entry) => entry.path === '/api/orders')).toHaveLength(1)
+  // And it is not a way around the table: this endpoint never opted into writes.
+  const refused = await mcp.call('douze_run_skill', {
+    skill: 'orders_create_order',
+    arguments: { item: 'widget', qty: 1 },
+  })
+  // A refusal is the tool's own failure, so it comes back as the result's error rather than text.
+  expect(JSON.stringify(refused.body)).toContain('read-only access')
 
   // --- Chrome closes -----------------------------------------------------
   await browser.dispose()

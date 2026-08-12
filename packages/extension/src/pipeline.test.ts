@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { Exchange, NOISE_HOSTS } from '@douze/shared'
+import { Exchange, NOISE_HOSTS, findSurvivingSecrets } from '@douze/shared'
 import type { GestureEvent } from './messages.js'
 import {
   PROVENANCE_WINDOW_MS,
@@ -114,10 +114,55 @@ describe('admits (AC-CAP-004)', () => {
     expect(admits(beacon)).toBe(true)
     expect(admits(beacon, { hosts: [...NOISE_HOSTS, 'app.example'] })).toBe(false)
   })
+
+  /**
+   * The reported bug, at the layer that dropped it: a `PUT` answering `204 No Content` carries no
+   * content type, and this returned false for it while every GET sailed through — so writes went
+   * missing from recordings with nothing logged and the popup's counter never moving.
+   */
+  it('keeps a write whose response had no body (204 No Content)', () => {
+    // The key is REMOVED rather than set to undefined: that is the shape a 204 actually produces,
+    // and `exactOptionalPropertyTypes` is right to refuse the other one.
+    const bodiless = (over: Partial<ExchangeDraft>): ExchangeDraft => {
+      const { response_content_type: _none, ...rest } = draft({ status: 204, response_headers: {}, ...over })
+      return rest
+    }
+    expect(admits(bodiless({ method: 'PUT' }))).toBe(true)
+    expect(admits(bodiless({ method: 'POST', status: 201, response_headers: { location: '/orders/42' } }))).toBe(true)
+    // Unchanged for reads, and unchanged for a write that did answer something unreadable.
+    expect(admits(bodiless({ method: 'GET' }))).toBe(false)
+    expect(admits(draft({ method: 'POST', response_content_type: 'text/css' }))).toBe(false)
+  })
 })
 
 describe('finalize', () => {
   const ctx = { session_id: 's1', position: 3, gesture: gesture(999) }
+
+  /**
+   * `provenance` was the one field written to disk without passing through redaction, while the
+   * write gate walked it exactly like every other field. On a dashboard whose own URLs carry a
+   * project key — `/projects/pk_live_…/players` — that refused EVERY exchange in the session at
+   * `$.provenance.route`, so the counter never moved and the recording came out empty. Silently:
+   * the refusal is a `console.warn` in the worker and nothing on screen.
+   */
+  it('redacts the route it stores, so a key in the page URL cannot refuse the whole session', () => {
+    const route = '/projects/pk_live_9aF3kQ2mZx7bV1nR8tYuI0pLsDcG/players'
+    const exchange = finalize(draft(), { ...ctx, gesture: { ...gesture(999), route } }, 'x9')
+
+    expect(exchange.provenance?.route).not.toContain('pk_live_9aF3kQ2mZx7bV1nR8tYuI0pLsDcG')
+    // Redacted, not discarded: the surrounding segments are what make the route worth keeping.
+    expect(exchange.provenance?.route).toContain('/projects/')
+    expect(exchange.provenance?.route).toContain('/players')
+    // The gate is what actually refused; this is the assertion that would have caught it.
+    expect(findSurvivingSecrets(exchange)).toEqual([])
+  })
+
+  it('leaves an ordinary route and control name alone', () => {
+    const exchange = finalize(draft(), ctx, 'x10')
+    expect(exchange.provenance?.route).toBe('/orders')
+    expect(exchange.provenance?.accessible_name).toBe('Create order')
+    expect(exchange.provenance?.title).toBe('Orders')
+  })
 
   it('redacts credential headers and secret fields before the exchange leaves (REQ-CAP-005)', () => {
     const exchange = finalize(

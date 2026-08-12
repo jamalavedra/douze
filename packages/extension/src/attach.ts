@@ -413,6 +413,19 @@ class Manager {
     return this.refusedBridges.size > 0 && !this.bridgeUp
   }
 
+  /**
+   * The relay answered 1008 for the token in storage: it has forgotten this endpoint, and no
+   * amount of waiting brings it back. `tick` stops dialling a refused token (see the guard in
+   * `targets`), so without this the connect page went on saying Douze "keeps trying on its own"
+   * about a link that was dead and a socket nothing was retrying — the one state where the page's
+   * reassuring sentence was the opposite of the truth. A relay that restarts forgets every
+   * endpoint it ever handed out, so this is not an edge case; it is every user, every deploy.
+   */
+  get relayRefused(): boolean {
+    // `refusedToken` is `string | null`, so no relay stored answers false rather than matching.
+    return this.relay?.token === this.refusedToken
+  }
+
   private async load(): Promise<void> {
     const stored = await chrome.storage.local.get([RELAY_KEY, BRIDGE_KEY, EXPOSE_KEY])
     this.relay = (stored[RELAY_KEY] as RelayPairing | undefined) ?? null
@@ -634,6 +647,7 @@ export function startAttachments(deps: AttachDeps): {
   pushSurface: () => void
   connected: () => boolean
   bridgeRefused: () => boolean
+  relayRefused: () => boolean
   pair: (code: string) => Promise<void>
   unpair: () => Promise<void>
   setExposed: (trust: Trust, tool: string, allow: boolean) => Promise<void>
@@ -648,6 +662,7 @@ export function startAttachments(deps: AttachDeps): {
     pushSurface: () => created.pushSurface(),
     connected: () => created.connected,
     bridgeRefused: () => created.bridgeRefused,
+    relayRefused: () => created.relayRefused,
     pair: (code) => created.pair(code),
     unpair: () => created.unpair(),
     setExposed: (trust, tool, allow) => created.setExposed(trust, tool, allow),

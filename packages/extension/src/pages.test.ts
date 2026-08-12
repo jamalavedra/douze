@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import config from '../vite.config.js'
+import { themeFrom } from './pages/theme.js'
 
 /**
  * WO-015 T-015.4 — the extension pages, asserted on their wiring rather than on a rendered DOM.
@@ -18,6 +19,14 @@ import config from '../vite.config.js'
  */
 
 const source = (...parts: string[]): string => readFileSync(join(import.meta.dirname, ...parts), 'utf8')
+
+/**
+ * Markup with every run of whitespace collapsed, for the assertions that pin PROSE. What those
+ * guard is that a sentence is still on the page and still says what it said; where the formatter
+ * chose to wrap it is not part of the promise, and pinning it made moving a paragraph into a
+ * disclosure — one level deeper, so two more spaces — look like deleting the disclosure itself.
+ */
+const prose = (...parts: string[]): string => source(...parts).replace(/\s+/g, ' ')
 
 describe('the extension build', () => {
   const input = (config as { build: { rollupOptions: { input: Record<string, string> } } }).build.rollupOptions
@@ -60,6 +69,83 @@ describe('the extension build', () => {
     for (const page of ['review', 'connect', 'data'] as const) {
       expect(source('..', 'public', `${page}.html`)).toContain('href="page.css"')
     }
+  })
+})
+
+/**
+ * The one thing a rewrite of these HTML files can break that nothing else here would notice: a
+ * script looks an element up by id, the markup no longer has it, and `byId` hands back null —
+ * so the page throws on load, or a control silently does nothing. Every other test in this file
+ * asserts on source strings, which is exactly the wrong shape to catch a dropped attribute.
+ *
+ * No jsdom needed: the ids a script asks for and the ids a document defines are both readable as
+ * text. Template-literal lookups (`exposed-${trust}`) cannot be resolved statically and are not
+ * matched; the two that exist are covered by name in the connect page's own tests.
+ */
+describe('every page can find the elements its script looks up', () => {
+  const LOOKUP = /(?:\bbyId|\$)(?:<[^>]*>)?\(['"]([\w-]+)['"]\)|getElementById\(['"]([\w-]+)['"]\)/g
+
+  for (const [script, page] of [
+    ['popup.ts', 'popup.html'],
+    ['pages/connect.ts', 'connect.html'],
+    ['pages/data.ts', 'data.html'],
+    ['pages/review.ts', 'review.html'],
+  ] as const) {
+    it(`${script} against ${page}`, () => {
+      const html = source('..', 'public', page)
+      const defined = [...html.matchAll(/\bid="([\w-]+)"/g)].map(([, id]) => id)
+      const wanted = [...source(script).matchAll(LOOKUP)].map(([, a, b]) => a ?? b)
+
+      expect(wanted.length).toBeGreaterThan(5)
+      expect(wanted.filter((id) => !defined.includes(id))).toEqual([])
+      // Two elements sharing an id makes getElementById a coin toss between them.
+      expect(defined.filter((id, at) => defined.indexOf(id) !== at)).toEqual([])
+    })
+  }
+})
+
+/**
+ * The theme is one attribute on <html> and one stylesheet that reads it, so what can actually
+ * break is the wiring: a page that forgets to apply the stored choice paints the other scheme,
+ * and a settings panel with no switch in it is a preference nobody can change.
+ */
+describe('light and dark', () => {
+  const theme = source('pages', 'theme.ts')
+  const css = source('..', 'public', 'page.css')
+
+  it('lets the stylesheet do the work — one attribute, no colours in the module', () => {
+    expect(css).toMatch(/\[data-theme="light"\][^}]*color-scheme: light/)
+    expect(css).toMatch(/\[data-theme="dark"\][^}]*color-scheme: dark/)
+    expect(css).toMatch(/color-scheme: light dark/)
+    // Every colour is one light-dark() pair, so a scheme cannot be half-applied.
+    expect(theme).not.toMatch(/#[0-9a-f]{3,6}\b/i)
+  })
+
+  it('is applied by every page, and switchable from every page that has settings', () => {
+    for (const page of ['popup', 'pages/connect', 'pages/data', 'pages/review'] as const) {
+      expect(source(`${page}.ts`)).toContain('applyTheme()')
+    }
+    // Review is opened for one capture and has no settings panel; the other three carry the switch.
+    for (const [page, html] of [
+      ['popup', 'popup.html'],
+      ['pages/connect', 'connect.html'],
+      ['pages/data', 'data.html'],
+    ] as const) {
+      expect(source(`${page}.ts`)).toContain("mountThemeSwitch(document.getElementById('theme'))")
+      expect(source('..', 'public', html)).toContain('id="theme"')
+    }
+    expect(source('pages/review.ts')).not.toContain('mountThemeSwitch')
+  })
+
+  /** Shared origin, so anything on it can write the key; an unknown value must not reach the DOM. */
+  it('falls back to the system scheme rather than trusting whatever is in storage', () => {
+    expect(themeFrom('light')).toBe('light')
+    expect(themeFrom('dark')).toBe('dark')
+    for (const hostile of [null, '', 'System', 'DARK', 'light ', 'x', '__proto__']) {
+      expect(themeFrom(hostile)).toBe('system')
+    }
+    // "system" is the absence of the attribute, not a third value written into it.
+    expect(theme).toMatch(/'system'.*removeAttribute\('data-theme'\)/s)
   })
 })
 
@@ -113,7 +199,7 @@ describe('the data page', () => {
   it('shows every refused entry rather than only counting it', () => {
     expect(data).toContain('const refused = report.refused')
     expect(data).toContain("el('p', { className: 'warn', textContent: entry.reason })")
-    expect(html).toContain('still carried something that looks like a\n            credential')
+    expect(prose('..', 'public', 'data.html')).toContain('still carried something that looks like a credential')
   })
 
   it('offers overwrite by name when an import collides, and changes nothing until asked', () => {
@@ -171,7 +257,9 @@ describe('the popup', () => {
   })
 
   it('offers the connect entry whether or not a session was just recorded', () => {
-    expect(html).toContain('<button id="connect">Use with ChatGPT or claude.ai</button>')
+    // The element type is part of the promise, not just the id and the label: a div with a click
+    // handler is not reachable by keyboard, and the looser assertion let one through.
+    expect(html).toContain('<button type="button" class="quiet" id="connect">Use with your AI</button>')
     // Not one of the sections the popup switches between, so a finished recording never hides it.
     const switched = popup.match(/const name of \[([^\]]+)\]/)?.[1] ?? ''
     expect(switched).not.toContain('hosted')
@@ -252,9 +340,20 @@ describe('the review page', () => {
     expect(review).toContain("byId('keeps').hidden = false")
   })
 
-  it('pre-selects reads only, so one click never approves an unread delete', () => {
-    expect(review).toContain('if (candidate.bulk_approvable) chosen.add(candidate.name)')
-    expect(review).not.toContain('for (const candidate of state.candidates) chosen.add')
+  /**
+   * Everything is selected, including writes and deletes. Reads-only was the safer default and made
+   * the common case wrong — nobody records a dashboard in order to approve half of it. What keeps a
+   * pre-ticked delete from being a deleted thing is enforcement, not a tick box: `checkPolicy`
+   * refuses a destructive tool for a hosted assistant with no setting that changes it, and refuses
+   * one locally unless the call carries `confirm: true`.
+   */
+  it('selects everything, and leans on enforcement rather than the tick box', () => {
+    expect(review).toContain('for (const candidate of state.candidates) chosen.add(candidate.name)')
+    expect(review).toContain('Turn off anything you would rather it could not do')
+    // The guarantees that make that safe have to still be there.
+    const guards = source('guards.ts')
+    expect(guards).toContain("if (trust === 'remote' && effect === 'destructive')")
+    expect(guards).toContain("if (effect === 'destructive' && args['confirm'] !== true)")
   })
 
   /**
@@ -292,6 +391,7 @@ describe('the review page', () => {
 
 describe('the connect page', () => {
   const html = source('..', 'public', 'connect.html')
+  const words = prose('..', 'public', 'connect.html')
   const connect = source('pages', 'connect.ts')
   const background = source('background.ts')
 
@@ -302,11 +402,14 @@ describe('the connect page', () => {
   it('keeps the trust disclosure verbatim', () => {
     for (const line of [
       'That link is the password. Anyone holding it can call these tools.',
-      'The relay operator can read and inject every message that crosses it — your tool\n            arguments and full result bodies.',
+      // Wrapped over two lines in the markup, so it is matched on its words like its neighbours:
+      // pinning the indentation here would fail the day the paragraph moves, for no reason a
+      // reader of this test would recognise as a broken promise.
+      'The relay operator can read and inject every message that crosses it — your tool arguments and full result bodies.',
       'The AI platform stores whatever your tools return, under its retention policy rather than yours.',
       'Those result bodies are live data from your dashboards, fetched from your account just now.',
     ]) {
-      expect(html).toContain(line)
+      expect(words).toContain(line)
     }
     expect(html).toContain('<h2 class="section-heading">What you are trusting</h2>')
     // The scope line is the one that changes with `allow_writes`; both halves live in the page.
@@ -389,12 +492,12 @@ describe('the connect page', () => {
    */
   it('says that an app on this computer is still an assistant with a provider', () => {
     expect(html).toContain('On this computer is not the same as staying on this computer.')
-    expect(html).toContain('goes on to their own\n          model provider')
+    expect(words).toContain('goes on to their own model provider')
   })
 
   /** "Whoever runs it can read everything" is not actionable until the reader knows who that is. */
   it('names who runs the relay it offers by default', () => {
-    expect(html).toContain('run by Jaume\n          Alavedra, who wrote Douze, on a personal server')
+    expect(words).toContain('run by Jaume Alavedra, who wrote Douze, on a personal server')
     expect(background).toContain('It is run by Jaume Alavedra, who wrote Douze, on a')
   })
 

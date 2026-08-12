@@ -2,14 +2,17 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { DouzeError, MAX_DESCRIPTION, type RelayRequest, type RelayResponse, type SideEffect } from '@douze/shared'
-import { AttachedTool } from '@douze/mcp-host'
+import { AttachedTool, type Trust } from '@douze/mcp-host'
 import {
   AUDIT_LIMIT,
   AuditLog,
   DATA_BOUNDARY_KEY,
   DEFAULT_RATE_LIMIT_PER_MINUTE,
   DEFAULT_TIMEOUT_MS,
+  DISPATCHERS,
+  LIST_SKILLS,
   MAX_RESULT_BYTES,
+  RUN_SKILL,
   RateLimiter,
   attachedSurface,
   buildRequest,
@@ -20,6 +23,7 @@ import {
   runToolCall,
   shapeResult,
   type AuditEntry,
+  type CallOutcome,
 } from './guards.js'
 import type { SurfaceTool } from './recipes.js'
 
@@ -87,7 +91,9 @@ const DESTRUCTIVE = tool(
 )
 const SURFACE = [READ, WRITE, DESTRUCTIVE]
 
-const names = (tools: { name: string }[]): string[] => tools.map((entry) => entry.name)
+/** Recipe tool names only; the dispatchers are asserted on their own. See LIST_SKILLS in guards.ts. */
+const names = (tools: { name: string }[]): string[] =>
+  tools.map((entry) => entry.name).filter((name) => !DISPATCHERS.includes(name))
 
 // --- the surface a host is offered ----------------------------------------
 
@@ -304,12 +310,27 @@ describe('session-expiry classification (AC-EXE-002.1)', () => {
     ...patch,
   })
 
-  it('reads 401, 403 and a login redirect as the same thing', () => {
-    for (const patch of [{ status: 401 }, { status: 403 }, { status: 200, redirected_to_login: true }]) {
+  it('reads a 401 and a login redirect as signed out', () => {
+    for (const patch of [{ status: 401 }, { status: 200, redirected_to_login: true }]) {
       const error = refusal(() => classify(READ, response(patch)))
       expect(error.code).toBe('session_expired')
       expect(error.message).toContain('signed out of jira.test')
     }
+  })
+
+  /**
+   * 403 used to be lumped in with 401, and the advice that came out of it — sign in again — could
+   * not fix it: X answers 403 when `x-csrf-token` is missing or stale while the session is
+   * perfectly valid, so a user signed in twice and got the same refusal both times.
+   */
+  it('does not call a 403 a sign-out, because signing in again cannot fix one', () => {
+    const error = refusal(() => classify(READ, response({ status: 403 })))
+    expect(error.message).not.toContain('signed out')
+    expect(error.message).toContain('while you are still signed in')
+    // Honest about which credentials re-recording can find, and that a hardcoded one is not among
+    // them — the advice "re-record" was itself wrong for x.com and cost the user four attempts.
+    expect(error.message).toContain('cookie, in storage, or in a meta tag')
+    expect(error.message).toContain('hardcodes in its own JavaScript')
   })
 
   it('leaves an ordinary answer alone', () => {
@@ -456,19 +477,37 @@ const JWT = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl
 describe('the result secret gate (T-014.4, ported)', () => {
   const carrying = { content: [{ type: 'text', text: `{"session":"${JWT}"}` }] }
 
-  it('refuses a result carrying a credential and names where it is', () => {
-    const error = refusal(() => gateResult('jira_list', carrying, []))
-    expect(error.message).toContain('$.content[0].text')
-    expect(error.message).toContain('jira_list')
-    expect(error.message).not.toContain(JWT)
+  /**
+   * Masking rather than withholding, because "looks like a credential" has false positives that
+   * cannot be enumerated ahead of time — a UUID id, an opaque cursor, a signed URL — and each one
+   * used to turn a whole tool into a dead end reachable only by granting a per-tool exemption.
+   * Teaching users to grant blanket exemptions is strictly worse for what this gate protects.
+   */
+  it('masks the credential and keeps the rest of the payload', () => {
+    const result = gateResult('jira_list', carrying, [])
+    const text = JSON.stringify(result)
+    // The one thing that must always hold.
+    expect(text).not.toContain(JWT)
+    // And the payload still arrives, rather than the caller getting nothing at all.
+    expect(text).toContain('session')
+    expect(text).toContain('«redacted:')
   })
 
-  it('lets the same result through once the tool is exempted', () => {
-    expect(() => gateResult('jira_list', carrying, ['jira_list'])).not.toThrow()
+  it('keeps every field that was not the credential', () => {
+    const mixed = { content: [{ type: 'text', text: `{"id":"ABC-1","name":"Ada","session":"${JWT}"}` }] }
+    const text = JSON.stringify(gateResult('jira_list', mixed, []))
+    expect(text).not.toContain(JWT)
+    expect(text).toContain('ABC-1')
+    expect(text).toContain('Ada')
+  })
+
+  it('hands back the untouched result once the tool is exempted', () => {
+    expect(gateResult('jira_list', carrying, ['jira_list'])).toBe(carrying)
   })
 
   it('leaves a clean result untouched', () => {
-    expect(() => gateResult('jira_list', { content: [{ type: 'text', text: '{"id":"ABC-1"}' }] }, [])).not.toThrow()
+    const clean = { content: [{ type: 'text', text: '{"id":"ABC-1"}' }] }
+    expect(gateResult('jira_list', clean, [])).toBe(clean)
   })
 })
 
@@ -543,6 +582,102 @@ const deps = (
 const textOf = (outcome: { result?: unknown }): Record<string, unknown> =>
   JSON.parse((outcome.result as { content: { text: string }[] }).content[0]!.text) as Record<string, unknown>
 
+/**
+ * See LIST_SKILLS in guards.ts for why these two exist. What this suite is mostly about is the
+ * obvious danger: a dispatcher must not be a way around the trust table.
+ */
+describe('reaching a skill a frozen tool catalogue does not know about', () => {
+  it('is offered at every trust level, whatever the write opt-in says', () => {
+    for (const [trust, writes] of [
+      ['remote', false],
+      ['remote', true],
+      ['local', false],
+    ] as const) {
+      const offered = attachedSurface(SURFACE, trust, writes).map((entry) => entry.name)
+      expect(offered).toContain(LIST_SKILLS)
+      expect(offered).toContain(RUN_SKILL)
+    }
+  })
+
+  it('does not claim to be read-only, because it can reach a write', () => {
+    const dispatcher = attachedSurface(SURFACE, 'local', true).find((entry) => entry.name === RUN_SKILL)
+    expect(dispatcher?.side_effect).not.toBe('read')
+  })
+
+  it('lists what the caller could already have been offered, and nothing more', async () => {
+    const listed = async (trust: Trust, allowWrites: boolean): Promise<string[]> => {
+      const outcome = await runToolCall({ name: LIST_SKILLS, args: {}, trust }, deps(async () => ok({}), { allowWrites }))
+      const text = (outcome.result as { content: { text: string }[] }).content[0]?.text ?? '{}'
+      return (JSON.parse(text) as { skills: { skill: string }[] }).skills.map((entry) => entry.skill)
+    }
+    // A hosted assistant learns nothing about the destructive tool it could never call.
+    expect(await listed('remote', false)).toEqual(['jira_list'])
+    expect(await listed('remote', true)).toEqual(['jira_list', 'jira_create'])
+    expect(await listed('local', false)).toEqual(['jira_list', 'jira_create', 'jira_delete'])
+  })
+
+  it('runs a skill that was never in the caller\'s tool list', async () => {
+    const outcome = await runToolCall(
+      { name: RUN_SKILL, args: { skill: 'jira_list', arguments: { limit: 5 } }, trust: 'remote' },
+      deps(async () => ok({ data: [{ id: 1 }] })),
+    )
+    expect(outcome.error).toBeUndefined()
+    // The payload the skill returned, shaped exactly as a direct call would have shaped it.
+    expect(textOf(outcome)).toMatchObject({ status: 200, data: [{ id: 1 }] })
+  })
+
+  it('refuses a destructive skill through the dispatcher, exactly as it does directly', async () => {
+    let reached = false
+    const outcome = await runToolCall(
+      { name: RUN_SKILL, args: { skill: 'jira_delete', arguments: { id: '7', confirm: true } }, trust: 'remote' },
+      deps(async () => {
+        reached = true
+        return ok({})
+      }),
+    )
+    expect(outcome.error?.code).toBe('trust_refused')
+    expect(outcome.error?.message).toContain('no setting that turns it on')
+    expect(reached).toBe(false)
+  })
+
+  it('refuses a write through the dispatcher until writes are opted into', async () => {
+    const call = (allowWrites: boolean): Promise<CallOutcome> =>
+      runToolCall(
+        { name: RUN_SKILL, args: { skill: 'jira_create', arguments: { title: 'x' } }, trust: 'remote' },
+        deps(async () => ok({ ok: true }), { allowWrites }),
+      )
+    expect((await call(false)).error?.code).toBe('trust_refused')
+    expect((await call(true)).error).toBeUndefined()
+  })
+
+  it('validates the dispatched skill\'s own arguments', async () => {
+    const outcome = await runToolCall(
+      { name: RUN_SKILL, args: { skill: 'jira_list', arguments: { role: 'admin' } }, trust: 'remote' },
+      deps(async () => ok({})),
+    )
+    expect(outcome.error?.code).toBe('invalid_arguments')
+  })
+
+  it('refuses a name it does not have, and refuses to dispatch to itself', async () => {
+    const run = (skill: unknown): Promise<CallOutcome> =>
+      runToolCall({ name: RUN_SKILL, args: { skill }, trust: 'remote' }, deps(async () => ok({})))
+    expect((await run('jira_nope')).error?.code).toBe('unknown_tool')
+    expect((await run(RUN_SKILL)).error?.code).toBe('invalid_arguments')
+    expect((await run(LIST_SKILLS)).error?.code).toBe('invalid_arguments')
+    expect((await run(undefined)).error?.code).toBe('invalid_arguments')
+  })
+
+  it('audits the skill that ran, not the dispatcher that carried it', async () => {
+    const entries: AuditEntry[] = []
+    await runToolCall(
+      { name: RUN_SKILL, args: { skill: 'jira_list', arguments: {} }, trust: 'remote' },
+      deps(async () => ok({ data: [] }), { audit: (entry) => entries.push(entry) }),
+    )
+    // Otherwise the log would say `douze_run_skill` ran a hundred times and never which skill.
+    expect(entries.map((entry) => entry.tool)).toEqual(['jira_list'])
+  })
+})
+
 describe('one inbound tool.call, end to end (T-015.9)', () => {
   it('runs a read and hands back the shaped payload', async () => {
     const outcome = await runToolCall({ name: 'jira_list', args: {}, trust: 'remote' }, deps(async () => ok({ data: [1, 2] })))
@@ -573,13 +708,13 @@ describe('one inbound tool.call, end to end (T-015.9)', () => {
     expect(allowed.error).toBeUndefined()
   })
 
-  it('refuses a result carrying a JWT, then passes once the tool is exempted', async () => {
+  it('masks a JWT in the payload, then sends it once the tool is exempted', async () => {
     const leaking = deps(async () => ok({ data: { session: JWT } }))
-    const refused = await runToolCall({ name: 'jira_list', args: {}, trust: 'remote' }, leaking)
-    // The path names the field inside the payload, because the gate now reads the payload rather
-    // than the serialised envelope it used to be handed.
-    expect(refused.error?.message).toContain('$.session')
-    expect(JSON.stringify(refused)).not.toContain(JWT)
+    const masked = await runToolCall({ name: 'jira_list', args: {}, trust: 'remote' }, leaking)
+    // Not a refusal any more, but the credential still never crosses.
+    expect(masked.error).toBeUndefined()
+    expect(JSON.stringify(masked)).not.toContain(JWT)
+    expect(JSON.stringify(masked)).toContain('«redacted:')
 
     const exempted = await runToolCall(
       { name: 'jira_list', args: {}, trust: 'remote' },
@@ -603,15 +738,17 @@ describe('one inbound tool.call, end to end (T-015.9)', () => {
     expect(String(payload['data'])).toContain('order-0')
   })
 
-  it('still withholds a big result once a credential is anywhere in it', async () => {
+  it('masks the credential in a big result and still returns the rows', async () => {
     const rows = Array.from({ length: 4000 }, (_, index) => ({ id: index, name: `order-${index}` }))
     const outcome = await runToolCall(
       { name: 'jira_list', args: {}, trust: 'remote' },
       deps(async () => ok({ data: { rows, session: JWT } })),
     )
-    expect(outcome.error?.code).toBe('result_withheld')
-    expect(outcome.error?.message).toContain('$.session')
-    expect(JSON.stringify(outcome)).not.toContain(JWT)
+    const text = JSON.stringify(outcome)
+    expect(text).not.toContain(JWT)
+    expect(outcome.error).toBeUndefined()
+    // The 4000 rows were the answer; one credential-shaped field no longer costs all of them.
+    expect(text).toContain('order-0')
   })
 
   it('refuses an argument the tool never had before it reaches the network', async () => {

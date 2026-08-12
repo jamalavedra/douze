@@ -14,6 +14,26 @@ const byName = (candidates: ReturnType<typeof infer>, name: string) => {
   return found
 }
 
+/**
+ * A capture store outlives the code that filled it, and one unrepresentable exchange used to cost
+ * the whole session: a stored `OPTIONS` (a CORS preflight, which a capture-filter bug briefly
+ * admitted) reached `restCandidate`, the recipe schema refused the method, and the throw came out
+ * of the review page as "Couldn't load what this site can do" — with every real candidate lost
+ * behind it. Skipping what cannot become a tool is the difference between one missing row and a
+ * blank screen.
+ */
+describe('an exchange that cannot become a tool', () => {
+  it('is skipped rather than taking every other candidate down with it', () => {
+    const exchanges = makeExchanges([
+      { method: 'OPTIONS', url: '/orders', status: 204 },
+      { url: '/orders', response_body: { orders: [{ id: 1 }] } },
+    ])
+    const candidates = infer({ exchanges })
+    expect(candidates).toHaveLength(1)
+    expect(candidates[0]?.tool.request.method).toBe('GET')
+  })
+})
+
 describe('REQ-INF-001 endpoint templating', () => {
   // COV_INF_001.1
   it('collapses /orders/1042|1043|1044 into one candidate named from the response id field', () => {

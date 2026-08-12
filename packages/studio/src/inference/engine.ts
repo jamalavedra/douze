@@ -1,4 +1,4 @@
-import { Tool, type AnnotationSpan, type Exchange, type UiProvenance } from '@douze/shared'
+import { TOOL_METHODS, Tool, type AnnotationSpan, type Exchange, type UiProvenance } from '@douze/shared'
 import type { Candidate, JsonSchema } from '../types.js'
 import { describeSync, descriptionInput } from '../descriptions/writer.js'
 import { disambiguate, nameCandidate } from '../descriptions/naming.js'
@@ -23,7 +23,12 @@ const BODY_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
  */
 export function infer(input: InferenceInput): Candidate[] {
   const spans = input.annotations ?? []
-  const usable = input.exchanges.filter((e) => e.status > 0 && e.status < 400)
+  // A method no recipe can describe is skipped, not carried into `restCandidate` where the schema
+  // throws and takes every other candidate down with it — a stored `OPTIONS` preflight did exactly
+  // that. The store outlives the filter that no longer writes those.
+  const usable = input.exchanges.filter(
+    (e) => e.status > 0 && e.status < 400 && (TOOL_METHODS as readonly string[]).includes(e.method.toUpperCase()),
+  )
   const graphql = usable.filter(isGraphqlExchange)
   const rest = usable.filter((e) => !isGraphqlExchange(e))
 

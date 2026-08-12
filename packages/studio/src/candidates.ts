@@ -250,7 +250,11 @@ function buildRecipe(config: RecipeConfig, tools: Tool[]): Recipe {
  * site, where the schema default is already right.
  */
 export function authFrom(exchanges: Exchange[]): Partial<Recipe['auth']> | undefined {
-  type Source = { kind: 'page_state'; expression: string; header?: string; param?: string; prefix: string }
+  type Source =
+    | { kind: 'page_state'; expression: string; header?: string; param?: string; prefix: string }
+    // A header the page keeps nowhere readable, so the value travels with the recipe. See
+    // `CredentialSource` in @douze/shared for what that costs.
+    | { kind: 'literal'; value: string; header: string; prefix: string }
   const sources = new Map<string, Source>()
   const pageOrigins = new Map<string, number>()
 
@@ -261,7 +265,12 @@ export function authFrom(exchanges: Exchange[]): Partial<Recipe['auth']> | undef
       // and one parameter per expression for the values that live in the URL.
       if (hint.header) {
         const key = `header:${hint.header.toLowerCase()}`
-        if (!sources.has(key)) {
+        // A hint with a value and no expression is a header the page keeps nowhere readable; a
+        // located one always wins, whichever order they were observed in.
+        const literal = hint.expression === '' && hint.value !== undefined
+        if (literal && !sources.has(key)) {
+          sources.set(key, { kind: 'literal', value: hint.value as string, header: hint.header, prefix: hint.prefix })
+        } else if (!literal && (!sources.has(key) || sources.get(key)?.kind === 'literal')) {
           sources.set(key, { kind: 'page_state', expression: hint.expression, header: hint.header, prefix: hint.prefix })
         }
       } else if (hint.segment !== undefined) {

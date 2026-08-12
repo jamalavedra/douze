@@ -1,3 +1,6 @@
+import { mkdtempSync, readFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { connect as connectTcp } from 'node:net'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { WebSocket } from 'ws'
@@ -190,10 +193,12 @@ describe('the round trip', () => {
     expect((await call(mcp_path, sid, 3)).status).toBe(404)
   })
 
-  it('refuses a server-initiated stream', async () => {
+  it('refuses a stream naming a session it does not have', async () => {
     const { token, mcp_path } = await enroll()
     await attach(token)
-    expect((await fetch(url(mcp_path))).status).toBe(405)
+    // No session header at all, and an unknown one, are the same answer: re-initialize.
+    expect((await fetch(url(mcp_path))).status).toBe(404)
+    expect((await fetch(url(mcp_path), { headers: { 'Mcp-Session-Id': 'no-such-session' } })).status).toBe(404)
   })
 
   it('reports health without authentication', async () => {
@@ -401,7 +406,9 @@ describe('authentication', () => {
 
   it('rate limits registrations from one address', async () => {
     for (let i = 0; i < 10; i++) await enroll()
-    const refused = await fetch(url('/register'), { method: 'POST', body: '{}' })
+    // A real registration, not `{}`: the budget is charged only once a body is one of ours, so an
+    // empty one is answered as 404 without ever reaching the limiter.
+    const refused = await fetch(url('/register'), { method: 'POST', body: JSON.stringify({ daemon_version: '0.1.0' }) })
     expect(refused.status).toBe(429)
   })
 
@@ -535,7 +542,10 @@ describe('registration input', () => {
   })
 
   it('refuses a bearer_token that is not a string instead of failing the request', async () => {
-    const res = await fetch(url('/register'), { method: 'POST', body: JSON.stringify({ bearer_token: 123 }) })
+    const res = await fetch(url('/register'), {
+      method: 'POST',
+      body: JSON.stringify({ daemon_version: '0.1.0', bearer_token: 123 }),
+    })
     // The unguarded version reached createHash().update(123) and answered 500 relay_failed.
     expect(res.status).toBe(400)
     expect(await res.json()).toMatchObject({ error: 'bad_request' })
@@ -544,9 +554,88 @@ describe('registration input', () => {
   it('refuses an oversize bearer_token', async () => {
     const res = await fetch(url('/register'), {
       method: 'POST',
-      body: JSON.stringify({ bearer_token: 'x'.repeat(513) }),
+      body: JSON.stringify({ daemon_version: '0.1.0', bearer_token: 'x'.repeat(513) }),
     })
     expect(res.status).toBe(400)
+  })
+
+  /**
+   * `/register` is the default dynamic-client-registration path an MCP client falls back to when
+   * OAuth discovery 404s, and claude.ai POSTs one there before it will connect. Answering it as a
+   * Douze registration made claude.ai believe the relay had a sign-in service, fail the flow it
+   * then started, and refuse to connect — while minting an endpoint nobody would ever dial and
+   * spending a slot of the caller's hourly budget on it.
+   */
+  it('answers an OAuth client registration as 404, mints nothing, and spends no budget', async () => {
+    const lines: string[] = []
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+      lines.push(String(chunk))
+      return true
+    })
+    try {
+      // Past the hourly cap of 10, so a probe that spent budget would show up as a 429 below.
+      for (let attempt = 0; attempt < 12; attempt += 1) {
+        const res = await fetch(url('/register'), {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            client_name: 'Claude',
+            redirect_uris: ['https://claude.ai/api/mcp/auth_callback'],
+            grant_types: ['authorization_code', 'refresh_token'],
+            token_endpoint_auth_method: 'none',
+          }),
+        })
+        // 404, not 400: this is what tells an MCP client there is no OAuth here, so it connects
+        // unauthenticated instead of asking its user for a client id.
+        expect(res.status).toBe(404)
+        expect(await res.json()).toMatchObject({ error: 'not_found' })
+      }
+      expect(lines.join('')).not.toContain('endpoint.registered')
+    } finally {
+      spy.mockRestore()
+    }
+
+    // The budget the probes did not spend is still there for a real registration.
+    const real = await fetch(url('/register'), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ daemon_version: '0.1.0' }),
+    })
+    expect(real.status).toBe(201)
+  })
+
+  /**
+   * Not spending the budget on a probe must not mean reading its body unthrottled: this is the one
+   * unauthenticated route, and parsing a megabyte for anyone who asks is work it may not do. So the
+   * limit is READ before the body and CHARGED after it — a caller already at the cap is refused
+   * without the body being touched at all, whatever shape it is.
+   */
+  /** An uncharged caller can repeat for free, so what they can make the relay READ is the bound. */
+  it('reads only a registration-sized body on the one unauthenticated route', async () => {
+    const huge = await fetch(url('/register'), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ client_name: 'x'.repeat(8_192) }),
+    })
+    expect(huge.status).toBe(413)
+    // The cap is the DEFENCE, not a new refusal for real clients: a registration still fits.
+    const real = await fetch(url('/register'), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ daemon_version: '0.1.0', bearer_token: 'x'.repeat(512) }),
+    })
+    expect(real.status).toBe(201)
+  })
+
+  it('refuses an over-budget caller before it reads the body, probe or not', async () => {
+    for (let attempt = 0; attempt < 10; attempt += 1) await enroll()
+    const probe = await fetch(url('/register'), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ client_name: 'Claude', redirect_uris: ['https://claude.ai/cb'] }),
+    })
+    // 429 and not the 404 an unthrottled caller would get: the cap was consulted first.
+    expect(probe.status).toBe(429)
   })
 })
 
@@ -605,14 +694,33 @@ describe('correlation', () => {
 })
 
 describe('sessions', () => {
-  it('refuses a session past the per-endpoint cap', async () => {
+  /**
+   * Refusing at the cap deadlocked the client it refused, and did so in the ordinary case: one
+   * link pasted into both ChatGPT and claude.ai fills the cap in seconds, each abandoning
+   * sessions without a DELETE. A client whose session had expired then got a 404, re-initialized
+   * as streamable HTTP prescribes — with no session header, so nothing was reclaimed — and hit a
+   * 429 it could never clear, because the sessions blocking it were the abandoned ones. Every
+   * retry reproduced the pair until the ten-minute idle sweep.
+   */
+  it('retires the least recently used session rather than refusing a new client', async () => {
     const { token, mcp_path } = await enroll()
     await attach(token)
-    for (let i = 0; i < REMOTE_MAX_SESSIONS; i++) expect((await initialize(mcp_path)).status).toBe(200)
+    const sids: string[] = []
+    for (let i = 0; i < REMOTE_MAX_SESSIONS; i++) {
+      const opened = await initialize(mcp_path)
+      expect(opened.status).toBe(200)
+      sids.push(opened.headers.get('mcp-session-id') ?? '')
+      // Touched in order, so the first opened is unambiguously the least recently used.
+      await new Promise((resolve) => setTimeout(resolve, 2))
+    }
 
-    const refused = await initialize(mcp_path)
-    expect(refused.status).toBe(429)
-    expect(await refused.json()).toMatchObject({ error: 'rate_limited' })
+    // The one over the cap is served, not refused.
+    const extra = await initialize(mcp_path)
+    expect(extra.status).toBe(200)
+
+    // And it cost the oldest session, not the newest: that one now 404s and re-initializes.
+    expect((await call(mcp_path, sids[0] ?? '', 60)).status).toBe(404)
+    expect((await call(mcp_path, sids[REMOTE_MAX_SESSIONS - 1] ?? '', 61)).status).not.toBe(404)
   })
 
   it('closes the session named in the header when a client re-initializes', async () => {
@@ -787,7 +895,7 @@ describe('HTTP semantics', () => {
     await attach(token)
     const res = await fetch(url(mcp_path), { method: 'PUT', body: '{}' })
     expect(res.status).toBe(405)
-    expect(res.headers.get('Allow')).toBe('POST, DELETE')
+    expect(res.headers.get('Allow')).toBe('GET, POST, DELETE')
   })
 
   it('answers 413 without waiting for the rest of the upload', async () => {
@@ -910,5 +1018,120 @@ describe('the log', () => {
     } finally {
       spy.mockRestore()
     }
+  })
+})
+
+/**
+ * Every link used to die with the process, so a deploy — or a crash on a `Restart=always` unit —
+ * invalidated every user's connector and made each of them re-pair the extension by hand and
+ * re-paste a new URL into their assistant. That is the cost this file removes.
+ */
+describe('endpoints across a restart', () => {
+  it('keeps the link, and keeps the tool surface off disk', async () => {
+    const statePath = join(mkdtempSync(join(tmpdir(), 'douze-relay-state-')), 'endpoints.json')
+    await relay.close()
+    relay = await startRelay({ port: 0, statePath })
+
+    const { token, mcp_path } = await enroll()
+    await attach(token)
+    await surfaced(mcp_path, await open(mcp_path))
+
+    // The process goes away entirely, as a deploy does.
+    await relay.close()
+    relay = await startRelay({ port: 0, statePath })
+
+    // The same URL still resolves, where before the restart it became a 404 for good.
+    const revived = await initialize(mcp_path)
+    expect(revived.status).toBe(200)
+    const sid = revived.headers.get('Mcp-Session-Id') ?? ''
+
+    // The surface is NOT restored from disk: the extension re-pushes it, and keeping tool names and
+    // descriptions out of that file is why it holds nothing but hashes.
+    expect(await list(mcp_path, sid)).toEqual([])
+    const saved = readFileSync(statePath, 'utf8')
+    expect(saved).not.toContain('orders_list')
+    expect(saved).not.toContain(token)
+    expect(saved).not.toContain(mcp_path.slice('/m/'.length))
+
+    // And it comes back on the extension's next dial, which `attach` performs.
+    await attach(token)
+    await surfaced(mcp_path, sid)
+  })
+})
+
+/**
+ * The half of streamable HTTP this relay used to answer 405, and the reason a skill recorded
+ * mid-conversation never showed up: the host generated `notifications/tools/list_changed`, the
+ * relay had nowhere to put it, and no target client polls `tools/list` — each reads it once per
+ * connector and caches it. ChatGPT opens this stream on every session, so the refusal was visible
+ * in the log as a 405 beside every notification the relay threw away.
+ */
+describe('the notification stream', () => {
+  /** The client's open notification stream. Awaited, so nothing after it races the subscription. */
+  const openStream = async (path: string, sid: string): Promise<ReadableStreamDefaultReader<Uint8Array>> => {
+    const res = await fetch(url(path), { headers: { 'Mcp-Session-Id': sid } })
+    expect(res.status).toBe(200)
+    expect(res.headers.get('content-type')).toContain('text/event-stream')
+    return (res.body as ReadableStream<Uint8Array>).getReader()
+  }
+
+  /** The next SSE event, skipping the comment lines that keep the stream alive. */
+  const nextEvent = async (reader: ReadableStreamDefaultReader<Uint8Array>): Promise<unknown> => {
+    const decoder = new TextDecoder()
+    for (;;) {
+      const { value, done } = await reader.read()
+      if (done) return undefined
+      const line = decoder.decode(value, { stream: true }).split('\n').find((l) => l.startsWith('data: '))
+      if (line) return JSON.parse(line.slice(6))
+    }
+  }
+
+  it('tells an open session that the tool list changed', async () => {
+    const { token, mcp_path } = await enroll()
+    const extension = await attach(token)
+    const sid = await open(mcp_path)
+    await surfaced(mcp_path, sid)
+
+    // Subscribed BEFORE the user records a new skill, which is the case that matters.
+    const reader = await openStream(mcp_path, sid)
+    extension.socket.send(JSON.stringify({ type: 'surface.push', tools: [tool('orders_list'), tool('orders_create')] }))
+
+    expect(await nextEvent(reader)).toEqual({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' })
+    // And the list the client then re-reads carries the new tool.
+    expect((await list(mcp_path, sid)).map((entry) => entry.name)).toEqual(['orders_list', 'orders_create'])
+  })
+
+  it('does not notify when a push leaves the surface unchanged', async () => {
+    const { token, mcp_path } = await enroll()
+    const extension = await attach(token)
+    const sid = await open(mcp_path)
+    await surfaced(mcp_path, sid)
+
+    const reader = await openStream(mcp_path, sid)
+    extension.socket.send(JSON.stringify({ type: 'surface.push', tools: SURFACE }))
+    await new Promise((resolve) => setTimeout(resolve, 200))
+
+    // Only the keepalive/open comments, which carry no event.
+    const first = await Promise.race([
+      reader.read().then(({ value }) => new TextDecoder().decode(value)),
+      new Promise<string>((resolve) => setTimeout(() => resolve('(nothing)'), 300)),
+    ])
+    expect(first).not.toContain('data:')
+    await reader.cancel()
+  })
+
+  it('ends the stream when the session it belongs to is closed', async () => {
+    const { token, mcp_path } = await enroll()
+    await attach(token)
+    const sid = await open(mcp_path)
+
+    const reader = await openStream(mcp_path, sid)
+    await fetch(url(mcp_path), { method: 'DELETE', headers: { 'Mcp-Session-Id': sid } })
+    // The read completes rather than hanging: a client left holding a stream on a dead session
+    // would wait for notifications that can never come.
+    await vi.waitFor(async () => {
+      const { done } = await reader.read()
+      expect(done).toBe(true)
+    })
   })
 })

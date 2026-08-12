@@ -74,12 +74,20 @@ test('a recorded dashboard becomes a tool a hosted assistant can call, with no d
   const review = await context.newPage()
   await review.goto(`chrome-extension://${extensionId}/review.html?session=${sessionId}`)
   await expect.poll(() => review.locator('code.name').allTextContents(), { timeout: 20_000 }).toContain('list_orders')
-  // AC-REC-002.3 — reads are pre-selected, the write is not, and one click must not approve it.
-  // Asserted on the boxes themselves: the surface checks further down cannot tell "never approved"
-  // apart from "approved but filtered out", because the pairing below is read-only either way.
+  /**
+   * Everything Douze found is selected, the write included: nobody records a dashboard in order to
+   * approve half of it, and what keeps a pre-ticked delete safe is enforcement rather than a tick box
+   * (see `checkPolicy` — never destructive for a hosted assistant, never without `confirm` locally).
+   *
+   * Asserted on the boxes themselves: the surface checks further down cannot tell "never approved"
+   * apart from "approved but filtered out", because the pairing below is read-only either way.
+   */
   const boxFor = async (tool: string): Promise<boolean> =>
     review.locator('li', { has: review.locator(`code.name:text-is("${tool}")`) }).locator('input').isChecked()
   expect(await boxFor('list_orders')).toBe(true)
+  expect(await boxFor('create_order')).toBe(true)
+  // And a box can still be turned off, which is the whole point of showing them.
+  await review.locator('li', { has: review.locator('code.name:text-is("create_order")') }).locator('input').uncheck()
   expect(await boxFor('create_order')).toBe(false)
   await review.locator('#go').click()
   await expect(review.locator('h1')).toContainText('All set')

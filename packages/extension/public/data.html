@@ -9,6 +9,10 @@
       and connect.html is one link, while deleting a recording, importing a .har and exporting
       skills are all about the whole set — a list neither of the other two has anywhere to put.
       Everything here reaches a store method the deleted CLI used to be the only caller of.
+
+      What the page answers first is its title: what is stored, and how to get rid of it. Moving
+      things in and out of Douze by file is a real capability and a rare one, so it sits under
+      Settings rather than between the two lists somebody actually came here to read.
     -->
     <link rel="stylesheet" href="page.css" />
   </head>
@@ -36,52 +40,10 @@
         <ul class="steps" id="sessions"></ul>
       </section>
 
-      <section id="import-har">
-        <h2 class="section-heading">Import a recording from a file</h2>
-        <p class="sub">
-          A .har file saved from Chrome's own Network panel becomes a recording here. Anything in
-          it that still carries a password or a token is refused rather than stored, and every
-          refusal is listed below by address.
-        </p>
-        <label class="field-label" for="har-name">Call this recording</label>
-        <input class="field" id="har-name" type="text" autocomplete="off" placeholder="Orders dashboard" />
-        <label class="field-label" for="har-file">The .har file</label>
-        <input class="field" id="har-file" type="file" accept=".har,.json,application/json" />
-        <div class="actions">
-          <p>Nothing is uploaded. The file is read in this browser.</p>
-          <button type="button" class="primary" id="har-import">Import</button>
-        </div>
-        <section class="notice" id="har-report" hidden aria-live="polite">
-          <p id="har-summary"></p>
-          <p class="sub" id="har-refused-copy" hidden>
-            These were not stored, because they still carried something that looks like a
-            credential:
-          </p>
-          <ul class="steps" id="har-refused"></ul>
-          <button type="button" class="quiet" id="har-review" hidden>Set up what this recording can do</button>
-        </section>
-      </section>
-
       <section id="skills">
         <h2 class="section-heading">Skills</h2>
         <p class="sub" id="recipes-empty" hidden>No skills yet. Record a site, then choose what to keep.</p>
         <ul class="steps" id="recipes"></ul>
-        <div class="actions">
-          <p>One file with every skill and its example answers in it.</p>
-          <button type="button" class="quiet" id="export">Save to a file</button>
-        </div>
-        <label class="field-label" for="skills-file">Add skills from a file</label>
-        <input class="field" id="skills-file" type="file" multiple accept=".json,.yaml,.yml" />
-        <div class="actions">
-          <p>A file saved above, or recipe .yaml files on their own.</p>
-          <button type="button" class="quiet" id="import">Add them</button>
-        </div>
-        <section class="confirm" id="conflict" hidden>
-          <p id="conflict-copy"></p>
-          <button type="button" class="primary" id="conflict-yes">Replace them</button>
-          <button type="button" class="quiet" id="conflict-no">Cancel</button>
-        </section>
-        <p class="sub" id="import-report" role="status" hidden></p>
       </section>
 
       <section id="activity">
@@ -98,6 +60,65 @@
           <button type="button" class="quiet danger" id="clear-audit">Clear</button>
         </div>
       </section>
+
+      <!--
+        Moving data in and out by file: everything here is a deliberate act nobody performs on a
+        first visit, and each one used to sit between the two lists this page exists to show.
+      -->
+      <details id="more">
+        <summary>Settings</summary>
+
+        <section>
+          <h3>Colour scheme</h3>
+          <div id="theme"></div>
+        </section>
+
+        <section id="import-har">
+          <h3>Import a recording from a file</h3>
+          <p class="sub">
+            A .har file saved from Chrome's own Network panel becomes a recording here. Anything in
+            it that still carries a password or a token is refused rather than stored, and every
+            refusal is listed below by address.
+          </p>
+          <label class="field-label" for="har-name">Call this recording</label>
+          <input class="field" id="har-name" type="text" autocomplete="off" placeholder="Orders dashboard" />
+          <label class="field-label" for="har-file">The .har file</label>
+          <input class="field" id="har-file" type="file" accept=".har,.json,application/json" />
+          <div class="actions">
+            <p>Nothing is uploaded. The file is read in this browser.</p>
+            <button type="button" class="primary" id="har-import">Import</button>
+          </div>
+          <section class="notice" id="har-report" hidden aria-live="polite">
+            <p id="har-summary"></p>
+            <p class="sub" id="har-refused-copy" hidden>
+              These were not stored, because they still carried something that looks like a
+              credential:
+            </p>
+            <ul class="steps" id="har-refused"></ul>
+            <button type="button" class="quiet" id="har-review" hidden>Set up what this recording can do</button>
+          </section>
+        </section>
+
+        <section>
+          <h3>Skills in and out by file</h3>
+          <div class="actions">
+            <p>One file with every skill and its example answers in it.</p>
+            <button type="button" class="quiet" id="export">Save to a file</button>
+          </div>
+          <label class="field-label" for="skills-file">Add skills from a file</label>
+          <input class="field" id="skills-file" type="file" multiple accept=".json,.yaml,.yml" />
+          <div class="actions">
+            <p>A file saved above, or recipe .yaml files on their own.</p>
+            <button type="button" class="quiet" id="import">Add them</button>
+          </div>
+          <section class="confirm" id="conflict" hidden>
+            <p id="conflict-copy"></p>
+            <button type="button" class="primary" id="conflict-yes">Replace them</button>
+            <button type="button" class="quiet" id="conflict-no">Cancel</button>
+          </section>
+          <p class="sub" id="import-report" role="status" hidden></p>
+        </section>
+      </details>
 
       <p id="error" role="alert"></p>
     </main>

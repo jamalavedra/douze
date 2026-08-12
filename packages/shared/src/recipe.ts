@@ -36,6 +36,22 @@ export const MAX_NAME = 60
  */
 export const CredentialSource = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('cookie') }),
+  /**
+   * A header value the site hardcodes, kept verbatim because there is nowhere to re-read it from.
+   * x.com's `authorization` bearer is the case: a public application constant in its JS bundle,
+   * identical for every visitor, and without it every call is refused 403.
+   *
+   * This is the one credential source that stores a VALUE, so two things follow. A skill using one
+   * stops working if the site rotates it, and re-recording is the fix. And the value is in the
+   * recipe: `exportAll` will write it to a file, so such a file is yours and not something to send
+   * anyone — which is why nothing offers to share it.
+   */
+  z.object({
+    kind: z.literal('literal'),
+    value: z.string(),
+    header: z.string(),
+    prefix: z.string().default(''),
+  }),
   z.object({
     kind: z.literal('page_state'),
     /** Expression evaluated in the page's MAIN world, e.g. `localStorage.getItem('token')`. */
@@ -103,8 +119,16 @@ export const Pagination = z.object({
   next_path: z.string().optional(),
 })
 
+/**
+ * The methods a recipe can describe, and therefore the only ones an exchange can become a tool
+ * from. Exported because the inference engine has to skip anything else rather than carry it into
+ * a schema that will reject it — a stored `OPTIONS` preflight once made `infer` throw and blanked
+ * the whole review page. One list, so the filter and the schema cannot disagree about it.
+ */
+export const TOOL_METHODS = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'] as const
+
 export const RequestContract = z.object({
-  method: z.enum(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE']),
+  method: z.enum(TOOL_METHODS),
   /**
    * Endpoint Template with `{param}` segments — REQ-INF-001.
    *

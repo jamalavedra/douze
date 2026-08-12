@@ -12,8 +12,9 @@ service worker Chrome evicts at will, it can hold no session state, and no inbou
 Terminating here is what lets a connector added while the browser was closed list its tools
 instead of looking broken.
 
-Still stateless in the sense that matters: every endpoint lives in memory and dies with the
-process, nothing is written to disk, and no payload is logged.
+Nearly stateless, and precise about the exception: no payload is logged, and the only thing written
+to disk is the endpoint registry — hashes, nothing else — so that a restart no longer invalidates
+every link. See [What is on disk](#what-is-on-disk).
 
 ## Trust model
 
@@ -26,6 +27,32 @@ input schema the extension has pushed — because that is what `tools/list` is a
 is new, and it is more than the transport used to see: the names and descriptions of your recipes
 describe the systems you have automated, whether or not anyone ever calls them. They are held for
 as long as the endpoint lives, never written to disk, and never logged; the log records a count.
+That is why `RELAY_STATE` persists identity and not the surface: a restart costs `tools/list`
+returning empty until the extension's next dial, which is a gap a cold start already had, rather
+than costing the link — and the file describes nobody's dashboards.
+
+### What is on disk
+
+With `RELAY_STATE` set, one JSON file, mode `0600`, holding one row per endpoint:
+
+| Field | What it is |
+| --- | --- |
+| `tokenHash` | SHA-256 of the endpoint token. Not the token. |
+| `secretHash` | SHA-256 of the URL secret. Not the secret, so the file cannot be turned into a working link. |
+| `bearerHash` | SHA-256 of the optional platform bearer, base64, or `null`. |
+| `label` | The first 8 hex of `tokenHash` — the same identifier the log uses. |
+| `lastAttached` | When the extension was last seen, so the reaper starts from something sane. |
+
+Nothing else. No tool names, no descriptions, no schemas, no session ids, no payloads, no caller
+addresses. Every credential is stored as the digest it is held as in memory, so the file yields no
+more to an attacker who reads it than a memory dump does — which is the property the paragraph
+above claims, now applying to both.
+
+Writes are atomic: a temporary file is renamed over the target, so a crash mid-write leaves the
+previous file whole rather than a truncated one that would drop every endpoint at the next boot. A
+failed write is logged (`state.save_failed`) and never fatal — the running relay still serves every
+live link. Leaving `RELAY_STATE` unset restores the old behaviour exactly: memory only, and every
+link dies with the process.
 
 **An endpoint lives only as long as its extension keeps attaching.** Six idle windows — one hour at
 the default — with no `hello` and the endpoint is reaped along with its sessions and its surface,
@@ -59,8 +86,18 @@ on shutdown, because a `Restart=always` unit killed by a signal never reaches sh
 | `DELETE /register` | `x-douze-relay-token` | drops the endpoint, closes the socket, closes its sessions |
 | `GET /health` | none | `{ok: true}` |
 | `WS /ws` | first frame `hello{token}`, within 5s | the extension's one connection |
+| `GET /m/<secret>` | same, plus a live `Mcp-Session-Id` | SSE stream carrying server-initiated JSON-RPC |
 | `POST /m/<secret>` | the secret, plus `Authorization: Bearer` if one was registered | the MCP endpoint |
 | `DELETE /m/<secret>` | same | closes the session named by `Mcp-Session-Id` |
+
+`daemon_version` is required, and it is the only thing separating our registration from somebody
+else's: `/register` is also the default path an MCP client falls back to for OAuth dynamic client
+registration when discovery 404s, and claude.ai POSTs one there before it will connect. A body
+without it is answered `404 not_found` — the same as any unknown path, which is what tells a client
+there is no OAuth here and to connect unauthenticated. Answering those as registrations made
+claude.ai run an OAuth flow against endpoints that do not exist and refuse to connect at all, while
+minting an endpoint nobody would dial. The hourly budget is charged after that check, so a probe
+never spends a real client's.
 
 The registration limit counts per socket address, which behind the TLS terminator below is the
 terminator itself — one bucket for every user of the deployment, which the first of the hour
@@ -73,9 +110,24 @@ that header, and an unknown one gets a 404 so the client re-initializes. A sessi
 10 minutes idle **and** at 12 hours old whatever it has been doing — inactivity alone never expires
 one that a client polls every nine minutes, and a session is a live capability over somebody's
 signed-in accounts. Either way the client sees a 404 and re-initializes. Requests cap at 1 MB,
-8 in flight per endpoint, 4 sessions per endpoint, and 120s each; reusing a JSON-RPC id that is
-still in flight is a 409. `GET /m/<secret>` is 405 — there is no server-initiated stream in v1, so
-a client sees a tool change when it next polls `tools/list`.
+8 in flight per endpoint, 8 sessions per endpoint, and 120s each; reusing a JSON-RPC id that is
+still in flight is a 409. At the session cap the least recently used one is retired rather than the
+new client refused: refusing deadlocked a client whose session had expired, because it re-initialized
+as the spec prescribes — with no session header, so nothing was reclaimed — and met a 429 caused by
+the abandoned sessions it was told to abandon. One link pasted into two assistants reached the old
+cap of four within seconds, so that was the ordinary case, not an edge one. `GET /m/<secret>` is the server-initiated half: an SSE stream, one per session, carrying
+`notifications/tools/list_changed` when the extension pushes a surface that differs from the cached
+one. It answers 404 for a session it does not hold, so the client re-initializes.
+
+This is what makes a skill recorded mid-conversation appear. It used to be 405, and the effect was
+that a new tool never showed up at all: the host generated the notification, the relay had nowhere
+to put it, and no target client polls `tools/list` — each reads it once per connector and caches it
+for the life of that connector, so not even a new chat re-fetched. ChatGPT opens this stream on
+every session, so the refusal was visible in the log as a 405 beside every notification thrown away.
+
+A comment line every 25 s keeps the stream past Cloudflare's 100 s idle close, and
+`x-accel-buffering: no` stops a proxy holding events until the stream ends — which would be the same
+silent failure with more steps.
 
 A refusal that a hosted client would otherwise swallow — in flight, duplicate id, too many
 sessions — comes back as `200 {"jsonrpc":"2.0","id":…,"error":{"code":-32000,"message":…}}`,
@@ -126,9 +178,15 @@ above assumes never happens.
 | `RELAY_PORT` | `9787` | the port to bind |
 | `RELAY_HOST` | `127.0.0.1` | the interface to bind; widen only with nothing terminating TLS in front |
 | `TRUST_PROXY` | unset | charge rate limits to the forwarded caller (see above) |
+| `RELAY_STATE` | unset | file (or directory) the endpoint registry is kept in, so links survive a restart. `STATE_DIRECTORY` is used when systemd provides it. Unset means memory only. |
 
 A systemd unit is enough to run it; the one deployment so far is a user unit with
 `Restart=always` behind a Cloudflare tunnel pointed at `http://127.0.0.1:9787`.
+
+Give that unit `StateDirectory=douze-relay` and it will both create the directory and make it
+writable, which matters because the unit is otherwise sandboxed (`ProtectSystem=strict`,
+`ProtectHome=read-only`) and can write nowhere at all. `bin.ts` reads `STATE_DIRECTORY` when
+`RELAY_STATE` is unset, so that one line is the whole configuration.
 
 On the extension side, type your instance's address into the connect page instead of leaving the
 default. There is no environment variable any more — the extension is the client now, and it has

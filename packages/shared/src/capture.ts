@@ -23,6 +23,12 @@ export const CredentialHint = z.object({
   segment: z.number().int().nonnegative().optional(),
   expression: z.string(),
   prefix: z.string().default(''),
+  /**
+   * The header value itself, and ONLY when `expression` is empty because the page keeps it nowhere
+   * readable — a token hardcoded in the site's own JavaScript. Kept because the alternative is a
+   * tool that can never run; exempt from the write gate by path (see `APPROVED_LITERAL`).
+   */
+  value: z.string().optional(),
 })
 
 export const Exchange = z.object({
@@ -182,11 +188,21 @@ export function isInferableContentType(contentType: string | undefined): boolean
  * request to — so importing one still names the origins it may keep.
  */
 export function shouldCapture(
-  candidate: { url: string; origin: string; response_content_type?: string | undefined },
+  candidate: {
+    url: string
+    origin: string
+    method?: string | undefined
+    response_content_type?: string | undefined
+  },
   origins: readonly string[] | null,
   noise: NoiseConfig = defaultNoise(),
 ): boolean {
   if (origins !== null && !origins.includes(candidate.origin)) return false
   if (isNoiseHost(candidate.url, noise)) return false
-  return isInferableContentType(candidate.response_content_type)
+  if (isInferableContentType(candidate.response_content_type)) return true
+  // A write answering `204 No Content` has no content type, and requiring one dropped most POSTs
+  // and PUTs while leaving GETs untouched: for a write the method, path and request body ARE the
+  // tool, and only the response schema is empty. An allowlist, not "anything but GET" — that also
+  // admits the `OPTIONS` preflight of every cross-origin call.
+  return candidate.response_content_type === undefined && /^(POST|PUT|PATCH|DELETE)$/i.test(candidate.method ?? '')
 }

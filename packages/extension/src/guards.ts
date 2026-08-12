@@ -1,4 +1,11 @@
-import { DouzeError, findSurvivingSecrets, MAX_DESCRIPTION, type RelayRequest, type RelayResponse } from '@douze/shared'
+import {
+  DouzeError,
+  findSurvivingSecrets,
+  MAX_DESCRIPTION,
+  redactBody,
+  type RelayRequest,
+  type RelayResponse,
+} from '@douze/shared'
 import type { AttachedTool, ToolFailure, Trust } from '@douze/mcp-host'
 import type { SurfaceTool } from './recipes.js'
 
@@ -157,12 +164,52 @@ export const offerable = (
   return sideEffect === 'write' && allowWrites
 }
 
-/** T-015.9 — the surface as one attachment sees it, filtered by its own trust level. */
-export const attachedSurface = (
-  tools: readonly SurfaceTool[],
-  trust: Trust,
-  allowWrites: boolean,
-): AttachedTool[] =>
+/**
+ * The two tool names that never change.
+ *
+ * Douze's surface grows while you use it, and both hosted clients freeze a connector's tool
+ * catalogue instead of following `notifications/tools/list_changed` (README.md, "When a new skill
+ * doesn't show up"). A constant name is what makes a frozen catalogue permanently correct: it still
+ * reaches a skill recorded a minute ago. They ADD a path — a client that does refresh keeps calling
+ * tools by their own names, which lets the model select on real descriptions.
+ */
+export const LIST_SKILLS = 'douze_list_skills'
+export const RUN_SKILL = 'douze_run_skill'
+export const DISPATCHERS = [LIST_SKILLS, RUN_SKILL]
+
+const META_TOOLS: AttachedTool[] = [
+  {
+    name: LIST_SKILLS,
+    description:
+      'List every Douze skill available right now, with what each does and the arguments it takes. ' +
+      'This list is often newer than the tools you were given, so call it when the skill you need ' +
+      'is not among them.',
+    input_schema: { type: 'object', properties: {} },
+    side_effect: 'read',
+  },
+  {
+    name: RUN_SKILL,
+    description:
+      'Run any Douze skill by name, including one that is not in your tool list. Pass a name from ' +
+      'douze_list_skills as `skill` and that skill\'s own arguments as `arguments`. Call a skill ' +
+      'directly when you can see it; use this when you cannot.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        skill: { type: 'string', description: 'The exact skill name, as given by douze_list_skills.' },
+        arguments: { type: 'object', description: "The skill's own arguments.", additionalProperties: true },
+      },
+      required: ['skill'],
+    },
+    // Not `read`: the host turns that into `readOnlyHint: true`, and a dispatcher that can reach a
+    // write tool must not claim otherwise. It is offered whatever `allow_writes` says, because the
+    // permission that matters is the resolved skill's and `checkPolicy` applies it either way.
+    side_effect: 'write',
+  },
+]
+
+/** The recipe tools one attachment may be offered, filtered by its own trust level (T-015.9). */
+export const skills = (tools: readonly SurfaceTool[], trust: Trust, allowWrites: boolean): AttachedTool[] =>
   tools
     .filter((entry) => offerable(entry.tool.side_effect, trust, allowWrites))
     .map((entry) => ({
@@ -171,6 +218,13 @@ export const attachedSurface = (
       input_schema: entry.tool.request.input_schema as Record<string, unknown>,
       side_effect: entry.tool.side_effect,
     }))
+
+/** What is pushed: those, plus the two names a frozen catalogue can still reach. */
+export const attachedSurface = (
+  tools: readonly SurfaceTool[],
+  trust: Trust,
+  allowWrites: boolean,
+): AttachedTool[] => [...skills(tools, trust, allowWrites), ...META_TOOLS]
 
 // --- call-time policy ------------------------------------------------------
 
@@ -338,14 +392,35 @@ function isType(value: unknown, type: string): boolean {
   return typeof value === type
 }
 
-/** AC-EXE-002.1 — 401, 403, or a login redirect all mean the same thing to the user. */
+/**
+ * AC-EXE-002.1 — a signed-out session, told to the user in words they can act on.
+ *
+ * 403 used to be lumped in with 401, and that sent people to sign in twice for a session that was
+ * never expired. It is the status an API returns when the request was UNDERSTOOD and refused:
+ * X answers 403 when `x-csrf-token` is missing or does not match the `ct0` cookie, which is a
+ * credential the recipe has to re-read from the page, not a login the user has to redo. Others use
+ * it for a permission the account lacks. Telling someone to sign in cannot fix either.
+ */
 export function classify(entry: SurfaceTool, response: RelayResponse): void {
-  if (!(response.status === 401 || response.status === 403 || response.redirected_to_login)) return
-  throw new DouzeError(
-    'session_expired',
-    `You have been signed out of ${siteOf(entry.base_url)}. Sign in again in Chrome, then retry.`,
-    { tool: entry.qualified_name, target: entry.base_url },
-  )
+  const site = siteOf(entry.base_url)
+  if (response.status === 401 || response.redirected_to_login) {
+    throw new DouzeError(
+      'session_expired',
+      `You have been signed out of ${site}. Sign in again in Chrome, then retry.`,
+      { tool: entry.qualified_name, target: entry.base_url },
+    )
+  }
+  if (response.status === 403) {
+    throw new DouzeError(
+      'session_expired',
+      `${site} refused this request with 403 while you are still signed in, so signing in again ` +
+        `will not help. Either this account cannot do it, or the request needs a header Douze did ` +
+        `not send. Douze can re-read a token the page keeps in a cookie, in storage, or in a meta ` +
+        `tag — recording the site again picks those up. It cannot send one the site hardcodes in ` +
+        `its own JavaScript, which is how x.com works, and no amount of re-recording changes that.`,
+      { tool: entry.qualified_name, target: entry.base_url, status: 403 },
+    )
+  }
 }
 
 // --- the rate limiter ------------------------------------------------------
@@ -520,13 +595,29 @@ export function cutToBytes(value: string, limit: number): string {
  * Give it the payload as data, never a serialised or truncated copy of it: the detector reads a
  * JSON *document*, and a string it cannot parse is judged by entropy alone.
  */
-export function gateResult(tool: string, result: unknown, exposed: readonly string[]): void {
-  if (exposed.includes(tool)) return
-  const findings = findSurvivingSecrets(result)
-  if (findings.length === 0) return
+export function gateResult(tool: string, result: unknown, exposed: readonly string[]): unknown {
+  if (exposed.includes(tool)) return result
+  if (findSurvivingSecrets(result).length === 0) return result
+
+  // MASK THE VALUE, KEEP THE PAYLOAD. Withholding the whole result was the wrong shape of
+  // response to a heuristic: "looks like a credential" has false positives that cannot be
+  // enumerated in advance — a UUID `id`, an opaque cursor, a base64 thumbnail, a signed URL, a
+  // long hash — and each one turned an entire tool into a dead end that only a per-tool exemption
+  // could revive. That trained the user to grant blanket exemptions, which is strictly worse for
+  // the thing this gate exists to prevent.
+  //
+  // Redaction gives the same guarantee with none of that: the suspect value is replaced by a
+  // placeholder carrying its type and length, and every other field survives. A false positive
+  // now costs one field, and the answer to a new one is nothing.
+  const masked = redactBody(result)
+  const survivors = findSurvivingSecrets(masked)
+  if (survivors.length === 0) return masked
+
+  // Redaction could not neutralise it, so the original ruling stands. Reaching here means a shape
+  // the detector recognises and the redactor cannot rewrite, which is a bug in the pair of them.
   throw new Refusal(
     'result_withheld',
-    `Douze withheld this result: ${tool} returned credential-shaped values at ${findings.join(', ')}. ` +
+    `Douze withheld this result: ${tool} returned credential-shaped values at ${survivors.join(', ')}. ` +
       `Allow this tool's results in the Douze extension if you meant to send them.`,
   )
 }
@@ -673,6 +764,37 @@ export async function runToolCall(
     })
 
   try {
+    if (call.name === LIST_SKILLS) {
+      // The same filter `attachedSurface` applies, so this never discloses a tool the caller would
+      // not have been offered — a hosted assistant still learns nothing about destructive ones.
+      const listed = skills(deps.surface(), call.trust, deps.allowWrites).map((tool) => ({
+        skill: tool.name,
+        does: tool.description,
+        arguments: tool.input_schema,
+      }))
+      done('ok', Date.now() - started)
+      return { result: { content: [{ type: 'text', text: JSON.stringify({ skills: listed }) }] } }
+    }
+
+    if (call.name === RUN_SKILL) {
+      const skill = call.args['skill']
+      if (typeof skill !== 'string' || skill === '') {
+        throw new Refusal('invalid_arguments', `${RUN_SKILL} needs "skill" set to a skill name.`)
+      }
+      // A dispatcher must never be a way around the trust table, so it does not re-implement one
+      // line of it: this is the same function, and the resolved skill goes through `checkPolicy`,
+      // the rate limiter, the result gate and the audit exactly as a direct call would. Naming
+      // itself is refused rather than recursed, which is what stops a cycle.
+      if (DISPATCHERS.includes(skill)) {
+        throw new Refusal('invalid_arguments', `"${skill}" is not a skill. Pass a name from ${LIST_SKILLS}.`)
+      }
+      const inner = call.args['arguments']
+      return await runToolCall(
+        { name: skill, args: typeof inner === 'object' && inner !== null ? (inner as Record<string, unknown>) : {}, trust: call.trust },
+        deps,
+      )
+    }
+
     const entry = deps.surface().find((candidate) => candidate.qualified_name === call.name)
     // `unknown_tool` and `trust_refused` read differently on purpose, and that does let a host
     // probe names it was never pushed — a guessed `shop_delete_order` comes back "never for a
@@ -707,8 +829,7 @@ export async function runToolCall(
     // longer parses, so the detector fell through to its entropy rule — and 32 KB of space-free
     // JSON scores far above the threshold. Truncation existed to make a big result usable; gating
     // after it made a big result impossible.
-    gateResult(call.name, selected.data, deps.exposed)
-    const shaped = capResult(selected)
+    const shaped = capResult({ ...selected, data: gateResult(call.name, selected.data, deps.exposed) })
     const result = {
       content: [
         {

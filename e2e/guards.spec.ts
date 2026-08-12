@@ -1,5 +1,6 @@
 import { test, expect } from '@playwright/test'
 import {
+  DISPATCHERS,
   FakeHost,
   FixtureApp,
   expose,
@@ -42,6 +43,10 @@ test('the guards refuse before anything reaches the target', async () => {
   const orderRequests = async (): Promise<string[]> =>
     (await app.log()).filter((entry) => entry.path.startsWith('/api/orders')).map((entry) => `${entry.method} ${entry.path}`)
 
+  /** Recipe tools only; the dispatchers ride on every surface. */
+  const recipeTools = (): string[] =>
+    host.tools.map((tool) => tool.name).filter((name) => !DISPATCHERS.includes(name))
+
   await app.start()
   await app.reset()
   await host.start()
@@ -57,7 +62,7 @@ test('the guards refuse before anything reaches the target', async () => {
   await waitFor(async () => host.tools.length > 0, 'the first surface push')
 
   // --- what a remote host is offered at all ------------------------------
-  expect(host.tools.map((tool) => tool.name)).toEqual(['orders_list_orders'])
+  expect(recipeTools()).toEqual(['orders_list_orders'])
 
   // --- a write, refused until opted in -----------------------------------
   await app.reset()
@@ -83,17 +88,20 @@ test('the guards refuse before anything reaches the target', async () => {
   await waitFor(async () => host.attached, 'the re-dial after the write opt-in')
   await waitFor(async () => host.tools.some((tool) => tool.name === 'orders_create_order'), 'the widened surface')
   // Opting into writes never widens to destructive: nothing puts that on a remote surface.
-  expect(host.tools.map((tool) => tool.name)).toEqual(['orders_list_orders', 'orders_create_order'])
+  expect(recipeTools()).toEqual(['orders_list_orders', 'orders_create_order'])
 
   // --- the result secret gate --------------------------------------------
   await app.reset()
   const leaky = await host.call('orders_create_order', { item: 'widget', qty: 1, note: JWT })
-  expect(leaky.error?.code).toBe('result_withheld')
-  expect(leaky.error?.message).toContain('credential-shaped')
-  // This guard is the one that CANNOT run before dispatch — the result is what it reads — so the
-  // request did happen, exactly once, and the answer is what was withheld.
-  expect(await orderRequests()).toEqual(['POST /api/orders'])
+  // Masked, not withheld: "looks like a credential" has false positives nobody can enumerate, and
+  // discarding the whole result over one made every such tool a dead end. The credential still
+  // never crosses — that is the property — and the rest of the answer survives.
+  expect(leaky.error).toBeUndefined()
   expect(JSON.stringify(leaky)).not.toContain(JWT)
+  expect(leaky.result?.content?.[0]?.text).toContain('«redacted:')
+  // This guard is the one that CANNOT run before dispatch — the result is what it reads — so the
+  // request did happen, exactly once.
+  expect(await orderRequests()).toEqual(['POST /api/orders'])
 
   // Exempting the tool at this trust level releases it, and nothing else.
   await expose(browser, 'remote', 'orders_create_order', true)
@@ -128,11 +136,13 @@ test('the guards refuse before anything reaches the target', async () => {
 
   // AC-EXE-003.3 — every one of those left a trace naming what happened.
   const audit = await browser.serviceWorker.evaluate(() => __douze.calls(10))
+  // The gate no longer produces an outcome of its own: a result carrying a credential is answered
+  // `ok` with the value masked, so the call succeeded and the audit says so.
   expect(audit.map((entry) => entry.outcome)).toEqual([
     'ok',
     'tool_degraded',
     'ok',
-    'result_withheld',
+    'ok',
     'ok',
     'trust_refused',
     'trust_refused',

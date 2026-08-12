@@ -59,6 +59,36 @@ describe('noise filtering (REQ-CAP-004)', () => {
   })
 
   /**
+   * The response content type answers "can inference read this payload?", and this gate used it to
+   * answer "is this exchange worth keeping?" — so every write that replied `204 No Content`, or
+   * `201 Created` with only a Location header, was dropped before it was stored or counted. GETs
+   * were unaffected, because a REST GET essentially always answers JSON, which is exactly the
+   * asymmetry that got reported: "some POSTs and PUTs are not being recorded".
+   */
+  it('keeps a write that answered with no body at all (204, or 201 with a Location)', () => {
+    const api = { url: 'https://api.test/v1/orders', origin: 'https://api.test' }
+    for (const method of ['POST', 'PUT', 'PATCH', 'DELETE', 'post']) {
+      expect(shouldCapture({ ...api, method }, null)).toBe(true)
+    }
+    // A bodiless GET is still nothing: no payload to infer from and no action to model.
+    expect(shouldCapture({ ...api, method: 'GET' }, null)).toBe(false)
+    expect(shouldCapture({ ...api, method: 'HEAD' }, null)).toBe(false)
+    // A CORS preflight is OPTIONS/204/no-content-type — the exact shape this rule admits, and
+    // every cross-origin API call makes one. Storing them was not just noise: the recipe schema
+    // permits six methods, so one stored OPTIONS made inference throw and the review page showed
+    // "Couldn't load what this site can do" with every real candidate lost behind it.
+    expect(shouldCapture({ ...api, method: 'OPTIONS' }, null)).toBe(false)
+    expect(shouldCapture({ ...api, method: 'TRACE' }, null)).toBe(false)
+    // The exemption is for an ABSENT body, not for any body a write happens to return: an HTML
+    // error page is no more inferable on a POST than on a GET.
+    expect(shouldCapture({ ...api, method: 'POST', response_content_type: 'text/html' }, null)).toBe(false)
+    // And it does not smuggle a noise host back in.
+    expect(shouldCapture({ url: 'https://x.sentry.io/api/1/envelope', origin: 'https://x.sentry.io', method: 'POST' }, null)).toBe(
+      false,
+    )
+  })
+
+  /**
    * Live capture passes null: the recorded tab is what scoped the request, and the host it called
    * is usually the site's API rather than the site itself. A HAR has no tab to attribute an entry
    * to, so it still names its origins.
@@ -458,11 +488,120 @@ describe('URL fragment and userinfo (REQ-CAP-005)', () => {
  * map keyed by session or API key. Both redactors walked values only, so such a secret passed
  * through redaction AND the write gate untouched — the one thing the gate exists to prevent.
  */
+/**
+ * The promise at the top of redact.ts: detection and removal use the same test, so
+ * `findSurvivingSecrets` cannot disagree with what ran before it. When they disagreed the capture
+ * gate refused whole exchanges — `credential at $.request_body`, on every X GraphQL call — and a
+ * recording came out empty with only a console line to say why.
+ *
+ * The trap was `=`. `FORM_BODY` matches base64 padding, so an opaque id parsed as a form, the form
+ * pass found no secret field, and the string was returned whole — while the gate judged that same
+ * string as one value.
+ */
+describe('the redactor and the gate cannot disagree (REQ-CAP-005)', () => {
+  const CASES: Record<string, unknown> = {
+    'base64 blob with padding': { feedbackMetadata: 'GjgKGRIXZmVlZGJhY2tfbWV0YWRhdGFfdmFsdWUQARoZChcSFWZl==' },
+    'long form body, no secret field': 'debug=true&log=%5B%7B%22event%22%3A%22click%22%7D%5D&sid=99887766554433221100',
+    'form body with a secret field': 'user=ada&session=Ab9xY2zQ7mN4pR8sT1vW6uJ0kL5hG3fD2eS7aZ9',
+    'jwt under an innocuous key': { clientId: 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r-wW1gFWFOEjXk' },
+    'ordinary payload': { id: 42, name: 'Ada', shipping_address: '10 Downing St' },
+  }
+
+  it('never leaves behind something it would then refuse', () => {
+    for (const [label, value] of Object.entries(CASES)) {
+      // The invariant, not the examples: whatever redaction produces must pass the gate.
+      expect(findSurvivingSecrets(redactBody(value)), label).toEqual([])
+    }
+  })
+
+  /**
+   * The trap in making the two agree: they can agree by both being blind. A padded base64 value is
+   * form-shaped to a loose regex, so walking it field by field found nothing — and a credential
+   * that used to be refused would have been persisted instead. Agreement has to come from both
+   * seeing it, not neither.
+   */
+  it('redacts a padded base64 credential rather than treating it as a form', () => {
+    const blob = 'c2tfbGl2ZV9hYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejEyMzQ1Ng=='
+    expect(redactBody({ blob })).toEqual({ blob: `«redacted:string:${blob.length}»` })
+    // A real form is still a form: one field, and a trailing empty field.
+    expect(redactBody('q=hello')).toBe('q=hello')
+    expect(redactBody('a=b&c=')).toBe('a=b&c=')
+  })
+
+  it('still redacts, rather than passing everything by widening the gate', () => {
+    const form = redactBody(CASES['form body with a secret field']) as string
+    expect(form).not.toContain('Ab9xY2zQ7mN4pR8sT1vW6uJ0kL5hG3fD2eS7aZ9')
+    expect(form).toContain('user=ada')
+    expect(JSON.stringify(redactBody(CASES['jwt under an innocuous key']))).not.toContain('eyJhbGciOiJIUzI1NiJ9')
+    // And an ordinary payload is untouched, which is what makes a recording worth keeping.
+    expect(redactBody(CASES['ordinary payload'])).toEqual({ id: 42, name: 'Ada', shipping_address: '10 Downing St' })
+  })
+})
+
+/**
+ * The one exemption in the write gate, and the only place a credential VALUE may be stored: a header
+ * the site hardcodes, which nothing can re-read. Narrow on purpose — matched on the path, so a
+ * captured response body cannot smuggle a token past the gate by containing `kind: 'literal'`.
+ */
+describe('the approved-literal exemption (TR-6)', () => {
+  // High entropy on purpose: x.com's own bearer is mostly a run of `A`s and the entropy rule does
+  // not flag it at all — it is redacted by HEADER NAME. A hardcoded token that IS flagged is what
+  // makes this exemption necessary, so that is what it is tested with.
+  const BEARER = 'sk_live_9aF3kQ2mZx7bV1nR8tYuI0pLsDcG4hJw'
+
+  it('lets an approved literal through, at either of the two fields that hold one', () => {
+    expect(findSurvivingSecrets({ auth: { credential_source: [{ kind: 'literal', value: BEARER }] } })).toEqual([])
+    expect(findSurvivingSecrets({ credentials: [{ header: 'authorization', value: BEARER }] })).toEqual([])
+  })
+
+  it('still refuses the same value anywhere else in the same document', () => {
+    expect(findSurvivingSecrets({ auth: { token: BEARER } })).toHaveLength(1)
+    expect(findSurvivingSecrets({ response_body: { data: { value: BEARER } } })).toHaveLength(1)
+    // Not keyed on `kind`, so a payload shaped like a credential source cannot hide one.
+    expect(findSurvivingSecrets({ body: { kind: 'literal', value: BEARER } })).toHaveLength(1)
+    // And not at an unindexed member of the right name either.
+    expect(findSurvivingSecrets({ credential_source: { value: BEARER } })).toHaveLength(1)
+  })
+})
+
 describe('secrets in key position (REQ-CAP-005, TR-6)', () => {
   const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r-wW1gFWFOEjXk'
 
-  it('flags a credential-shaped object key', () => {
-    expect(findSurvivingSecrets({ [jwt]: { id: 1 } })).toEqual([`$.${jwt} (key)`])
+  /**
+   * The path it reports names WHERE a secret is, and the caller puts that name in the refusal it
+   * sends back — the extension's `gateResult` hands it to a hosted assistant over the relay. So a
+   * path carrying the key verbatim made the gate transmit, to a remote party, the exact
+   * credential it had just refused to send. It must locate without disclosing.
+   */
+  it('flags a credential-shaped object key without repeating it', () => {
+    const [found, ...rest] = findSurvivingSecrets({ [jwt]: { id: 1 } })
+    expect(rest).toEqual([])
+    expect(found).toContain('(key)')
+    expect(found).not.toContain(jwt)
+    expect(found).toBe(`$.«redacted:string:${jwt.length}» (key)`)
+  })
+
+  /**
+   * A UUID is 36 characters of mixed alphabet with no spaces, and with a resource prefix it is 40
+   * — which is exactly the entropy rule's definition of a token. So `id: pol_<uuid>` read as a
+   * credential, and the result gate withheld the whole tool result over it: a list endpoint
+   * returning six rows told the assistant only that six existed. Identifiers are the most common
+   * field in any REST response, so the gate has to be able to see one.
+   *
+   * A credential that happens to be a UUID is still caught, one layer earlier: redaction matches
+   * `session`, `token` and the rest by KEY before any value is judged, and the gate runs on what
+   * redaction produced.
+   */
+  it('lets an identifier through while still redacting a UUID under a secret key', () => {
+    const uuid = '4f8a2c1e-9b3d-4a7f-8e21-77c0d5b6a913'
+    expect(findSurvivingSecrets({ id: `pol_${uuid}`, policyId: uuid })).toEqual([])
+
+    for (const key of ['session_id', 'sessionId', 'access_token']) {
+      const redacted = redactBody({ [key]: uuid }) as Record<string, unknown>
+      expect(redacted[key]).toBe(`«redacted:string:${uuid.length}»`)
+    }
+    // And the rule is narrowed to UUIDs, not to long strings generally.
+    expect(findSurvivingSecrets({ id: 'AbC9xY2zQ7mN4pR8sT1vW6uJ0kL5hG3fD2eS7aZ9' })).toHaveLength(1)
   })
 
   it('redacts a credential-shaped object key while keeping the shape', () => {

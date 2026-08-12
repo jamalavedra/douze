@@ -1,4 +1,5 @@
 import type { AuditEntry } from '../guards.js'
+import { applyTheme, mountThemeSwitch } from './theme.js'
 import type { DataCommand, DataState } from '../messages.js'
 import type { ExportedFile } from '../recipes.js'
 import type { SessionSummary } from '../store.js'
@@ -34,6 +35,9 @@ let pending: ExportedFile[] = []
 let arming = ''
 
 const byId = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T
+
+applyTheme()
+mountThemeSwitch(document.getElementById('theme'))
 const el = (tag: string, props: Record<string, unknown> = {}, children: (Node | string)[] = []): HTMLElement => {
   const node = Object.assign(document.createElement(tag), props)
   for (const child of children) node.append(child)

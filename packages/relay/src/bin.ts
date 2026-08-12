@@ -6,10 +6,14 @@ import { startRelay } from './server.js'
 const host = process.env['RELAY_HOST'] ?? '127.0.0.1'
 // Only safe when that proxy is the sole route to this port; see `trustProxy` in server.ts.
 const trustProxy = process.env['TRUST_PROXY'] === '1'
+// The DIRECTORY the endpoint registry is kept in, so a restart does not invalidate every link.
+// Unset means memory only; `StateDirectory=` in the systemd unit provides it and makes it writable.
+const state = process.env['RELAY_STATE'] ?? process.env['STATE_DIRECTORY']
 const relay = await startRelay({
   port: Number(process.env['RELAY_PORT'] ?? 9787),
   host,
   trustProxy,
+  ...(state === undefined ? {} : { statePath: `${state}/endpoints.json` }),
 }).catch((error: Error) => {
   process.stderr.write(`${error.message}\n`)
   process.exit(1)

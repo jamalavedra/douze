@@ -32,8 +32,13 @@ export function isLoginRedirect(requestUrl: string, finalUrl: string | undefined
   }
 }
 
+/**
+ * Only a 401 or an actual login redirect. A 403 means the request was understood and refused —
+ * a CSRF token Douze did not send, or a permission the account lacks — and a "you are signed out"
+ * notification for one sends the user to sign in twice for a session that never expired.
+ */
 export function isExpired(status: number | undefined, loginRedirect: boolean): boolean {
-  return loginRedirect || status === 401 || status === 403
+  return loginRedirect || status === 401
 }
 
 /** The login page to point the user at when a session expires (AC-EXE-002.3). */
@@ -80,6 +85,40 @@ export function readPageCredentials(expressions: string[]): Array<string | null>
           cursor = (cursor as Record<string, unknown>)[part]
         }
         return cursor === null || cursor === undefined ? null : String(cursor)
+      } catch {
+        return null
+      }
+    }
+    /**
+     * A token the page publishes in its DOM. `<meta name="csrf-token" content="…">` is the Rails,
+     * Laravel and Django convention and is how a large share of ordinary dashboards authorise a
+     * write — five of opencli's own site adapters read exactly this. Only `meta[...]` is accepted
+     * and only `content` is read: a general selector plus a general property is a page-scraping
+     * primitive, and this needs to be a credential lookup.
+     */
+    const meta = /^document\.querySelector\(\s*['"`]meta\[(?:name|property)=['"]?([\w:-]+)['"]?\]['"`]\s*\)\.content$/.exec(
+      source,
+    )
+    if (meta) {
+      try {
+        const document_ = scope['document'] as Document | undefined
+        const found = document_?.querySelector(`meta[name="${meta[1]}"], meta[property="${meta[1]}"]`)
+        return found?.getAttribute('content') ?? null
+      } catch {
+        return null
+      }
+    }
+    // One named cookie, which is what capture-time discovery emits. The whole-jar form below is
+    // kept for a recipe that was recorded before this existed.
+    const named = /^document\.cookie\[\s*['"`](.+?)['"`]\s*\]$/.exec(source)
+    if (named) {
+      try {
+        const jar = (scope['document'] as Document | undefined)?.cookie ?? ''
+        for (const pair of jar.split('; ')) {
+          const split = pair.indexOf('=')
+          if (split > 0 && pair.slice(0, split) === named[1]) return decodeURIComponent(pair.slice(split + 1))
+        }
+        return null
       } catch {
         return null
       }
@@ -168,6 +207,26 @@ export async function issueRequest(
  * Endpoint Template parameters it fills — a project key in the URL is read from the page exactly
  * like one in a header, because an agent has no way to know it and a placeholder is not a URL.
  */
+/**
+ * Headers the user has allowed Douze to keep and resend for one origin, from `auth:literals`.
+ *
+ * Read at call time rather than baked into a recipe: the recipe stays free of credentials (so a
+ * skills file is still safe to hand to somebody), and withdrawing consent takes effect on the next
+ * call rather than on the next recording.
+ */
+export async function approvedLiterals(origin: string): Promise<Record<string, string>> {
+  const headers: Record<string, string> = {}
+  try {
+    const stored = await chrome.storage.local.get('auth:literals')
+    const allowed =
+      (stored['auth:literals'] as Record<string, { header: string; value: string; prefix: string }[]>) ?? {}
+    for (const entry of allowed[origin] ?? []) headers[entry.header] = `${entry.prefix}${entry.value}`
+  } catch {
+    // No approval store is the ordinary case, and a call must not fail for the want of one.
+  }
+  return headers
+}
+
 export function credentialContributions(
   sources: CredentialSource[],
   values: Array<string | null>,
@@ -176,6 +235,13 @@ export function credentialContributions(
   const params: Record<string, string> = {}
   let index = 0
   for (const source of sources) {
+    // A literal consumes no read: its value came with the recipe because the page keeps it nowhere
+    // this extension could look. `values` is indexed by page-state source only — see
+    // `pageStateSources`, which is what produced the reads — so it must not advance here.
+    if (source.kind === 'literal') {
+      headers[source.header] = `${source.prefix}${source.value}`
+      continue
+    }
     if (source.kind !== 'page_state') continue
     const value = values[index++]
     if (!value) continue
@@ -358,6 +424,9 @@ export async function executeRelay(request: RelayRequest, deps: RelayDeps): Prom
       })
       const contributed = credentialContributions(pageState, (read?.result as Array<string | null>) ?? [])
       Object.assign(headers, contributed.headers)
+      // A header this origin was explicitly allowed to keep, for a token the page holds nowhere
+      // readable. Page-state wins where both exist: a value read live is never staler than a copy.
+      Object.assign(headers, await approvedLiterals(request.origin), contributed.headers)
       // `{param}` left in the URL by the daemon, because only the page knows the value. Both
       // spellings: `new URL()` percent-encodes the braces on the way here, so matching only the
       // literal form left the placeholder in place and the call 404'd on `%7Bproject_key%7D`.
