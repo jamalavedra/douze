@@ -263,6 +263,24 @@ export const Recipe = z
           message: `approved destructive tool "${tool.name}" must require a "confirm" parameter`,
         })
       }
+      // An imported file asserts its own side-effect label. Method semantics are the minimum
+      // classification it may claim, otherwise DELETE/PUT/PATCH/POST can bypass the write gates by
+      // calling itself a read. GraphQL POST queries are the one modelled read-over-POST case.
+      const method = tool.request.method
+      const isGraphqlQuery = method === 'POST' && tool.request.graphql !== undefined
+      if (method === 'DELETE' && tool.side_effect !== 'destructive') {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['tools', i, 'side_effect'],
+          message: `tool "${tool.name}" uses DELETE, so it must be side_effect "destructive"`,
+        })
+      } else if (tool.side_effect === 'read' && ['POST', 'PUT', 'PATCH'].includes(method) && !isGraphqlQuery) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['tools', i, 'side_effect'],
+          message: `tool "${tool.name}" uses ${method}, so it cannot be side_effect "read"`,
+        })
+      }
       /**
        * A GraphQL document is a program, and `side_effect` next to it is a label the file asserts
        * rather than anything derived from what the document does. Inference DOES derive it — a

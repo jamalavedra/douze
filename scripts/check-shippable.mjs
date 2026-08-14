@@ -19,3 +19,14 @@ if (granted.length > 0) {
   )
   process.exit(1)
 }
+
+if (readFileSync('packages/extension/dist/LICENSE', 'utf8') !== readFileSync('LICENSE', 'utf8')) {
+  process.stderr.write('refusing to package: the extension is missing the current project LICENSE.\n')
+  process.exit(1)
+}
+
+const notices = readFileSync('packages/extension/dist/THIRD_PARTY_NOTICES', 'utf8')
+if (!notices.includes('zod 4.4.3 (MIT)') || !notices.includes('yaml 2.9.0 (ISC)')) {
+  process.stderr.write('refusing to package: the extension is missing its third-party notices.\n')
+  process.exit(1)
+}

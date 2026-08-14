@@ -1,15 +1,40 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { CROSS_ORIGIN_REFUSED, PERMISSION_MISSING } from './guards.js'
 import {
   approvedLiterals,
   credentialHeaders,
   executeRelay,
+  issueRequest,
   isExpired,
   isLoginRedirect,
   loginUrlFor,
   pageStateSources,
   readPageCredentials,
 } from './relay.js'
+
+describe('issuing a request in the executor tab', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('refuses redirects before fetch can forward a custom credential', async () => {
+    const fetch = vi.fn(async (_url: string, init?: RequestInit) => {
+      expect(init?.redirect).toBe('error')
+      return new Response('{"ok":true}', { headers: { 'content-type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetch)
+
+    const result = await issueRequest('https://app.example/api', 'GET', { 'x-api-key': 'secret' }, null, 1_000)
+    expect(result.body).toBe('{"ok":true}')
+    expect(fetch).toHaveBeenCalledOnce()
+  })
+
+  it('stops reading a response above 2 MiB', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(new Uint8Array(2 * 1024 * 1024 + 1))))
+
+    const result = await issueRequest('https://app.example/api', 'GET', {}, null, 1_000)
+    expect(result.error).toBe('response exceeded 2097152 byte limit')
+    expect(result.body).toBe('')
+  })
+})
 
 /**
  * A site's API is on a host of its own, so an approved tool can name an origin Chrome never
@@ -296,13 +321,8 @@ describe('a request that would leave its own origin (WO-015)', () => {
   })
 })
 
-/**
- * `redirect: 'follow'` means an open redirect on the user's own dashboard — reached through an
- * argument the tool legitimately accepts — lands wherever the attacker points it, and the fetch
- * spec forwards a custom header such as `x-api-key` across that hop. The response is then
- * attacker-controlled text handed to the model as if the dashboard had said it.
- */
-describe('a request redirected off its own origin (WO-015)', () => {
+/** Defense in depth if a legacy or replaced executor returns a cross-origin result. */
+describe('an executor result from another origin (WO-015)', () => {
   const call = async (finalUrl: string): Promise<{ response: Awaited<ReturnType<typeof executeRelay>>; notified: string[][] }> => {
     ;(globalThis as Record<string, unknown>)['chrome'] = {
       permissions: { contains: async () => true },
@@ -363,11 +383,6 @@ describe('a request redirected off its own origin (WO-015)', () => {
     expect(notified).toEqual([['https://app.example', 'https://app.example/login']])
   })
 
-  it('still allows an ordinary same-origin redirect', async () => {
-    const { response } = await call('https://app.example/api/orders/')
-    expect(response.ok).toBe(true)
-    expect(response.body).toEqual({ attacker: 'controlled' })
-  })
 })
 
 describe('an origin the user never granted (AC-EXE-001.1)', () => {

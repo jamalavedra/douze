@@ -76,16 +76,10 @@
         <p class="sub" id="copied" role="status" hidden></p>
 
         <h2 class="section-heading">Where to paste it</h2>
-        <!--
-          One disclosure per product, because nobody is pasting this into three of them: the two
-          they are not using are noise beside the one they are. The marks are files in this
-          extension, never a remote URL — MV3's CSP would refuse the load, and fetching a logo
-          would tell OpenAI, Anthropic and Dust that somebody opened this page. `alt` is empty
-          because the product's name is the next thing in the summary.
-        -->
+        <!-- One disclosure per product, because the other two are noise beside the one in use. -->
         <div class="providers">
           <details class="provider">
-            <summary><img class="mark" src="chatgpt.svg" alt="" />Instructions for ChatGPT</summary>
+            <summary>Instructions for ChatGPT</summary>
             <ol class="numbered">
               <li>Settings &rarr; Plugins &rarr; Developer mode, and turn it on.</li>
               <li>Back to Settings &rarr; Plugins, then the <strong>+</strong> beside the search box.</li>
@@ -97,7 +91,7 @@
             </ol>
           </details>
           <details class="provider">
-            <summary><img class="mark" src="claude.svg" alt="" />Instructions for claude.ai</summary>
+            <summary>Instructions for claude.ai</summary>
             <ol class="numbered">
               <li>Settings &rarr; Connectors &rarr; Add custom connector.</li>
               <li>Paste the link as the server URL.</li>
@@ -105,7 +99,7 @@
             </ol>
           </details>
           <details class="provider">
-            <summary><img class="mark" src="dust.png" alt="" />Instructions for Dust</summary>
+            <summary>Instructions for Dust</summary>
             <ol class="numbered">
               <li>Admin &rarr; Tools &rarr; Add MCP server.</li>
               <li>Paste the link as the server URL.</li>

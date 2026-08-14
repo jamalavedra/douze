@@ -159,14 +159,9 @@ Production extension builds request host permission when recording. Test builds 
 
 ## Self-host the relay
 
-```sh
-pnpm --filter @douze/relay build
-node packages/relay/dist/index.js
-```
-
-The relay binds `127.0.0.1:9787` by default and serves plain HTTP. Terminate TLS in front of it.
-Set `RELAY_STATE` to a writable directory if endpoint links must survive restarts. See
-[packages/relay/README.md](packages/relay/README.md) for the API and deployment settings.
+The relay binds `127.0.0.1:9787` by default and serves plain HTTP behind your TLS terminator. The
+[relay hosting guide](packages/relay/README.md#production-setup-systemd-and-caddy) covers DNS,
+systemd, Caddy, persistent endpoint links, upgrades, recovery, and connecting the extension.
 
 ## License
 

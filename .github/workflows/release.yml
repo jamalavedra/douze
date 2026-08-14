@@ -12,11 +12,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
-    name: Build and publish the release artifacts
+  build:
+    name: Build the release artifact
     runs-on: ubuntu-latest
     permissions:
-      contents: write # create the GitHub Release and upload its assets
+      contents: read
     steps:
       - name: Check out the tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -41,8 +41,28 @@ jobs:
       - name: Build the release artifacts
         run: pnpm release:local
 
+      - name: Store the release artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: douze-extension
+          path: douze-extension.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish the release artifact
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download the verified artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: douze-extension
+
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" --generate-notes douze-extension.zip
+        run: gh release create "$TAG" --repo "$GH_REPO" --generate-notes douze-extension.zip
