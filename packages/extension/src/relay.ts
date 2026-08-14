@@ -178,15 +178,45 @@ export async function issueRequest(
       method,
       headers,
       credentials,
-      redirect: 'follow',
+      // Never follow a redirect: fetch can forward custom credentials such as `x-api-key` before
+      // the caller gets a chance to inspect the destination.
+      redirect: 'error',
       // A hung target must not hold the relay open to the MV3 five-minute per-call ceiling.
       signal: AbortSignal.timeout(timeoutMs),
       ...(body === null ? {} : { body }),
     })
+
+    // The model-facing result is capped later, after JSON parsing and primary-payload selection.
+    // Bound the earlier network read as well so a target cannot exhaust the extension's memory.
+    const maxResponseBytes = 2 * 1024 * 1024
+    const reader = res.body?.getReader()
+    const decoder = new TextDecoder()
+    const parts: string[] = []
+    let bytes = 0
+    if (reader) {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        bytes += value.byteLength
+        if (bytes > maxResponseBytes) {
+          await reader.cancel()
+          return {
+            status: 0,
+            headers: {},
+            body: '',
+            url,
+            redirected: false,
+            error: `response exceeded ${maxResponseBytes} byte limit`,
+          }
+        }
+        parts.push(decoder.decode(value, { stream: true }))
+      }
+      parts.push(decoder.decode())
+    }
     return {
       status: res.status,
       headers: Object.fromEntries(res.headers),
-      body: await res.text(),
+      body: parts.join(''),
       url: res.url,
       redirected: res.redirected,
     }
@@ -467,23 +497,8 @@ export async function executeRelay(request: RelayRequest, deps: RelayDeps): Prom
 
     const loginRedirect = isLoginRedirect(url, result.url)
 
-    /**
-     * Where the request LANDED, not where it was aimed. `redirect: 'follow'` means an open
-     * redirect on the user's own dashboard — reached through an argument the tool legitimately
-     * accepts — lands on a host of the attacker's choosing, and the fetch spec forwards custom
-     * headers such as `x-api-key` across that hop (only `Authorization` is stripped). Two things
-     * follow from a cross-origin landing, and both are refused here: the response body is fully
-     * attacker-controlled and would be handed to the model as if the dashboard had said it, and
-     * the caller would be told a call to another origin succeeded.
-     *
-     * Same-origin redirects are ordinary — a trailing slash, a canonical host — and still pass.
-     *
-     * What this cannot undo is the hop itself: by the time the response is back, the browser has
-     * already sent the request to the redirect target. `redirect: 'manual'` would prevent that but
-     * yields an opaque response with no readable `Location`, which breaks the same-origin
-     * redirects that must keep working. Refusing the result is the part that is enforceable here;
-     * a header allow-list at capture time is the place to shrink what the hop can carry.
-     */
+    // `issueRequest` refuses every redirect before credentials can cross a hop. Keep this check as
+    // defense in depth: an old or replaced executor result still cannot leave the recipe origin.
     const landedOrigin = originOf(result.url)
     if (landedOrigin !== request.origin) {
       // Still worth telling the user their session expired if that is what this was — pointed at

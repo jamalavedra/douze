@@ -73,8 +73,6 @@ ul { display: grid; gap: 6px; list-style: none; margin: 0; padding: 0; }
   background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
   font-size: 0.875rem; overflow-wrap: anywhere; padding: 10px 12px;
 }
-.mark { border-radius: 4px; flex: 0 0 18px; height: 18px; width: 18px; }
-
 /* One folded row per product, drawn as a single bordered card of disclosures. */
 .providers { border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
 .provider { border-top: 1px solid var(--line); margin: 0; padding: 0; }

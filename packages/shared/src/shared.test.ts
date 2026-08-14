@@ -262,7 +262,7 @@ describe('recipe format (REQ-REC-001)', () => {
   describe('a GraphQL mutation cannot be labelled read (WO-016)', () => {
     const withGraphql = (document: string, sideEffect = 'read'): ReturnType<typeof parseRecipe> =>
       parseRecipe(
-        VALID.replace('side_effect: read', `side_effect: ${sideEffect}`).replace(
+        VALID.replace('side_effect: read', `side_effect: ${sideEffect}`).replace('method: GET', 'method: POST').replace(
           '      path: /api/orders',
           `      path: /graphql\n      graphql:\n        operation: op\n        document: ${JSON.stringify(document)}`,
         ),
@@ -292,6 +292,34 @@ describe('recipe format (REQ-REC-001)', () => {
     it('reads the document, not the operation name', () => {
       expect(graphqlHasMutation('mutation { deleteAllOrders { id } }')).toBe(true)
       expect(graphqlHasMutation('query GetMutations { mutations { id } }')).toBe(false)
+    })
+  })
+
+  describe('REST methods cannot understate their side effects', () => {
+    const withMethod = (method: string, sideEffect = 'read'): ReturnType<typeof parseRecipe> =>
+      parseRecipe(
+        VALID.replace('method: GET', `method: ${method}`).replace('side_effect: read', `side_effect: ${sideEffect}`),
+        'x.yaml',
+      )
+
+    it('refuses DELETE labelled as a read', () => {
+      const result = withMethod('DELETE')
+      expect(result.ok).toBe(false)
+      expect(result.error).toContain('must be side_effect "destructive"')
+    })
+
+    it('refuses DELETE labelled as an ordinary write', () => {
+      expect(withMethod('DELETE', 'write').error).toContain('must be side_effect "destructive"')
+    })
+
+    it.each(['POST', 'PUT', 'PATCH'])('refuses %s labelled as a read', (method) => {
+      const result = withMethod(method)
+      expect(result.ok).toBe(false)
+      expect(result.error).toContain(`uses ${method}`)
+    })
+
+    it('allows a REST write when it is labelled write', () => {
+      expect(withMethod('PUT', 'write').ok).toBe(true)
     })
   })
 
