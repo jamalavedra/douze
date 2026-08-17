@@ -5,6 +5,10 @@ Use a signed-in website once; expose the observed actions as MCP tools.
 Douze is a Chrome extension. It records a tab's API traffic, infers tools, lets the user approve
 them, and executes approved calls inside the same browser session.
 
+## Demo
+
+https://github.com/user-attachments/assets/175f9fd9-16fc-4bd7-aedf-ed9ee5f764a2
+
 ```text
 hosted assistant ──HTTPS── relay ──┐
                                    ├──WebSocket── extension ── signed-in tab
