@@ -203,9 +203,14 @@ el.done.addEventListener('click', async () => {
 
 el.addNote.addEventListener('click', async () => {
   if (!el.note.value.trim()) return
-  render(await send({ type: 'douze:annotate', note: el.note.value }))
-  el.note.value = ''
-  el.noted.hidden = false
+  const answered = await send({ type: 'douze:annotate', note: el.note.value })
+  render(answered)
+  // "Noted." only when it was. A note with nothing recorded since the last one describes an empty
+  // span and reaches no tool, and the sentence is kept in the box rather than cleared: retyping
+  // something you already wrote is worse than being told it did not land.
+  const landed = answered.error === undefined
+  el.noted.hidden = !landed
+  if (landed) el.note.value = ''
 })
 
 /** AC-CAP-004.3 — additions apply to subsequent sessions, not the one already running. */
