@@ -204,16 +204,16 @@ describe('Reconciler (T-002.6)', () => {
     expect(r.accept(draft(), 0)).toHaveLength(1)
   })
 
-  it('drops a debugger capture of a request the interceptor already claimed', () => {
+  it('drops an oracle capture of a request the interceptor already claimed', () => {
     const r = new Reconciler()
     r.accept(draft(), 0)
-    expect(r.accept(draft({ source: 'debugger' }), 0)).toHaveLength(0)
+    expect(r.accept(draft({ source: 'web_request' }), 0)).toHaveLength(0)
     expect(r.due(RECONCILE_GRACE_MS + 1)).toHaveLength(0)
   })
 
-  it('emits a debugger capture the interceptor never saw, once the grace window passes', () => {
+  it('emits an oracle capture the interceptor never saw, once the grace window passes', () => {
     const r = new Reconciler()
-    expect(r.accept(draft({ source: 'debugger' }), 0)).toHaveLength(0)
+    expect(r.accept(draft({ source: 'web_request' }), 0)).toHaveLength(0)
     expect(r.due(RECONCILE_GRACE_MS - 1)).toHaveLength(0)
     expect(r.due(RECONCILE_GRACE_MS + 1)).toHaveLength(1)
   })
@@ -228,11 +228,11 @@ describe('Reconciler (T-002.6)', () => {
 
   it('does not collapse two genuine calls to the same URL', () => {
     const r = new Reconciler()
-    // Two MAIN-world emissions bank two credits, so both debugger drafts are accounted for.
+    // Two MAIN-world emissions bank two credits, so both oracle drafts are accounted for.
     expect(r.accept(draft({ started_at: 1_000 }), 0)).toHaveLength(1)
     expect(r.accept(draft({ started_at: 1_500 }), 5)).toHaveLength(1)
-    r.accept(draft({ source: 'debugger', started_at: 1_000 }), 6)
-    r.accept(draft({ source: 'debugger', started_at: 1_500 }), 7)
+    r.accept(draft({ source: 'web_request', started_at: 1_000 }), 6)
+    r.accept(draft({ source: 'web_request', started_at: 1_500 }), 7)
     expect(r.due(RECONCILE_GRACE_MS + 10)).toHaveLength(0)
   })
 
@@ -264,11 +264,11 @@ describe('Reconciler (T-002.6)', () => {
     expect(r.due(RECONCILE_GRACE_MS + 10)).toHaveLength(0)
   })
 
-  it('emits the second debugger capture when the interceptor only saw the first', () => {
+  it('emits the second oracle capture when the interceptor only saw the first', () => {
     const r = new Reconciler()
     r.accept(draft({ started_at: 1_000 }), 0)
-    r.accept(draft({ source: 'debugger', started_at: 1_000 }), 1)
-    r.accept(draft({ source: 'debugger', started_at: 2_000 }), 2)
+    r.accept(draft({ source: 'web_request', started_at: 1_000 }), 1)
+    r.accept(draft({ source: 'web_request', started_at: 2_000 }), 2)
     expect(r.due(RECONCILE_GRACE_MS + 10)).toHaveLength(1)
   })
 

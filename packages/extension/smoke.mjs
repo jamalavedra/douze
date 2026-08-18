@@ -90,7 +90,6 @@ try {
         type: 'douze:start',
         name: '  ',
         origins: ['https://app.example'],
-        useDebugger: false,
       })
       return typeof res.error === 'string' && res.error.includes('no open tab')
     }),

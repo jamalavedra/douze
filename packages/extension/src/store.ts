@@ -88,7 +88,6 @@ export class CaptureStore {
     id?: string
     name: string
     origins: string[]
-    debugger_enabled?: boolean
   }): Promise<CaptureSession> {
     // AC-CAP-001.2 — an unnamed session is rejected before anything is written.
     const session = CaptureSession.parse({
@@ -96,7 +95,6 @@ export class CaptureStore {
       name: input.name,
       origins: input.origins,
       started_at: Date.now(),
-      debugger_enabled: input.debugger_enabled ?? false,
     })
     await this.put(SESSIONS, session)
     return session

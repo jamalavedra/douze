@@ -176,7 +176,10 @@ function render(): void {
     : state.stale
       ? // Not "no connection at the moment": the relay has forgotten this endpoint, Douze has
         // stopped dialling it, and no amount of waiting brings it back. Only a new link does.
-        'This link no longer works — the relay has forgotten it. Get a new one and paste it in again.'
+        // Not "get a new one": that button is `POST /rotate`, which authenticates with the token
+        // the relay has just forgotten, so it fails with a 401 and a contradiction. Stop sharing
+        // registers afresh, which is the only route out of this state.
+        'This link no longer works — the relay has forgotten it. Choose Stop sharing, then Connect, and paste the new link in again.'
       : state.connected
         ? 'Shared, and Douze has a live connection right now.'
         : 'Shared, but Douze has no connection at the moment. It keeps trying on its own; the link stays the same.'

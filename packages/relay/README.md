@@ -24,8 +24,37 @@ By default nothing is persisted and a restart invalidates every link. When `RELA
 the relay atomically writes `endpoints.json` in that directory with three hashes per endpoint:
 `tokenHash`, `secretHash`, and `bearerHash`. Tool surfaces and payloads remain memory-only.
 
-Endpoints with no extension attachment expire after six idle windows (one hour by default).
-Never-used registrations expire after two windows.
+### Endpoint lifetime
+
+Two clocks, both measured from the last time the **extension** attached. A platform client polling
+`/m/<secret>` cannot move either of them; that is the point of measuring attachment rather than
+traffic.
+
+| Clock | Default | Effect |
+|---|---|---|
+| `ENDPOINT_ATTACH_WINDOWS` | 6 idle windows, 1 hour | Dormant: tool surface dropped, sessions closed, hashes kept. The URL still resolves. |
+| `ENDPOINT_MAX_AGE_MS` | 30 days | Reaped: the endpoint and its `secretHash` are deleted. The URL 404s. |
+
+Dormancy exists so the surface — tool names, descriptions and schemas, all derived from the user's
+own dashboards — does not outlive the browser it came from, while the URL a user pasted into a
+hosted connector by hand keeps working. The extension re-attaches to the same endpoint and
+re-pushes its surface, which reaches connected clients as `notifications/tools/list_changed`.
+While a surface is empty, `initialize` carries instructions naming the cause — extension away, or
+nothing recorded yet — so a client with no tools to list can still tell its user what to do.
+
+The 30-day clock bounds a disclosed URL. The URL is the whole credential unless the endpoint was
+registered with a bearer token, and the extension does not send one, so without an outer clock a
+copied URL would stay live forever and silently re-arm whenever the user's browser returned. It
+also collects rows that `POST /register` plus a single `hello` would otherwise leave in the
+registry permanently.
+
+Besides those clocks, a link is removed by `DELETE /register` and by `POST /rotate`. A registration
+no extension ever dialled is deleted after two idle windows, or six if a client keeps polling it.
+
+**Restarts reset the 30-day clock.** Restored rows carry no timestamp — the file holds hashes and
+nothing else — so a relay that is redeployed more often than monthly never reaps an abandoned
+endpoint. Dormancy is unaffected. If accumulated dead rows ever matter, stopping the service and
+removing `endpoints.json` invalidates every link, including live ones.
 
 ## HTTP API
 
@@ -235,8 +264,11 @@ must connect again and paste the new links into their assistants.
 
 If health is down, check the relay service first, then Caddy and DNS. If health is up but an MCP URL
 is offline, open the browser containing Douze: the relay cannot execute a tool until that extension
-reconnects. A browser may be closed temporarily—sessions and the cached tool list remain—but calls
-need the browser within the 40-second wake window.
+reconnects, and a call waits out the 40-second wake window for it. A briefly closed browser costs
+nothing — sessions and the cached tool list survive for an hour, after which the endpoint is
+dormant and `tools/list` answers empty until the extension dials in again (see Endpoint lifetime).
+The URL stays valid throughout, so a user reporting "my assistant has no tools" needs their browser
+open, not a new link.
 
 ### Security checklist
 
@@ -244,6 +276,8 @@ need the browser within the 40-second wake window.
 - Keep Node and the checked-out Douze release updated.
 - Restrict access to the host, journal, Caddy configuration, and relay state file.
 - Monitor registration refusals and unexpected request volume in the journal.
-- Treat every MCP URL as a password and rotate it after accidental disclosure.
+- Treat every MCP URL as a password and rotate it after accidental disclosure. A disclosed URL is a
+  live capability until it is rotated: dormancy empties the tool list but does not invalidate the
+  URL, and the endpoint is deleted on its own only after 30 days with no extension attachment.
 - Remember that the relay operator can read or alter live tool arguments and results even though
   the relay does not persist or log them.

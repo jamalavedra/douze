@@ -524,7 +524,7 @@ describe('messages from anything but an extension page (security)', () => {
   const forged = contentScript('https://evil.test')
 
   it('refuses a forged session start, with no reply and nothing recorded', async () => {
-    expect(await sendFrom(forged, { type: 'douze:start', name: 'x', origins: ['https://evil.test'], useDebugger: false })).toBeUndefined()
+    expect(await sendFrom(forged, { type: 'douze:start', name: 'x', origins: ['https://evil.test'] })).toBeUndefined()
     await settle()
     expect(douze().status().session).toBeNull()
     expect(await (await openCaptures()).sessions()).toEqual([])

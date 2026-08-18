@@ -17,7 +17,7 @@ import type { CapturedBody, CredentialHint, GestureEvent } from './messages.js'
 export const PROVENANCE_WINDOW_MS = 2000
 
 /**
- * How long a `web_request` or `debugger` observation waits for the MAIN-world interceptor to
+ * How long a `web_request` observation waits for the MAIN-world interceptor to
  * claim the same request before it is emitted on its own. Long enough to cover the bridge's
  * 250 ms batch plus a slow response body read.
  */
@@ -191,10 +191,10 @@ export function finalize(draft: ExchangeDraft, ctx: SessionContext, id: string):
 const SAME_REQUEST_MS = 50
 
 /**
- * T-002.6 — an exchange the interceptor and the debugger both saw is emitted exactly once.
+ * T-002.6 — an exchange the interceptor and the oracle both saw is emitted exactly once.
  *
- * The paths share no request id, so a MAIN-world emission is matched to a deferred oracle or
- * debugger draft by (method, url) within the grace window, consuming one credit per match.
+ * The paths share no request id, so a MAIN-world emission is matched to a deferred oracle
+ * draft by (method, url) within the grace window, consuming one credit per match.
  *
  * Counting an ordinal per source and then keying the claim source-blind does NOT work, and the
  * failure is silent data loss rather than a duplicate: the oracle observes a SUPERSET of
@@ -219,8 +219,8 @@ export class Reconciler {
   }
 
   /**
-   * The MAIN-world path emits immediately and banks a credit; the oracle and debugger paths
-   * wait out the grace window so a body-bearing capture of the same request wins.
+   * The MAIN-world path emits immediately and banks a credit; the oracle path waits out the
+   * grace window so a body-bearing capture of the same request wins.
    */
   accept(draft: ExchangeDraft, now: number): ExchangeDraft[] {
     const key = Reconciler.key(draft)

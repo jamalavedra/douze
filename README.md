@@ -99,6 +99,31 @@ The same trust checks apply whether a skill is called directly or through `douze
 Use the extension's connect page to disable hosted writes, rotate the URL, stop sharing, manage
 result exemptions, or pair a local client.
 
+#### How long the link lasts
+
+Paste the URL into your assistant once. It stays valid for as long as you keep using Douze — the
+countdown below restarts every time your browser connects, which happens within about 30 seconds
+of Chrome starting, on its own.
+
+| Time with no browser connection | What happens | Your URL |
+|---|---|---|
+| 1 hour | The relay forgets your tools and closes open sessions. | Still valid. |
+| 30 days | The relay deletes the link. | Dead — connect again and paste the new URL. |
+
+So closing your laptop overnight, over a weekend or for a holiday costs nothing: reopen Chrome and
+the tools come back by themselves. Only a month of never opening the browser — you uninstalled
+Douze, moved to another machine, or stopped using it — retires the link.
+
+**If your assistant says it has no tools**, that is the one-hour state: your browser is not
+connected. Open Chrome on the computer where Douze is installed, leave it open for half a minute,
+then start a new conversation. The link does not need replacing. Douze tells the assistant this
+too, so a capable client should say it for you rather than claiming the tool does not exist.
+
+The 30-day deletion is a safety net, not an inconvenience: the URL is the only credential — anyone
+who copies it out of your assistant's settings has the same access you do, and it would otherwise
+work forever. If a URL is ever exposed, do not wait for the clock; use **Get a new link**, which
+invalidates the old one immediately.
+
 ### Local clients
 
 Build the optional bridge:
@@ -132,9 +157,12 @@ exemptions, and audit entries live in `chrome.storage.local`. A paired bridge al
 The extension's data page can delete captures and recipes, import HAR files, and import or export
 recipe sets. Imported tools remain unapproved until reviewed.
 
-To revoke hosted access immediately, select **Stop sharing** before uninstalling the extension.
-Uninstalling removes extension storage but not `~/.douze/bridge.json`, relay state that has not yet
-expired, or data already retained by an AI provider.
+To revoke hosted access, select **Stop sharing** and check that it reports success *before*
+uninstalling the extension. The token that authorises removal lives only in extension storage, so
+uninstalling first leaves the relay endpoint in place, with no way for anyone but the relay
+operator to remove it; it stops listing tools within the hour and is deleted after 30 days without
+the extension. Uninstalling also leaves `~/.douze/bridge.json` and any data an AI provider has
+already retained.
 
 ## Development
 

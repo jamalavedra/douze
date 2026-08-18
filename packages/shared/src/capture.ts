@@ -10,7 +10,7 @@ export const UiProvenance = z.object({
 })
 
 /** AC-CAP-002.3 — how the exchange reached us, and whether its body is trustworthy. */
-export const CaptureSource = z.enum(['main_world', 'web_request', 'debugger', 'har'])
+export const CaptureSource = z.enum(['main_world', 'web_request', 'har'])
 
 /**
  * AC-EXE-001.3 — how the page supplies a credential: read `expression` in the page, prefix it, and
@@ -99,8 +99,6 @@ export const CaptureSession = z.object({
   origins: z.array(z.string()).min(1),
   started_at: z.number(),
   stopped_at: z.number().optional(),
-  /** AC-CAP-002.4 — chrome.debugger capture was enabled for this session. */
-  debugger_enabled: z.boolean().default(false),
 })
 
 export type Exchange = z.infer<typeof Exchange>
@@ -180,9 +178,9 @@ export function isInferableContentType(contentType: string | undefined): boolean
  * serves its own API: `dashboard.example.com` calls `api.example.com`, and requiring the target
  * to be the page's origin dropped every request that mattered — a recording of a real site
  * retained nothing at all. Live capture does not need this check, because it only ever sees
- * requests the recorded tab itself made: the interceptor is registered on the granted origin, the
- * oracle filters on the recording tab's id, and the debugger is attached to that one tab. The
- * noise list and the content type are what remain.
+ * requests the recorded tab itself made: the interceptor is registered on the granted origin and
+ * the oracle filters on the recording tab's id. The noise list and the content type are what
+ * remain.
  *
  * A HAR is different — it is a recording of the whole browser, with no tab to attribute a
  * request to — so importing one still names the origins it may keep.

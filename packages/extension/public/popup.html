@@ -38,9 +38,6 @@
       .tools li[data-effect='destructive'] .kind { color: var(--danger); }
       .hosted { border-top: 1px solid var(--line-soft); margin-top: 16px; padding-top: 14px; }
       details { margin-top: 16px; }
-      .check { align-items: baseline; display: flex; gap: 8px; margin-top: 12px; }
-      .check label { color: var(--ink); font-size: 0.8125rem; margin: 0; }
-      .check input { margin: 0; }
     </style>
   </head>
   <body>
@@ -109,11 +106,6 @@
         <summary>Settings</summary>
         <p class="field-label">Colour scheme</p>
         <div id="theme"></div>
-        <div class="check">
-          <input type="checkbox" id="use-debugger" />
-          <label for="use-debugger">Thorough recording</label>
-        </div>
-        <p class="note">Chrome shows a warning bar while it's on. Only needed if Douze records nothing without it.</p>
         <label for="noise">Ignore these sites</label>
         <textarea class="field" id="noise" rows="3" placeholder="metrics.internal.example"></textarea>
         <p class="note">One address per line. Applies next time you record.</p>

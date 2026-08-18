@@ -767,7 +767,7 @@ describe('sessions', () => {
    * The loop below IS the polling: each attempt refreshes the endpoint exactly as a connector
    * would, and the endpoint is reaped anyway because the clock that matters is the extension's.
    */
-  it('reaps an endpoint whose extension is gone, however hard the platform keeps polling', async () => {
+  it('drops the surface of an endpoint whose extension is gone, however hard the platform keeps polling', async () => {
     await relay.close()
     relay = await startRelay({ port: 0, sessionIdleMs: 60 })
     const { token, mcp_path } = await enroll()
@@ -779,11 +779,71 @@ describe('sessions', () => {
     await vi.waitFor(
       async () => {
         const res = await post(mcp_path, { jsonrpc: '2.0', id: 99, method: 'tools/list' }, session(sid))
-        // `not_found` and not `no_session`: the whole endpoint is gone, not merely its session.
-        expect(await res.json()).toMatchObject({ error: 'not_found' })
+        // `no_session` and not `not_found`: the session went with the surface, the link did not.
+        expect(await res.json()).toMatchObject({ error: 'no_session' })
       },
       { timeout: 3000, interval: 25 },
     )
+    // The tool names, descriptions and schemas are what must not outlive the browser.
+    expect(await list(mcp_path, await open(mcp_path))).toEqual([])
+  })
+
+  /**
+   * The URL is the whole credential — the extension sends no bearer — so dormancy cannot make it
+   * immortal. Deleting the endpoint is what used to rotate a leaked link every time someone shut
+   * their laptop; the outer clock is what still does, a month later instead of an hour.
+   */
+  it('deletes a dormant endpoint once nothing has attached for the outer clock', async () => {
+    await relay.close()
+    // Sleeps at 6 x 60ms, then abandoned at 900ms: the order is the point, not the numbers.
+    relay = await startRelay({ port: 0, sessionIdleMs: 60, endpointMaxAgeMs: 900 })
+    const { token, mcp_path } = await enroll()
+    const extension = await attach(token)
+    await surfaced(mcp_path, await open(mcp_path))
+    extension.socket.close()
+
+    // Dormant first: the surface is gone, and `open` asserting 200 is the link still answering.
+    await vi.waitFor(async () => expect(await list(mcp_path, await open(mcp_path))).toEqual([]), {
+      timeout: 3000,
+      interval: 25,
+    })
+
+    // Then the secret itself stops existing.
+    await vi.waitFor(async () => expect((await initialize(mcp_path)).status).toBe(404), { timeout: 3000, interval: 25 })
+  })
+
+  /**
+   * The other half of the rule above: a registration no extension ever dialled has no surface to
+   * protect and nobody coming back for it, so it is deleted rather than kept forever. Without this
+   * `POST /register` alone would grow the registry.
+   */
+  it('deletes a registration no extension ever dialled', async () => {
+    await relay.close()
+    relay = await startRelay({ port: 0, sessionIdleMs: 60 })
+    const { mcp_path } = await enroll()
+
+    await vi.waitFor(async () => expect((await initialize(mcp_path)).status).toBe(404), { timeout: 3000, interval: 25 })
+  })
+
+  /**
+   * The URL is pasted into a hosted connector by hand, once. A weekend with the laptop shut must
+   * not turn that into a chore, so the extension re-attaches to the endpoint it left.
+   */
+  it('serves the same link again when the extension comes back', async () => {
+    await relay.close()
+    relay = await startRelay({ port: 0, sessionIdleMs: 60 })
+    const { token, mcp_path } = await enroll()
+    const extension = await attach(token)
+    await surfaced(mcp_path, await open(mcp_path))
+
+    extension.socket.close()
+    await vi.waitFor(
+      async () => expect(await (await post(mcp_path, { jsonrpc: '2.0', id: 1, method: 'tools/list' }, session('x'))).json()).toMatchObject({ error: 'no_session' }),
+      { timeout: 3000, interval: 25 },
+    )
+
+    await attach(token)
+    await surfaced(mcp_path, await open(mcp_path))
   })
 
   /**
@@ -1018,6 +1078,39 @@ describe('the log', () => {
     } finally {
       spy.mockRestore()
     }
+  })
+})
+
+/**
+ * An empty tool list is the one failure the client cannot report: with no tool to refuse, the
+ * assistant says "I have no tool for that" and never mentions Douze. `initialize` is the only
+ * thing that still reaches a chat window on another device, so it has to carry the reason.
+ */
+describe('what initialize says when there are no tools', () => {
+  const instructions = async (path: string): Promise<string> => {
+    const body = (await (await initialize(path)).json()) as { result: { instructions: string } }
+    return body.result.instructions
+  }
+
+  it('names the extension when it is away, and the recipes when it is not', async () => {
+    const { token, mcp_path } = await enroll()
+    const extension = await attach(token, { tools: [] })
+
+    // Live socket, nothing recorded: sending this user to check their browser would be a wild
+    // goose chase, so it names the thing that is actually missing.
+    await vi.waitFor(async () => expect(await instructions(mcp_path)).toContain('no site has been recorded yet'))
+
+    extension.socket.close()
+    await vi.waitFor(async () => expect(await instructions(mcp_path)).toContain('extension is not connected'))
+    expect(await instructions(mcp_path)).toContain('link is still valid')
+  })
+
+  it('says nothing special once there are tools to list', async () => {
+    const { token, mcp_path } = await enroll()
+    await attach(token)
+    await surfaced(mcp_path, await open(mcp_path))
+
+    expect(await instructions(mcp_path)).toContain('recorded from your own authenticated dashboards')
   })
 })
 
