@@ -547,15 +547,21 @@ async function stopSession(): Promise<PopupStatus> {
  * The span is computed by the store from the spans and positions it already holds, so the worker
  * keeps no "annotated through" counter of its own to drift from what was actually written.
  */
-function annotate(note: string): void {
-  if (!recording || !note.trim()) return
+async function annotate(note: string): Promise<boolean> {
+  if (!recording || !note.trim()) return false
   const sessionId = recording.session.id
   // Truncated rather than refused. The note is free text the user typed to describe what they just
   // did, and this path is fire-and-forget: a note the store rejects would throw into the write
   // chain and vanish with nothing said, which is the worst of both. The popup's `maxlength` stops
   // it happening at all; this is what keeps the worker honest if anything else ever calls in.
   const text = note.trim().slice(0, MAX_NOTE_CHARS)
-  void sequence(async () => (await openStores()).captures.annotate(sessionId, text))
+  // Awaited rather than fired and forgotten, because the answer decides what the popup says. A
+  // note claims the exchanges recorded since the last one, so one typed before anything happened —
+  // or straight after another note — claims an empty span and describes nothing. That is the
+  // documented shape (`end < start` in AnnotationSpan), not an error, but the popup used to answer
+  // "Noted." either way and the sentence was gone.
+  const span = await sequence(async () => (await openStores()).captures.annotate(sessionId, text))
+  return span.end_position >= span.start_position
 }
 
 /**
@@ -1067,8 +1073,14 @@ chrome.runtime.onMessage.addListener((message: Inbound, sender, sendResponse) =>
       if (message.type === 'douze:start') return startSession(message)
       if (message.type === 'douze:stop') return stopSession()
       if (message.type === 'douze:annotate') {
-        annotate(message.note)
-        return status()
+        const landed = await annotate(message.note)
+        if (landed) return status()
+        return {
+          ...status(),
+          error:
+            'Nothing has been recorded since your last note, so there was nothing for this one to ' +
+            'describe. Do the thing on the site first, then write what you did.',
+        }
       }
       if (message.type === 'douze:noise') {
         await chrome.storage.local.set({ noise_hosts: message.hosts })

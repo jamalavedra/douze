@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { MAX_NAME } from '@douze/shared'
 import type { Exchange, Tool } from '@douze/shared'
 import { RecipeStore } from './recipes.js'
 import { ReviewSession } from './review-session.js'
@@ -171,6 +172,25 @@ describe('review inside the extension (T-015.3)', () => {
   })
 
   /**
+   * Every one of these recorded and reviewed fine and then failed, or produced a name nobody
+   * recognised, at the moment the user pressed Save — the latest point at which it could go wrong.
+   * The popup takes any text; `Recipe` takes kebab-case, first character a letter, MAX_NAME long.
+   */
+  it.each([
+    ['folds accents rather than dropping them', 'Hoja de cálculo', 'hoja-de-calculo'],
+    ['falls back to the site when the name slugs to nothing', '日本語のサイト', 'app-test'],
+    ['truncates a name longer than the schema allows', `Orders ${'x'.repeat(80)}`, `orders-${'x'.repeat(53)}`],
+    ['leaves no trailing hyphen behind after truncating', `Orders ${'x'.repeat(46)} yz`, `orders-${'x'.repeat(46)}-yz`],
+  ])('%s', async (_label, typed, expected) => {
+    const review = await openReview(RECORDED, typed)
+    const name = review.recipeName()
+    expect(name).toBe(expected)
+    // The point of all of it: what comes out is a name `Recipe` will accept.
+    expect(name.length).toBeLessThanOrEqual(MAX_NAME)
+    expect(name).toMatch(/^[a-z][a-z0-9-]*$/)
+  })
+
+  /**
    * Approval is by name and only by name. `bulk_approvable` is what the review page seeds its
    * selection from (AC-REC-002.3, now a UI default — see the class doc), so it is asserted here as
    * the data behind that seed rather than as a method the session enforces.
@@ -192,6 +212,51 @@ describe('review inside the extension (T-015.3)', () => {
     review.unapprove(['create_order', 'get_order'])
     expect(approved()).toEqual(['list_orders'])
     expect(() => review.approve(['no_such_tool'])).toThrow(/no candidate named/)
+  })
+
+  /**
+   * Two sites the user happened to name the same thing — "Work", "Admin" — used to become one
+   * recipe. `mergeRecipe` keeps the EXISTING recipe's target, so the second site's tools were
+   * rewritten to call the first site's host while the auth block was re-derived from the second
+   * site's capture: one site's credentials, sent to another site's server.
+   */
+  it('does not merge a second site into a recipe of the same name', async () => {
+    const recipes = await RecipeStore.open()
+    const first = await ReviewSession.open('cap', { captures: capturesOf(detailOf(RECORDED, 'Work')), recipes })
+    approveReads(first)
+    await first.save()
+
+    const elsewhere = RECORDED.map((e) => ({
+      ...e,
+      url: e.url.replace('https://app.test', 'https://other.test'),
+      origin: 'https://other.test',
+      page_origin: 'https://other.test',
+    }))
+    const detail = detailOf(elsewhere, 'Work')
+    detail.session.origins = ['https://other.test']
+    const second = await ReviewSession.open('cap', { captures: capturesOf(detail), recipes })
+
+    expect(second.recipeName()).toBe('work-other-test')
+    approveReads(second)
+    await second.save()
+
+    expect(storedNames().sort()).toEqual(['work', 'work-other-test'])
+    // The point of all of it: nothing recorded on other.test points at app.test.
+    const moved = recipes.recipe('work-other-test')
+    expect(moved?.target.base_url).toBe('https://other.test')
+    expect(recipes.recipe('work')?.target.base_url).toBe('https://app.test')
+  })
+
+  /** Re-recording the SAME site must still merge — that is what a stable name is for. */
+  it('still merges a second capture of the same site', async () => {
+    const recipes = await RecipeStore.open()
+    for (const _ of [1, 2]) {
+      const review = await ReviewSession.open('cap', { captures: capturesOf(detailOf(RECORDED, 'Work')), recipes })
+      expect(review.recipeName()).toBe('work')
+      approveReads(review)
+      await review.save()
+    }
+    expect(storedNames()).toEqual(['work'])
   })
 
   it('saves a recipe the store accepts, with fixtures it can read back', async () => {

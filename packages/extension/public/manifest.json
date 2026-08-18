@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Douze",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Let your AI assistant use the websites you're signed into. Douze watches a site while you use it, then your assistant can do those things for you. Your passwords and cookies never leave your browser; connecting a hosted assistant sends that assistant what your tools return.",
   "minimum_chrome_version": "116",
   "permissions": ["scripting", "storage", "unlimitedStorage", "alarms", "activeTab", "webRequest", "notifications"],

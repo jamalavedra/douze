@@ -471,6 +471,27 @@ describe('a session recorded with no daemon anywhere (T-015.1)', () => {
   })
 
   /**
+   * A note claims the exchanges recorded since the last one, so one typed before anything happened
+   * — or straight after another note — describes nothing and reaches no tool. That is a legitimate
+   * shape rather than an error, and the popup used to answer "Noted." to it and drop the sentence.
+   */
+  it('says so when a note has nothing to describe, and not when it has', async () => {
+    const page = extensionPage()
+    await douze().startSession('Shop', ['https://app.test'], { tabId: 7 })
+
+    const first = (await sendFrom(page, { type: 'douze:annotate', note: 'nothing yet' })) as { error?: string }
+    expect(first.error).toContain('Nothing has been recorded since your last note')
+
+    await capture(exchangeEvents('r1', 'POST', 'https://app.test/api/orders'))
+    const second = (await sendFrom(page, { type: 'douze:annotate', note: 'creates an order' })) as { error?: string }
+    expect(second.error).toBeUndefined()
+
+    // Two in a row: the second claims a span that starts past everything recorded.
+    const third = (await sendFrom(page, { type: 'douze:annotate', note: 'and again' })) as { error?: string }
+    expect(third.error).toContain('Nothing has been recorded since your last note')
+  })
+
+  /**
    * The credential hints come from the page, which is attacker-controlled, and redaction does not
    * walk them — so a hint carrying the value itself is stopped only by the store's gate. It must
    * fail closed: nothing stored, and the count must not claim an exchange that is not there.
