@@ -49,25 +49,46 @@ const REGISTER_MAX_BYTES = 4_096
 const SWEEP_MS = 30_000
 /** How long an over-cap body is read and discarded so its 413 can land. See readBody. */
 const LINGER_MS = 5_000
-/** An endpoint with no extension and no session for this many idle windows is nobody's; reap it. */
+/**
+ * A registration nothing ever dialled, with no session, for this many idle windows is nobody's;
+ * reap it. A link an extension has held is never reaped by this rule — see `sleep`.
+ */
 const ENDPOINT_IDLE_WINDOWS = 2
 /**
- * How many idle windows an endpoint may go without its extension attached before it is reaped
- * **whatever the platform is doing**. One hour at the default 10-minute window.
+ * How many idle windows an endpoint may go without its extension attached before its **surface**
+ * is dropped **whatever the platform is doing**. One hour at the default 10-minute window.
  *
- * The rule above is not enough on its own, because every `POST /m/<secret>` refreshes `lastSeen`
+ * The idle rule is not enough on its own, because every `POST /m/<secret>` refreshes `lastSeen`
  * and holds a session open: a hosted connector that goes on polling `tools/list` after the user
- * uninstalled the extension would keep the endpoint — and with it that user's tool names,
- * descriptions and schemas — alive in memory forever, listing them to whoever still holds the URL.
- * Liveness has to be a property of the party the surface belongs to, and that is the extension.
+ * uninstalled the extension would keep that user's tool names, descriptions and schemas alive in
+ * memory forever, listing them to whoever still holds the URL. Liveness has to be a property of
+ * the party the surface belongs to, and that is the extension.
  *
  * Six windows rather than two: a browser that is merely closed re-dials within 30 seconds of
  * starting (`chrome.alarms`), so an hour covers a restart, a Chrome update and a lunch break,
  * while an extension that has not managed one dial in that time is not asleep — Chrome is not
- * running at all, or it is gone. Reconnecting is one click on a page the user already knows.
- * The 40-second wake grace is untouched: that is a call waiting for a worker, not an endpoint.
+ * running at all, or it is gone. The 40-second wake grace is untouched: that is a call waiting
+ * for a worker, not an endpoint.
+ *
+ * What this does NOT do is delete the endpoint — see `sleep`. Adding a connector is a URL pasted
+ * into a hosted client by hand, and expiring that URL because someone shut their laptop for the
+ * weekend makes it a chore that repeats. The surface dies on this clock; the link does not.
  */
 const ENDPOINT_ATTACH_WINDOWS = 6
+/**
+ * The outer clock: an endpoint no extension has attached to for this long is deleted, secret and
+ * all. Dormancy alone would make the URL immortal, and the URL is the whole credential — the
+ * extension sends no bearer, so anyone who copied it out of a connector's settings holds a live
+ * capability over the user's signed-in accounts that re-arms itself the moment the browser comes
+ * back. Deleting the endpoint used to be what quietly rotated a leaked link every time someone
+ * shut their laptop overnight, and something has to still bound it.
+ *
+ * Thirty days, because the only cost of being wrong is re-pasting a URL, and an extension that has
+ * not dialled in for a month is not on a long weekend — Douze is uninstalled, the profile is gone,
+ * or the laptop is. It also collects the rows an anonymous `POST /register` + one `hello` would
+ * otherwise leave in `endpoints.json` for good.
+ */
+const ENDPOINT_MAX_AGE_MS = 2_592_000_000
 /**
  * How long a `tools/call` waits for a detached extension before it is answered as offline.
  *
@@ -81,6 +102,21 @@ const ENDPOINT_ATTACH_WINDOWS = 6
  * the whole point of the host owning the session.
  */
 const WAKE_GRACE_MS = 40_000
+/**
+ * What `initialize` says instead of the usual instructions when there are no tools to list, so an
+ * assistant with nothing to offer can say why. Two causes, and guessing wrong is worse than
+ * saying nothing: a brand-new user with a live extension and no recipes has an empty surface too,
+ * and telling them their browser is offline would send them to fix something that is not broken.
+ * The relay knows which it is — the socket is either there or it is not.
+ */
+const EXTENSION_AWAY =
+  'This server is listing no tools because the Douze browser extension is not connected. Tell the ' +
+  'user to open Chrome on the computer where Douze is installed, leave it open for about thirty ' +
+  'seconds, then start a new conversation. The link is still valid and does not need replacing.'
+const NOTHING_RECORDED =
+  'This server is listing no tools because no site has been recorded yet. Tell the user to open the ' +
+  'Douze extension in their browser, click Watch on a site they are signed into, do the thing they ' +
+  'want automated once, then click Done and start a new conversation.'
 /**
  * Refusals a hosted MCP client would otherwise never show anyone: it renders a JSON-RPC error and
  * drops an HTTP error body on the floor, so these are delivered as `200 {error:{code:-32000}}`
@@ -142,6 +178,17 @@ interface Endpoint {
    */
   lastAttached: number
   /**
+   * Whether an extension has ever held this endpoint's socket — the line between a link somebody
+   * is using and a registration that never became one. Only the former reaches disk, and only the
+   * latter is deleted outright by the reaper.
+   */
+  attached: boolean
+  /**
+   * The extension has been away long enough that the surface was dropped, and this endpoint is now
+   * three hashes waiting for it to come back. Kept so the sweep neither re-drops nor re-logs it.
+   */
+  dormant: boolean
+  /**
    * One cached surface per endpoint, not per session: the extension pushes it once per connect,
    * every live session is fanned out from it, and a session created later is seeded from it. That
    * is what lets a connector added while Chrome is closed list its tools.
@@ -185,6 +232,7 @@ export async function startRelay(options: {
   statePath?: string
   sessionIdleMs?: number
   sessionMaxAgeMs?: number
+  endpointMaxAgeMs?: number
   heartbeatMs?: number
   requestTimeoutMs?: number
   wakeGraceMs?: number
@@ -192,6 +240,7 @@ export async function startRelay(options: {
   // Only the tests set these; production reads the numbers both halves of the protocol agree on.
   const idleMs = options.sessionIdleMs ?? REMOTE_SESSION_IDLE_MS
   const maxAgeMs = options.sessionMaxAgeMs ?? SESSION_MAX_AGE_MS
+  const endpointMaxAgeMs = options.endpointMaxAgeMs ?? ENDPOINT_MAX_AGE_MS
   const heartbeatMs = options.heartbeatMs ?? HEARTBEAT_MS
   const timeoutMs = options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS
   const graceMs = options.wakeGraceMs ?? WAKE_GRACE_MS
@@ -224,20 +273,31 @@ export async function startRelay(options: {
     bearerHash: string | null
   }
 
+  /** The bytes last written, so a save that would rewrite them does nothing. */
+  let written = ''
   const save = (): void => {
     if (statePath === undefined) return
-    const rows: StoredEndpoint[] = [...byToken.values()].map((endpoint) => ({
+    // Only links an extension actually held: a registration nothing ever dialled is a dead row on
+    // every future boot, and restoring it would make it indistinguishable from a real pairing.
+    const rows: StoredEndpoint[] = [...byToken.values()].filter((endpoint) => endpoint.attached).map((endpoint) => ({
       tokenHash: endpoint.tokenHash,
       secretHash: endpoint.secretHash,
       bearerHash: endpoint.bearerHash === null ? null : endpoint.bearerHash.toString('base64'),
     }))
+    const body = JSON.stringify(rows)
+    // Most calls change nothing that is written: `register` saves an endpoint the filter above
+    // drops, and `reap` saves the removal of one that was never in the file. Both produce the same
+    // bytes as last time, and both are reachable by an anonymous caller — so without this an
+    // unauthenticated request costs an O(endpoints) serialise and a blocking write.
+    if (body === written) return
     // Written to a temporary name and renamed over, so a crash mid-write leaves the previous file
     // whole rather than a truncated one that would drop every endpoint at the next boot. Synchronous
     // because it is sub-kilobyte and only a registration triggers it — and because two of those
     // landing together must not interleave two writes of the same map.
     try {
-      writeFileSync(`${statePath}.tmp`, JSON.stringify(rows), { mode: 0o600 })
+      writeFileSync(`${statePath}.tmp`, body, { mode: 0o600 })
       renameSync(`${statePath}.tmp`, statePath)
+      written = body
     } catch (error) {
       // Never fatal: a relay that cannot write still serves every live link.
       log('state.save_failed', { reason: (error as Error).name })
@@ -340,6 +400,8 @@ export async function startRelay(options: {
       lastPong: 0,
       lastSeen: now,
       lastAttached: now,
+      attached: false,
+      dormant: false,
       surface: [],
       sessions: new Map(),
       inFlight: new Set(),
@@ -412,6 +474,13 @@ export async function startRelay(options: {
     const host = new McpHost({
       trust: 'remote',
       callTimeoutMs: timeoutMs,
+      // An empty surface is the one failure a hosted client cannot report: with no tool to refuse,
+      // the assistant does not say "Douze is offline", it says "I have no tool for that" — or
+      // quietly does something else — and the word Douze never reaches the person. They are in a
+      // chat window, usually on another device, so the popup, the connect page and every
+      // notification are on the wrong machine. What `initialize` carries is the only channel
+      // left, and this is the one moment it is worth spending on something other than the tools.
+      ...(endpoint.surface.length === 0 ? { instructions: live(endpoint) ? NOTHING_RECORDED : EXTENSION_AWAY } : {}),
       send: (frame) => {
         // Throwing rather than dropping: the host turns it into the offline refusal for this call,
         // where silently swallowing it would leave the caller waiting out the full timeout.
@@ -784,6 +853,13 @@ export async function startRelay(options: {
     endpoint.lastPong = Date.now()
     endpoint.lastSeen = endpoint.lastPong
     endpoint.lastAttached = endpoint.lastPong
+    endpoint.dormant = false
+    // The first hello is what turns a registration into a link, and the only moment its hashes
+    // become worth keeping across a restart.
+    if (!endpoint.attached) {
+      endpoint.attached = true
+      save()
+    }
     endpoint.heartbeat = setInterval(() => {
       if (Date.now() - endpoint.lastPong > 2 * heartbeatMs) {
         socket.terminate()
@@ -813,6 +889,22 @@ export async function startRelay(options: {
     log('endpoint.reaped', { ep: endpoint.label, reason })
   }
 
+  /**
+   * Drops everything an absent extension leaves behind — the surface, the sessions, whatever is
+   * parked — while keeping the three hashes, so the link itself survives. Why the surface goes and
+   * the hashes stay: see `ENDPOINT_ATTACH_WINDOWS`.
+   *
+   * An extension that comes back re-attaches to the endpoint it left, and `pushSurface` sends the
+   * `notifications/tools/list_changed` that makes a connected client re-list.
+   */
+  const sleep = (endpoint: Endpoint, reason: string): void => {
+    endpoint.dormant = true
+    endpoint.surface = []
+    for (const sid of endpoint.sessions.keys()) closeSession(endpoint, sid)
+    wake(endpoint)
+    log('endpoint.dormant', { ep: endpoint.label, reason })
+  }
+
   const sweep = setInterval(() => {
     const now = Date.now()
     // Both maps below only ever grew: a rate-limit bucket per peer address that outlived its
@@ -832,12 +924,14 @@ export async function startRelay(options: {
       // Before the idle rule, and deliberately not conditioned on it: this is the one clock a
       // platform's polling cannot move, so it is what stops a dead user's surface living forever.
       if (now - endpoint.lastAttached > ENDPOINT_ATTACH_WINDOWS * idleMs) {
-        reap(endpoint, 'extension_gone')
+        if (!endpoint.attached) reap(endpoint, 'never_attached')
+        else if (now - endpoint.lastAttached > endpointMaxAgeMs) reap(endpoint, 'abandoned')
+        else if (!endpoint.dormant) sleep(endpoint, 'extension_gone')
         continue
       }
-      if (endpoint.socket || endpoint.sessions.size > 0) continue
-      if (now - endpoint.lastSeen <= ENDPOINT_IDLE_WINDOWS * idleMs) continue
-      reap(endpoint, 'unused')
+      // Never dialled and nobody talking to it: a registration that never became a link.
+      if (endpoint.attached || endpoint.socket || endpoint.sessions.size > 0) continue
+      if (now - endpoint.lastSeen > ENDPOINT_IDLE_WINDOWS * idleMs) reap(endpoint, 'unused')
     }
     // A `Restart=always` unit killed by a signal never reaches `close()`, so the counters it logs
     // there would be the only record of a busy hour and would go with the process. Emitted on the
@@ -873,6 +967,10 @@ export async function startRelay(options: {
           // link the moment it is loaded because the file records an attachment from yesterday.
           lastSeen: Date.now(),
           lastAttached: Date.now(),
+          // Only attached links reach the file, so a restored row is one, and it gets the full
+          // attach window to dial back in before it is put to sleep.
+          attached: true,
+          dormant: false,
           // Not persisted: the extension re-pushes it on its next dial, within 30 seconds of the
           // browser being open. Keeping tool names and descriptions off disk is the point.
           surface: [],

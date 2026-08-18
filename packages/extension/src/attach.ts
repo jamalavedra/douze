@@ -588,7 +588,7 @@ class Manager {
     this.deps.notify(
       'douze-relay-refused',
       'Douze lost its link',
-      'The link you shared with your hosted assistant is no longer valid. Open Douze and get a new one.',
+      'The link you shared with your hosted assistant is no longer valid. Open Douze, choose Stop sharing, then Connect, and paste the new link in.',
     )
   }
 
