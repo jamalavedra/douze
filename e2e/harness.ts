@@ -42,7 +42,7 @@ declare global {
   }
   /** The extension's own e2e surface (packages/extension/src/background.ts, "e2e surface"). */
   const __douze: {
-    startSession: (name: string, origins: string[], opts?: { debugger?: boolean; tabId?: number }) => Promise<string>
+    startSession: (name: string, origins: string[], opts?: { tabId?: number }) => Promise<string>
     stopSession: () => Promise<{ retained: number }>
     annotate: (note: string) => Promise<void>
     badgeCount: () => number

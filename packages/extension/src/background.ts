@@ -28,7 +28,6 @@ import {
   type ExposeLists,
   type RelayPairing,
 } from './attach.js'
-import { DebuggerCapture } from './debugger-capture.js'
 import { importHar } from './har.js'
 import { installOracle } from './oracle.js'
 import { RECONCILE_GRACE_MS, Reconciler, admits, decodeBody, finalize, type ExchangeDraft } from './pipeline.js'
@@ -71,8 +70,6 @@ let noise: NoiseConfig = { hosts: NOISE_HOSTS }
 const pendingRequests = new Map<string, { event: RequestEvent; gesture?: GestureEvent }>()
 const lastGesture = new Map<number, GestureEvent>()
 const reconciler = new Reconciler()
-
-const debuggerCapture = new DebuggerCapture((draft) => emit(draft))
 
 // --- state ----------------------------------------------------------------
 
@@ -497,7 +494,7 @@ async function resolveTab(origin: string, tabId?: number): Promise<number> {
 /** AC-CAP-001.1 / .2 — a named session scoped to the origins the user granted. */
 async function startSession(
   command: Extract<PopupCommand, { type: 'douze:start' }>,
-): Promise<PopupStatus & { error?: string }> {
+): Promise<PopupStatus> {
   const [primary] = command.origins
   if (!primary) throw new Error('a session needs at least one origin')
   const tabId = await resolveTab(primary, command.tabId)
@@ -508,31 +505,16 @@ async function startSession(
     // An unnamed session is named after the site rather than refused: the name is a label.
     name: command.name.trim() || new URL(primary).hostname,
     origins: command.origins,
-    debugger_enabled: command.useDebugger,
   })
   recording = { session, tabId, position: 0, count: 0, seenOrigins: [] }
   await persist()
   await registerScripts(session.origins)
   // Registration does not affect an already-loaded tab, and document_start injection is the
-  // whole point — patch `fetch` before page scripts capture a reference to it. Both branches
-  // reload, so a caller never has to; `attach` reloads to make bodies retrievable at all.
-  //
-  // A swallowed attach failure took the reload with it: the session ran with no interceptor in
-  // the page and no debugger either, recorded nothing, and said nothing. The reload happens
-  // whatever attach does, and the reason reaches the popup.
-  let attachError: string | undefined
-  if (command.useDebugger) {
-    try {
-      await debuggerCapture.attach(tabId)
-    } catch (error) {
-      attachError = `Douze couldn't attach the debugger (${(error as Error)?.message ?? error}), so it's watching the ordinary way instead.`
-      await chrome.tabs.reload(tabId)
-    }
-  } else {
-    await chrome.tabs.reload(tabId)
-  }
+  // whole point — patch `fetch` before page scripts capture a reference to it. So the reload
+  // happens here, and a caller never has to.
+  await chrome.tabs.reload(tabId)
   await paintBadge()
-  return { ...status(), ...(attachError === undefined ? {} : { error: attachError }) }
+  return status()
 }
 
 /**
@@ -550,7 +532,6 @@ async function stopSession(): Promise<PopupStatus> {
     // user pressed Done rather than only those that had already landed.
     await sequence(() => captures.stopSession(stopping.session.id))
   }
-  await debuggerCapture.detachAll()
   await chrome.scripting.unregisterContentScripts({ ids: RECONCILE_IDS }).catch(() => {})
   recording = null
   pendingRequests.clear()
@@ -1126,7 +1107,6 @@ installOracle({
 // Dynamic registrations are wiped on every extension update and reload.
 chrome.runtime.onInstalled.addListener(() => {
   void hydrated.then(async () => {
-    await DebuggerCapture.clearZombies()
     if (recording) await registerScripts(recording.session.origins)
   })
 })
@@ -1145,7 +1125,6 @@ chrome.notifications.onClicked.addListener((id) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   lastGesture.delete(tabId)
-  void debuggerCapture.detach(tabId)
 })
 
 // --- e2e surface ----------------------------------------------------------
@@ -1159,14 +1138,13 @@ Object.assign(globalThis, {
     async startSession(
       name: string,
       origins: string[],
-      opts: { debugger?: boolean; tabId?: number } = {},
+      opts: { tabId?: number } = {},
     ): Promise<string> {
       await hydrated
       await startSession({
         type: 'douze:start',
         name,
         origins,
-        useDebugger: opts.debugger ?? false,
         ...(opts.tabId === undefined ? {} : { tabId: opts.tabId }),
       })
       return recording?.session.id ?? ''

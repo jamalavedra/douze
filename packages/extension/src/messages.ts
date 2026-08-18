@@ -84,7 +84,7 @@ export interface CaptureBatch {
 
 /** Popup → service worker. */
 export type PopupCommand =
-  | { type: 'douze:start'; name: string; origins: string[]; tabId?: number; useDebugger: boolean }
+  | { type: 'douze:start'; name: string; origins: string[]; tabId?: number }
   | { type: 'douze:stop' }
   | { type: 'douze:annotate'; note: string }
   | { type: 'douze:status' }

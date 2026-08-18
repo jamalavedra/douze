@@ -39,7 +39,6 @@ const el = {
   error: $<HTMLParagraphElement>('error'),
   connect: $<HTMLButtonElement>('connect'),
   stored: $<HTMLButtonElement>('stored'),
-  useDebugger: $<HTMLInputElement>('use-debugger'),
   noise: $<HTMLTextAreaElement>('noise'),
   saveNoise: $<HTMLButtonElement>('save-noise'),
 }
@@ -165,14 +164,7 @@ function renderTools(tools: SiteTool[]): void {
 
 el.watch.addEventListener('click', async () => {
   // First statement: any await before this consumes the user gesture and the request rejects.
-  //
-  // `debugger` is optional and nothing else ever asks for it, so ticking the box used to start a
-  // session whose attach failed on a permission that had never been granted. It goes in this one
-  // request because a second one would need a second gesture, and there is only ever one click.
-  const granted = await chrome.permissions.request({
-    origins: [`${activeOrigin}/*`],
-    ...(el.useDebugger.checked ? { permissions: ['debugger'] } : {}),
-  })
+  const granted = await chrome.permissions.request({ origins: [`${activeOrigin}/*`] })
   if (!granted) {
     return showError('Douze needs your permission to watch this site. Nothing is recorded until you allow it.')
   }
@@ -187,7 +179,6 @@ el.watch.addEventListener('click', async () => {
       name: el.name.value.trim() || activeHostname,
       origins: [activeOrigin],
       tabId: activeTab.id,
-      useDebugger: el.useDebugger.checked,
     }),
   )
   return undefined

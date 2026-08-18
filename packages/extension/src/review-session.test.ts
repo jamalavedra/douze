@@ -111,7 +111,6 @@ const detailOf = (exchanges: Exchange[], name = 'Shop orders'): SessionDetail =>
     name,
     origins: ['https://app.test'],
     started_at: 1_700_000_000_000,
-    debugger_enabled: false,
   },
   exchanges,
   annotations: [],
