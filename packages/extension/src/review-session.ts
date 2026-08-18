@@ -1,4 +1,4 @@
-import { parseRecipe, serializeRecipe, type Exchange, type Recipe, type Tool } from '@douze/shared'
+import { MAX_NAME, parseRecipe, serializeRecipe, type Exchange, type Recipe, type Tool } from '@douze/shared'
 import {
   approve as approveCandidate,
   authFrom,
@@ -71,9 +71,10 @@ export class ReviewSession {
     // AC-EXE-001.3 — the auth block is derived from the capture, as douzed derives it. A recipe
     // left on the schema default (`cookie`) sends no credential and every call fails signed out.
     const auth = authFrom(detail.exchanges)
+    const baseUrl = baseUrlFrom(detail.exchanges)
     const config: RecipeConfig = {
-      recipeName: recipeNameFrom(detail.session.name),
-      baseUrl: baseUrlFrom(detail.exchanges),
+      recipeName: unclaimedName(recipeNameFrom(detail.session.name, detail.session.origins[0]), baseUrl, stores.recipes),
+      baseUrl,
       ...(auth === undefined ? {} : { auth }),
     }
     const candidates = candidatesFrom(
@@ -222,14 +223,78 @@ function sampleFrom(recipe: Recipe, tool: Tool, fixture: Fixture | undefined): E
 }
 
 /**
- * The capture's name as a recipe name. `Recipe` requires kebab-case starting with a letter, so a
- * session named "2026 audit" is prefixed rather than failing at save time — the user named a
- * recording, not a recipe.
+ * The capture's name as a recipe name. `Recipe` requires kebab-case starting with a letter and no
+ * more than MAX_NAME characters, so a session named "2026 audit" is prefixed rather than failing
+ * at save time — the user named a recording, not a recipe.
+ *
+ * Three things the plain slug got wrong, all of them only visible after a recording was finished
+ * and reviewed, when saving threw "recipe rejected" or produced a name nobody recognised:
+ *
+ *  - Accents were dropped mid-word rather than folded, so "Hoja de cálculo" became
+ *    `hoja-de-c-lculo`. NFD and stripping the combining marks gives `hoja-de-calculo`.
+ *  - A name in a non-Latin script slugged to nothing and came out as `recipe-`, so every such
+ *    capture collided on one recipe. The origin is the fallback, because it is what the popup
+ *    offers when the name is left blank and it at least names the site.
+ *  - Nothing was truncated, so any name over MAX_NAME characters recorded fine and then failed
+ *    validation at save, with the work already done.
  */
-function recipeNameFrom(sessionName: string): string {
-  const slug = sessionName
+function recipeNameFrom(sessionName: string, origin?: string): string {
+  const slug = slugify(sessionName) || (origin === undefined ? '' : slugify(hostOf(origin)))
+  const named = /^[a-z]/.test(slug) ? slug : `recipe-${slug}`
+  // Trailing hyphens again: the slice can land on one, and `recipe-` with an empty slug is one.
+  return named.slice(0, MAX_NAME).replace(/-+$/, '')
+}
+
+function slugify(text: string): string {
+  return text
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
-  return /^[a-z]/.test(slug) ? slug : `recipe-${slug}`
+}
+
+/**
+ * A recipe name that will not merge this capture into a different site's recipe.
+ *
+ * Saving into an existing recipe keeps THAT recipe's target — `mergeRecipe` builds on it, and
+ * `config.baseUrl` is only read when there is no existing recipe — so two captures a user happened
+ * to name the same thing, "Work" or "Admin", became one recipe whose tools all pointed at whichever
+ * site was recorded first. The second site's tools then ran against the first site's host carrying
+ * the second site's credentials, which is a request nobody asked for sent somewhere it should
+ * never go.
+ *
+ * Re-recording the SAME site must still merge — that is what makes a stable name useful — so the
+ * test is the target, not the name. The disambiguator is the host, because it is the thing that
+ * actually differs; the counter after it exists only for two origins on one host, like a staging
+ * port, and giving up loudly beats merging quietly.
+ */
+function unclaimedName(preferred: string, baseUrl: string, recipes: RecipeStore): string {
+  const claimedByAnother = (name: string): boolean => {
+    const existing = recipes.recipe(name)
+    return existing !== null && existing !== undefined && existing.target.base_url !== baseUrl
+  }
+  if (!claimedByAnother(preferred)) return preferred
+  // The suffix is trimmed off the PREFERRED half, never the suffix: clamping the whole string
+  // would truncate the very thing that makes it distinct and hand back `preferred` again.
+  const withSuffix = (suffix: string): string =>
+    `${preferred.slice(0, Math.max(1, MAX_NAME - suffix.length - 1))}-${suffix}`.replace(/-+$/, '')
+  const host = slugify(hostOf(baseUrl))
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const name = withSuffix(attempt === 0 ? host : `${host}-${attempt + 1}`)
+    if (!claimedByAnother(name)) return name
+  }
+  throw new Error(
+    `every name based on "${preferred}" is already used by a different site. ` +
+      `Delete or rename the recipe called "${preferred}", then review this capture again.`,
+  )
+}
+
+/** The host alone, so a fallback name is `jira-example-com` rather than `https-jira-example-com`. */
+function hostOf(origin: string): string {
+  try {
+    return new URL(origin).hostname
+  } catch {
+    return origin
+  }
 }
