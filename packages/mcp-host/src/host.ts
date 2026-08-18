@@ -71,13 +71,24 @@ const DEFAULT_INSTRUCTIONS =
   'runs; re-read tools/list after a notifications/tools/list_changed.'
 
 /**
+ * Every failure below is one a browser being open would fix, and the person who has to open it is
+ * reading a chat window, often on another device — the popup, the connect page and every
+ * notification are on the machine that is switched off. So each one ends with the same instruction
+ * rather than describing the state and leaving the reader to infer the action, and they share one
+ * string so the three cannot drift into three different answers to the same question.
+ */
+const OPEN_BROWSER =
+  'Tell the user to open the browser where Douze is installed, check the extension is enabled, and ' +
+  'leave it open for about thirty seconds.'
+
+/**
  * REQ-CON-004 — the extension is the thing that is offline, and a chat user with no terminal has
  * to be able to act on this sentence alone.
  */
 const DISCONNECTED =
   'The Douze browser extension is not connected right now, so there is nothing to run this tool. ' +
-  'Open the browser where Douze is installed and check that the extension is enabled and connected, ' +
-  'then try again — it holds your recipes and runs every call inside your signed-in tabs.'
+  `${OPEN_BROWSER} It holds your recipes and runs every call inside your signed-in tabs, so nothing ` +
+  'can run until it is back.'
 
 /**
  * The extension went away with a call already sent to it. That call is never re-sent: a tool can
@@ -85,12 +96,12 @@ const DISCONNECTED =
  */
 const DROPPED =
   'The Douze browser extension disconnected while this tool was running. Douze never retries a ' +
-  'call automatically, because a tool can write — check whether it took effect, then call it again ' +
-  'if it did not.'
+  'call automatically, because a tool can write — check whether it took effect before calling it ' +
+  `again. ${OPEN_BROWSER}`
 
 const TIMED_OUT =
   'The Douze browser extension did not answer this call in time. It may still be running, or the ' +
-  'browser may be asleep — check the result before calling again.'
+  `browser may be asleep — check whether it took effect before calling it again. ${OPEN_BROWSER}`
 
 /** Only the shape needed to route; everything past this is per-method. */
 const JsonRpcMessage = z.object({
