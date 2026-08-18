@@ -63,7 +63,7 @@ export interface McpHostOptions {
   callTimeoutMs?: number
 }
 
-const DEFAULT_SERVER_INFO = { name: 'douze', title: 'Douze', version: '0.1.0' }
+const DEFAULT_SERVER_INFO = { name: 'douze', title: 'Douze', version: '0.1.1' }
 
 const DEFAULT_INSTRUCTIONS =
   'Tools recorded from your own authenticated dashboards. Each tool is named <recipe>_<tool> and ' +
