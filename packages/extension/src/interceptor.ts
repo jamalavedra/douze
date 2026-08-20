@@ -272,21 +272,42 @@ declare global {
     !res.headers.get('content-length')
 
   /**
+   * How long an observed stream may sit without reaching `done` or `cancel` before what has been
+   * seen so far is reported anyway. Matches the other browser-side waits in this extension.
+   */
+  const STREAM_IDLE_MS = 15_000
+
+  /**
    * Zero-buffer alternative to `clone()` for streaming responses: observes chunks at exactly
    * the rate the page reads them, so a slow SSE consumer cannot make Chrome buffer the whole
    * response in memory behind our tee branch.
+   *
+   * Reading at the page's rate means the page decides whether there is ever a last chunk. One that
+   * abandons the stream, or is unloaded mid-read, calls neither `done` nor `cancel`: without the
+   * watchdog `onDone` never fires, no `response` event is posted, and the worker holds the request
+   * open until it is dropped — the exchange disappears with nothing to say it existed. Measured on
+   * reddit.com's search, which answers 549KB chunked with no `content-length`.
    */
   function passthrough(res: Response, onDone: (r: { bytes: Uint8Array; truncated: boolean }) => void): Response {
     const reader = (res.body as ReadableStream<Uint8Array>).getReader()
     const chunks: Uint8Array[] = []
     let size = 0
     let truncated = false
+    // One response event per request: a `done` arriving after the watchdog must not post a second.
+    let posted = false
+    const finish = (cut: boolean): void => {
+      if (posted) return
+      posted = true
+      clearTimeout(watchdog)
+      onDone({ bytes: concat(chunks), truncated: truncated || cut })
+    }
+    const watchdog = setTimeout(() => finish(true), STREAM_IDLE_MS)
     const observed = new ReadableStream<Uint8Array>({
       async pull(ctrl) {
         const { done, value } = await reader.read()
         if (done) {
           ctrl.close()
-          onDone({ bytes: concat(chunks), truncated })
+          finish(false)
           return
         }
         if (size + value.byteLength <= MAX_BODY) {
@@ -298,7 +319,7 @@ declare global {
         ctrl.enqueue(value)
       },
       cancel(reason) {
-        onDone({ bytes: concat(chunks), truncated: true })
+        finish(true)
         return reader.cancel(reason)
       },
     })

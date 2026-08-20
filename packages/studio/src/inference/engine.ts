@@ -1,4 +1,13 @@
-import { TOOL_METHODS, Tool, type AnnotationSpan, type Exchange, type UiProvenance } from '@douze/shared'
+import {
+  TOOL_METHODS,
+  Tool,
+  isDocumentSnapshot,
+  isHtmlContentType,
+  isPlaceholder,
+  type AnnotationSpan,
+  type Exchange,
+  type UiProvenance,
+} from '@douze/shared'
 import type { Candidate, JsonSchema } from '../types.js'
 import { describeSync, descriptionInput } from '../descriptions/writer.js'
 import { disambiguate, nameCandidate } from '../descriptions/naming.js'
@@ -31,9 +40,14 @@ export function infer(input: InferenceInput): Candidate[] {
   )
   const graphql = usable.filter(isGraphqlExchange)
   const rest = usable.filter((e) => !isGraphqlExchange(e))
+  // REQ-INF-006 — a page and an API answering the same path are two operations with nothing in
+  // common but their URL. Grouping them apart is what keeps a snapshot out of a JSON tool's schema.
+  const documents = rest.filter(isDocumentExchange)
+  const json = rest.filter((e) => !isDocumentExchange(e))
 
   const candidates = [
-    ...groupEndpoints(rest).map((group) => restCandidate(group, spans)),
+    ...groupEndpoints(json).map((group) => restCandidate(group, spans)),
+    ...groupEndpoints(documents).map((group) => restCandidate(group, spans, true)),
     ...splitOperations(graphql).map((op) => graphqlCandidate(op, spans)),
   ]
 
@@ -48,24 +62,38 @@ export function infer(input: InferenceInput): Candidate[] {
   return candidates.sort((a, b) => a.tool.name.localeCompare(b.tool.name))
 }
 
-function restCandidate(group: EndpointGroup, spans: AnnotationSpan[]): Candidate {
+/**
+ * REQ-INF-006 — a document exchange carries a `{ url, title, text, links }` snapshot the capture
+ * pipeline extracted from an HTML reply, in place of the HTML itself.
+ */
+export const isDocumentExchange = (e: Exchange): boolean =>
+  isHtmlContentType(e.response_content_type) && isDocumentSnapshot(e.response_body)
+
+function restCandidate(group: EndpointGroup, spans: AnnotationSpan[], isDocument = false): Candidate {
   const { method, path, params, exchanges } = group
   const queries = exchanges.map((e) => queryParams(e.url))
+  // A query value is a string in the URL and a number in the schema when it plainly is one,
+  // which is what gives `limit` a ceiling at all.
+  const coerced = queries.map(coerceNumericValues)
   const bodies = BODY_METHODS.has(method) ? exchanges.map((e) => e.request_body) : []
   const responses = exchanges.map((e) => e.response_body)
 
-  const pagination = detectPagination(queries, responses)
+  // A snapshot is the whole result — there is no envelope to descend past and no page to fetch
+  // next, so a `?page=2` in the URL is just another query parameter the caller supplies.
+  const pagination = isDocument ? undefined : detectPagination(queries, responses)
   const inputSchema = withRawParam(
     // The pagination parameter is driven by the runtime, so it is never required of the caller
     // even when every observation happened to carry it (AC-INF-005.2).
     optional(
-      // A query value is a string in the URL and a number in the schema when it plainly is one,
-      // which is what gives `limit` a ceiling at all.
-      mergeSchemas(pathParamSchema(params), inferSchema(queries.map(coerceNumericValues)), inferSchema(bodies)),
+      mergeSchemas(
+        pathParamSchema(params),
+        siteDefaults(inferSchema(coerced), coerced, pagination?.param),
+        inferSchema(bodies),
+      ),
       pagination?.param,
     ),
   )
-  const payloadPath = primaryPayloadPath(responses)
+  const payloadPath = isDocument ? '$' : primaryPayloadPath(responses)
   const outputSchema = inferSchema(responses.map((body) => resolvePath(body, payloadPath)))
   const sideEffect = classify({ method, path })
   const annotation = noteFor(exchanges, spans)
@@ -103,6 +131,47 @@ function optional(schema: JsonSchema, key: string | undefined): JsonSchema {
 function omitRequired(schema: JsonSchema): JsonSchema {
   const { required: _required, ...rest } = schema
   return rest
+}
+
+/**
+ * A query parameter whose value never varied is the site decorating its own URLs, not something a
+ * caller could know to send: reddit's search carries `screen_view_count=1&ext-referrer=DIRECT` and
+ * wikipedia's `title=Special:Search`. Inference made every observed parameter required, so both
+ * tools refused `{q: 'ledger'}` / `{search: 'Ledger'}` until the caller reproduced the site's own
+ * decorations. Such a parameter stays in the schema so a caller may still override it, but it is
+ * optional and carries the observed value as a `default` that `buildRequest` sends when the caller
+ * omits it.
+ *
+ * One observation counts as "never varied" deliberately — a tool recorded once is the common case
+ * and the one this blocks. Two observations disagreeing about a value make it a caller input again.
+ */
+function siteDefaults(
+  schema: JsonSchema,
+  queries: readonly Record<string, string | number>[],
+  paginationParam: string | undefined,
+): JsonSchema {
+  const properties = schema['properties'] as Record<string, JsonSchema> | undefined
+  if (properties === undefined) return schema
+  const constant = new Set<string>()
+  const withDefaults: Record<string, JsonSchema> = {}
+  for (const [key, property] of Object.entries(properties)) {
+    const values = queries.map((q) => q[key])
+    const observed = values[0]
+    // The pagination parameter is the runtime's to drive, so pinning it to the page the app
+    // happened to be on would fight `detectPagination`. A redacted value is a placeholder rather
+    // than anything the site sent: resending `«redacted:string:8»` is worse than omitting the
+    // parameter, so it gets no default either.
+    const fixed =
+      key !== paginationParam &&
+      observed !== undefined &&
+      !isPlaceholder(observed) &&
+      values.every((value) => value === observed)
+    withDefaults[key] = fixed ? { ...property, default: observed } : property
+    if (fixed) constant.add(key)
+  }
+  const required = ((schema['required'] as string[] | undefined) ?? []).filter((k) => !constant.has(k))
+  const next: JsonSchema = { ...schema, properties: withDefaults }
+  return required.length > 0 ? { ...next, required } : omitRequired(next)
 }
 
 function graphqlCandidate(op: ReturnType<typeof splitOperations>[number], spans: AnnotationSpan[]): Candidate {

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { snapshotDocument } from './document.js'
 import { CROSS_ORIGIN_REFUSED, PERMISSION_MISSING } from './guards.js'
 import {
   approvedLiterals,
@@ -22,7 +23,7 @@ describe('issuing a request in the executor tab', () => {
     })
     vi.stubGlobal('fetch', fetch)
 
-    const result = await issueRequest('https://app.example/api', 'GET', { 'x-api-key': 'secret' }, null, 1_000)
+    const result = await issueRequest({ url: 'https://app.example/api', method: 'GET', headers: { 'x-api-key': 'secret' }, body: null, timeoutMs: 1_000 })
     expect(result.body).toBe('{"ok":true}')
     expect(fetch).toHaveBeenCalledOnce()
   })
@@ -30,7 +31,7 @@ describe('issuing a request in the executor tab', () => {
   it('stops reading a response above 2 MiB', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(new Uint8Array(2 * 1024 * 1024 + 1))))
 
-    const result = await issueRequest('https://app.example/api', 'GET', {}, null, 1_000)
+    const result = await issueRequest({ url: 'https://app.example/api', method: 'GET', headers: {}, body: null, timeoutMs: 1_000 })
     expect(result.error).toBe('response exceeded 2097152 byte limit')
     expect(result.body).toBe('')
   })
@@ -90,7 +91,7 @@ describe('cookies are sent only where they are the credential (AC-EXE-001.1)', (
       tabs: { query: async () => [{ id: 7, url: 'https://dashboard.example.com/x' }] },
       scripting: {
         executeScript: async ({ args }: { args?: unknown[] }) => {
-          if (args && args.length > 5) mode = args[5] as RequestCredentials
+          if (args?.[0]) mode = (args[0] as { credentials: RequestCredentials }).credentials
           return [{ result: { status: 200, headers: {}, body: '{}', url: 'https://api.example.com/v1/x', redirected: false } }]
         },
       },
@@ -148,7 +149,7 @@ describe('a path parameter filled from page state (AC-EXE-001.3)', () => {
         executeScript: async ({ args, func }: { args?: unknown[]; func?: unknown }) => {
           // The first call reads page state; the second issues the request.
           if (String(func).includes('getItem')) return [{ result: ['pk_live_the_key'] }]
-          issued = (args?.[0] as string) ?? ''
+          issued = (args?.[0] as { url?: string } | undefined)?.url ?? ''
           return [{ result: { status: 200, headers: {}, body: '{}', url: issued, redirected: false } }]
         },
       },
@@ -204,7 +205,7 @@ describe('a request that would leave its own origin (WO-015)', () => {
           issued.push(args ?? [])
           return [
             {
-              result: { status: 200, headers: {}, body: '{"ok":1}', url: String(args?.[0]), redirected: false },
+              result: { status: 200, headers: {}, body: '{"ok":1}', url: String((args?.[0] as { url?: string } | undefined)?.url), redirected: false },
             },
           ]
         },
@@ -317,7 +318,7 @@ describe('a request that would leave its own origin (WO-015)', () => {
       { notifyExpired: () => undefined },
     )
     expect(response.ok).toBe(true)
-    expect(issued[0]?.[0]).toBe('https://api.example.com/v1/project/apikey/SECRET-TOKEN/origins')
+    expect((issued[0]?.[0] as { url?: string } | undefined)?.url).toBe('https://api.example.com/v1/project/apikey/SECRET-TOKEN/origins')
   })
 })
 
@@ -746,5 +747,217 @@ describe('readPageCredentials', () => {
     ).toEqual([null, null, null, null])
     expect(scope['__PWNED__']).toBe(0)
     delete scope['__PWNED__']
+  })
+})
+
+/**
+ * REQ-007 — a page-rendered read replays as an ordinary fetch; the only new step is turning the
+ * document it answers with into something an assistant can act on, in the tab that fetched it.
+ */
+describe('a reply the target answered with a document (REQ-007)', () => {
+  const HTML = '<html><head><title>Results</title></head><body><main>Lamps</main></body></html>'
+  const SNAPSHOT = {
+    url: 'https://app.example/search/?q=lamp',
+    title: 'Results',
+    text: 'Lamps',
+    links: [{ label: 'Brass lamp', url: 'https://app.example/p/1' }],
+  }
+
+  /** Runs one relayed GET with no tab open on the origin, so the ephemeral path is exercised. */
+  const call = async (reply: {
+    contentType: string
+    body: string
+    status?: number
+    url?: string
+  }): Promise<{
+    response: Awaited<ReturnType<typeof executeRelay>>
+    extracted: unknown[][]
+    removed: number
+  }> => {
+    const extracted: unknown[][] = []
+    let removed = 0
+    ;(globalThis as Record<string, unknown>)['chrome'] = {
+      permissions: { contains: async () => true },
+      tabs: {
+        query: async () => [],
+        create: async () => ({ id: 11, url: 'https://app.example/' }),
+        remove: async () => void removed++,
+        onUpdated: {
+          addListener: (fn: (tabId: number, info: { status: string }) => void) => fn(11, { status: 'complete' }),
+          removeListener: () => undefined,
+        },
+      },
+      scripting: {
+        executeScript: async ({ func, args }: { func?: unknown; args?: unknown[] }) => {
+          if (func === snapshotDocument) {
+            extracted.push(args ?? [])
+            return [{ result: SNAPSHOT }]
+          }
+          return [
+            {
+              result: {
+                status: reply.status ?? 200,
+                headers: { 'content-type': reply.contentType },
+                body: reply.body,
+                url: reply.url ?? 'https://app.example/search/?q=lamp',
+                redirected: false,
+              },
+            },
+          ]
+        },
+      },
+    }
+    const response = await executeRelay(
+      {
+        id: 'r-doc',
+        origin: 'https://app.example',
+        url: 'https://app.example/search/?q=lamp',
+        method: 'GET',
+        headers: {},
+        credential_source: [],
+        timeout_ms: 1000,
+      } as never,
+      { notifyExpired: () => undefined },
+    )
+    return { response, extracted, removed }
+  }
+
+  afterEach(() => {
+    delete (globalThis as Record<string, unknown>)['chrome']
+  })
+
+  it('hands back the snapshot the executor tab extracted, and closes the tab it opened', async () => {
+    const { response, extracted, removed } = await call({
+      contentType: 'text/html; charset=utf-8',
+      body: HTML,
+    })
+    expect(response.ok).toBe(true)
+    expect(response.body).toEqual(SNAPSHOT)
+    // The markup went to the tab that fetched it and nowhere else.
+    expect(extracted).toEqual([[HTML, 'https://app.example/search/?q=lamp']])
+    expect(removed).toBe(1)
+  })
+
+  it('leaves a JSON reply alone', async () => {
+    const { response, extracted, removed } = await call({
+      contentType: 'application/json',
+      body: '{"orders":[{"id":1}]}',
+    })
+    expect(response.body).toEqual({ orders: [{ id: 1 }] })
+    expect(extracted).toEqual([])
+    expect(removed).toBe(1)
+  })
+
+  /** The origin check runs on `result.url` first: markup from somebody else never reaches a DOM. */
+  it('refuses an off-origin document before extracting anything from it', async () => {
+    const { response, extracted, removed } = await call({
+      contentType: 'text/html',
+      body: HTML,
+      url: 'https://evil.example/collect',
+    })
+    expect(response.ok).toBe(false)
+    expect(response.body).toBeUndefined()
+    expect(response.error).toMatch(CROSS_ORIGIN_REFUSED)
+    expect(extracted).toEqual([])
+    expect(removed).toBe(1)
+  })
+})
+
+/**
+ * REQ-016 — a server-rendered search answers `302 Location: /results/lamp/`, and refusing every
+ * redirect turned that into a failed tool call. Cookies do not cross an origin, so a request
+ * carrying nothing else may follow the hop; anything the page contributed still may not.
+ */
+describe('following a redirect when cookies are the only credential (REQ-016)', () => {
+  const SNAPSHOT = { url: 'https://app.example/results/lamp/', title: 'Lamps', text: 'Brass lamp', links: [] }
+
+  /** Returns the `redirect` mode `issueRequest` was injected with, plus the relay's own answer. */
+  const call = async (request: Partial<Record<string, unknown>>, landedAt = 'https://app.example/results/lamp/') => {
+    let redirect: unknown
+    ;(globalThis as Record<string, unknown>)['chrome'] = {
+      permissions: { contains: async () => true },
+      storage: { local: { get: async () => ({}) } },
+      tabs: {
+        query: async () => [{ id: 7, url: 'https://app.example/' }],
+        remove: async () => undefined,
+      },
+      scripting: {
+        executeScript: async ({ func, args }: { func?: unknown; args?: unknown[] }) => {
+          if (func === snapshotDocument) return [{ result: SNAPSHOT }]
+          if (func === readPageCredentials) return [{ result: ['page-token'] }]
+          redirect = (args?.[0] as { redirect?: unknown } | undefined)?.redirect
+          return [
+            {
+              result: {
+                status: 200,
+                headers: { 'content-type': 'text/vnd.turbo-stream.html' },
+                body: '<main>Brass lamp</main>',
+                url: landedAt,
+                redirected: true,
+              },
+            },
+          ]
+        },
+      },
+    }
+    const response = await executeRelay(
+      {
+        id: 'r-redirect',
+        origin: 'https://app.example',
+        url: 'https://app.example/find/?q=lamp',
+        method: 'GET',
+        headers: {},
+        credential_source: [],
+        timeout_ms: 1000,
+        ...request,
+      } as never,
+      { notifyExpired: () => undefined },
+    )
+    return { redirect, response }
+  }
+
+  afterEach(() => {
+    delete (globalThis as Record<string, unknown>)['chrome']
+  })
+
+  it('follows the hop and snapshots where the server landed', async () => {
+    const { redirect, response } = await call({})
+    expect(redirect).toBe('follow')
+    expect(response.ok).toBe(true)
+    expect(response.body).toEqual(SNAPSHOT)
+  })
+
+  it('still refuses the hop when a recipe header is credential-shaped', async () => {
+    const { redirect } = await call({ headers: { authorization: 'Bearer abc' } })
+    expect(redirect).toBe('error')
+  })
+
+  /** The header name is unremarkable; what makes it forwardable is that the page supplied it. */
+  it('still refuses the hop when page state contributed a header', async () => {
+    const { redirect } = await call({
+      credential_source: [{ kind: 'page_state', expression: 'localStorage.token', header: 'x-tenant-key', prefix: '' }],
+    })
+    expect(redirect).toBe('error')
+  })
+
+  /** Following a redirect does not widen where a reply may come from. */
+  it('refuses a landing that left the recipe origin, redirect mode or not', async () => {
+    const { redirect, response } = await call({}, 'https://evil.example/collect')
+    expect(redirect).toBe('follow')
+    expect(response.ok).toBe(false)
+    expect(response.error).toMatch(CROSS_ORIGIN_REFUSED)
+    expect(response.body).toBeUndefined()
+  })
+})
+
+/**
+ * CON-001/REQ-002 — `chrome.scripting.executeScript` serializes this function's source and
+ * evaluates it in the page. Anything it referenced from its own module would be undefined there,
+ * which is why the DOM test for it is a Playwright spec and this is all a unit test can assert.
+ */
+describe('the extractor injected into a tab', () => {
+  it('takes only its two arguments and reaches for nothing else', () => {
+    expect(snapshotDocument.length).toBe(2)
+    expect(snapshotDocument.toString()).not.toContain('import')
   })
 })

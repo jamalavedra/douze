@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { findSurvivingSecrets, redactBody, redactHeaders, redactUrl } from './redact.js'
-import { AnnotationSpan, MAX_NOTE_CHARS, isNoiseHost, shouldCapture } from './capture.js'
+import { AnnotationSpan, MAX_NOTE_CHARS, isHtmlContentType, isNoiseHost, shouldCapture } from './capture.js'
 import { parseRecipe, serializeRecipe } from './recipe-file.js'
 import { graphqlHasMutation, MAX_DESCRIPTION, MAX_NAME } from './recipe.js'
 import { RemoteRegistration } from './protocol.js'
@@ -86,6 +86,20 @@ describe('noise filtering (REQ-CAP-004)', () => {
     expect(shouldCapture({ url: 'https://x.sentry.io/api/1/envelope', origin: 'https://x.sentry.io', method: 'POST' }, null)).toBe(
       false,
     )
+  })
+
+  it('recognises the HTML family without widening what capture admits (REQ-017)', () => {
+    for (const type of ['text/html', 'text/html; charset=utf-8', 'TEXT/HTML', 'text/vnd.turbo-stream.html', 'text/vnd.reddit.partial+html']) {
+      expect(isHtmlContentType(type)).toBe(true)
+    }
+    for (const type of ['application/json', 'text/plain', 'text/x-component', 'application/xhtml+xml', undefined]) {
+      expect(isHtmlContentType(type)).toBe(false)
+    }
+    // A charset parameter must not be read as part of the media type.
+    expect(isHtmlContentType('text/plain; charset=html')).toBe(false)
+    // HAR import stays HTTP-only: none of the family is inferable on its own (CON-003).
+    const api = { url: 'https://app.test/search/', origin: 'https://app.test', method: 'GET' }
+    expect(shouldCapture({ ...api, response_content_type: 'text/vnd.turbo-stream.html' }, null)).toBe(false)
   })
 
   /**

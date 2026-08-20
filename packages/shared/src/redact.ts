@@ -74,7 +74,11 @@ export function placeholder(value: unknown): string {
   return `«redacted:${Array.isArray(value) ? 'array' : typeof value}»`
 }
 
-const isPlaceholder = (v: unknown): boolean => typeof v === 'string' && v.startsWith('«redacted:')
+/**
+ * Whether a value is one of the placeholders above rather than a captured value. Exported because
+ * inference has the same question to ask: a placeholder must never be replayed to the site.
+ */
+export const isPlaceholder = (v: unknown): boolean => typeof v === 'string' && v.startsWith('«redacted:')
 
 /**
  * Substring match after normalisation, not equality. Real payloads carry `old_password`,

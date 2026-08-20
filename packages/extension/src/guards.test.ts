@@ -184,6 +184,13 @@ describe('call-time enforcement regardless of what was pushed (T-015.9)', () => 
     expect(error.message).toContain('jira.test')
   })
 
+  // The symptom this was reported as: reddit's recorded search refused `{q: 'ledger'}` until the
+  // caller invented `screen_view_count` and `ext-referrer`.
+  it('lets a call through without the site decorations a default covers', () => {
+    const entry = tool('search', 'read', {}, { path: '/search/', input_schema: DECORATED_SEARCH })
+    expect(() => checkPolicy(entry, { q: 'ledger' }, 'remote', false)).not.toThrow()
+  })
+
   it('refuses an argument of the wrong type, and a required one that is missing', () => {
     expect(refusal(() => checkPolicy(READ, { limit: '20' }, 'local', true)).message).toContain('limit must be integer')
     expect(refusal(() => checkPolicy(DESTRUCTIVE, { confirm: true }, 'local', true)).message).toContain(
@@ -533,6 +540,25 @@ describe('buildRequest', () => {
     expect(buildRequest(entry, {}).url).toContain('%7Bproject%7D')
   })
 
+  /**
+   * The site's own URL decorations (`ext-referrer=DIRECT`, `title=Special:Search`) are optional
+   * parameters carrying the recorded value as a `default`; a caller that never saw the recording
+   * omits them and the request still goes out the way the site makes it.
+   */
+  it('sends the recorded default for a parameter the caller omitted', () => {
+    const entry = tool('search', 'read', {}, { path: '/search/', input_schema: DECORATED_SEARCH })
+    expect(buildRequest(entry, { q: 'ledger' }).url).toBe(
+      'https://jira.test/search/?q=ledger&ext-referrer=DIRECT&screen_view_count=1',
+    )
+  })
+
+  it('lets the caller override a default', () => {
+    const entry = tool('search', 'read', {}, { path: '/search/', input_schema: DECORATED_SEARCH })
+    const url = new URL(buildRequest(entry, { q: 'ledger', 'ext-referrer': 'ME' }).url)
+    expect(url.searchParams.get('ext-referrer')).toBe('ME')
+    expect(url.searchParams.get('screen_view_count')).toBe('1')
+  })
+
   it('sends the remaining arguments as a JSON body on a write, minus confirm and raw', () => {
     const request = buildRequest(tool('create', 'write', {}, { method: 'POST', path: '/issues' }), {
       title: 'x',
@@ -543,6 +569,17 @@ describe('buildRequest', () => {
     expect(request.headers['content-type']).toBe('application/json')
   })
 })
+
+/** Reddit's search as inference records it: one caller input, two of the site's own decorations. */
+const DECORATED_SEARCH = {
+  type: 'object',
+  properties: {
+    q: { type: 'string' },
+    'ext-referrer': { type: 'string', default: 'DIRECT' },
+    screen_view_count: { type: 'integer', default: 1 },
+  },
+  required: ['q'],
+}
 
 // --- the whole path --------------------------------------------------------
 
@@ -942,6 +979,19 @@ describe('the audit log’s cap (AC-EXE-003.3)', () => {
     trust: 'remote',
     outcome: 'ok',
     duration_ms: 1,
+  })
+
+  /**
+   * `runToolCall` audits a call after its result has gone back to the host, so a reader that does
+   * not wait for the write queue can miss the newest entry — which is exactly the call whoever is
+   * looking at the log just made.
+   */
+  it('hands back a call whose write has not landed yet', async () => {
+    const log = new AuditLog()
+    // Deliberately not awaited: this is what `deps.audit` does.
+    void log.record(entry(1))
+
+    expect((await AuditLog.recent(1)).map((call) => call.tool)).toEqual(['jira_list_1'])
   })
 
   it('keeps the last AUDIT_LIMIT entries and drops what fell off the front', async () => {

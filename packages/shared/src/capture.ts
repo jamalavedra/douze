@@ -164,6 +164,35 @@ export function isNoiseHost(url: string, config: NoiseConfig = defaultNoise()): 
   return config.hosts.some((noise) => host === noise || host.endsWith(`.${noise}`))
 }
 
+/**
+ * REQ-017 — "HTML" is a family, not the literal `text/html`. Turbo streams answer
+ * `text/vnd.turbo-stream.html` and Reddit's partials `text/vnd.reddit.partial+html`; both are
+ * documents by every measure that matters here. Matched on the media type alone, so a `charset`
+ * parameter cannot smuggle the word in behind a `;`.
+ *
+ * Deliberately absent from `ALLOWED_CONTENT`: a document only becomes an exchange once the
+ * extractor has replaced its markup with a snapshot, and HAR import has no tab to run that in
+ * (CON-003).
+ */
+export function isHtmlContentType(contentType: string | undefined): boolean {
+  return contentType !== undefined && /^text\/[^;]*html/i.test(contentType)
+}
+
+/** REQ-001 — what a page-rendered read is stored and answered as, in place of its markup. */
+export interface DocumentSnapshot {
+  url: string
+  title: string
+  text: string
+  links: { label: string; url: string }[]
+}
+
+/** Shape, not content type: this is what decides whether a body is a snapshot Douze made. */
+export function isDocumentSnapshot(value: unknown): value is DocumentSnapshot {
+  const s = value as Partial<DocumentSnapshot> | null | undefined
+  if (typeof s?.url !== 'string' || typeof s.title !== 'string' || typeof s.text !== 'string') return false
+  return Array.isArray(s.links) && s.links.every((l) => typeof l?.label === 'string' && typeof l?.url === 'string')
+}
+
 export function isInferableContentType(contentType: string | undefined): boolean {
   if (!contentType) return false
   const normalized = contentType.toLowerCase()

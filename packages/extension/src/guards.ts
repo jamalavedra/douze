@@ -636,21 +636,30 @@ export function gateResult(tool: string, result: unknown, exposed: readonly stri
  */
 export class AuditLog {
   static readonly KEY = 'attach:audit'
-  /** Read-modify-write, so two calls finishing together cannot lose an entry. */
-  private writes: Promise<unknown> = Promise.resolve()
+  /**
+   * Read-modify-write, so two calls finishing together cannot lose an entry.
+   *
+   * Static because the queue guards one storage key, and because `recent` has to wait on it: a
+   * call is audited AFTER its result has gone back to the host (`runToolCall` fires `deps.audit`
+   * and returns), so anything that lists the log immediately after a call — the data page, the
+   * popup, a test — could read it before the entry it is looking for had landed.
+   */
+  private static writes: Promise<unknown> = Promise.resolve()
 
   record(entry: AuditEntry): Promise<void> {
-    const next = this.writes.then(async () => {
+    const next = AuditLog.writes.then(async () => {
       const stored = await chrome.storage.local.get(AuditLog.KEY)
       const existing = (stored[AuditLog.KEY] as AuditEntry[] | undefined) ?? []
       await chrome.storage.local.set({ [AuditLog.KEY]: [...existing, entry].slice(-AUDIT_LIMIT) })
     })
-    this.writes = next.catch(() => undefined)
+    AuditLog.writes = next.catch(() => undefined)
     return next
   }
 
   /** Most recent first, which is the order anyone reading a log wants. */
   static async recent(limit = 20): Promise<AuditEntry[]> {
+    // Behind the queue: see `writes`. Without this the list can be missing the newest call.
+    await AuditLog.writes.catch(() => undefined)
     const stored = await chrome.storage.local.get(AuditLog.KEY)
     const entries = (stored[AuditLog.KEY] as AuditEntry[] | undefined) ?? []
     return entries.slice(-limit).reverse()
@@ -683,6 +692,15 @@ export function buildRequest(
   const remaining = { ...args }
   delete remaining['confirm']
   delete remaining['raw']
+
+  // A query parameter the site put on every recorded URL with one value is optional in the schema
+  // and carries that value as its `default` (`siteDefaults` in the inference engine). Filling it
+  // here, after `validateArgs` has run, is the point: the parameter stays optional — a caller that
+  // does not know the site's own decorations omits it and the recorded value still goes out — and
+  // a caller that does pass one wins, because only an absent argument is filled.
+  for (const [key, value] of Object.entries(recordedDefaults(entry.tool.request.input_schema))) {
+    if (remaining[key] === undefined) remaining[key] = value
+  }
 
   // Parameters the PAGE fills, not the caller: the extension substitutes them after reading the
   // value out of page state. Left in the URL untouched here — resolving them to nothing produced
@@ -720,6 +738,15 @@ export function buildRequest(
     ...(entry.page_origin === undefined ? {} : { execute_origin: entry.page_origin }),
     timeout_ms: timeoutMs,
   }
+}
+
+function recordedDefaults(schema: unknown): Record<string, unknown> {
+  const properties = isRecord(schema) && isRecord(schema['properties']) ? schema['properties'] : {}
+  const defaults: Record<string, unknown> = {}
+  for (const [key, property] of Object.entries(properties)) {
+    if (isRecord(property) && property['default'] !== undefined) defaults[key] = property['default']
+  }
+  return defaults
 }
 
 // --- the one entry point ---------------------------------------------------

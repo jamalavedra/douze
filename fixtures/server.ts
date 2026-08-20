@@ -38,6 +38,8 @@ const SESSION_COOKie = 'fixture_session'
 const SESSION_VALUE = 's3ssion-fixture-value'
 const CSRF_VALUE = 'csrf-fixture-value'
 const PAGE_TOKEN = 'page-state-bearer-token-value'
+/** Lives inside the search page's `<script>`. A snapshot that carries it kept markup, not text. */
+const SCRIPT_MARKER = 'FIXTURE_SCRIPT_MARKER'
 
 let nextId = 1042
 const orders: Order[] = [
@@ -130,6 +132,20 @@ const server = createServer(async (req, res) => {
   }
   if (path === '/api/poll' && method === 'GET') return json(res, 200, { data: { tick: Date.now() } })
 
+  // A route the site renders server-side and its own router fetches as HTML — the shape a
+  // "hybrid routing" page has, and the one a snapshot has to turn into something readable.
+  if (path === '/search/' && method === 'GET') return serveSearch(res, url.searchParams.get('q') ?? '')
+
+  // The classic server-rendered search: the form is submitted, the document is replaced, and the
+  // server redirects to the canonical result page. Replay only sees the results if it follows.
+  if (path === '/find/' && method === 'GET') {
+    const term = encodeURIComponent(url.searchParams.get('q') ?? '')
+    res.writeHead(302, { location: `/results/${term}/` })
+    return res.end()
+  }
+  const resultsMatch = /^\/results\/([^/]*)\/$/.exec(path)
+  if (resultsMatch && method === 'GET') return serveSearch(res, decodeURIComponent(resultsMatch[1]!))
+
   if (path === '/graphql' && method === 'POST') {
     const body = JSON.parse((await readBody(req)) || '{}')
     const op = body.operationName as string | undefined
@@ -168,17 +184,47 @@ function handleControl(path: string, req: IncomingMessage, res: ServerResponse) 
   return json(res, 404, { error: `unknown control "${key}"` })
 }
 
+const escapeHtml = (text: string): string =>
+  text.replace(/[&<>"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[char] ?? char)
+
+/**
+ * The page-rendered read, served for `/search/` (fetched by the router) and for `/results/<term>/`
+ * (landed on after the plain form's redirect): a full HTML document whose `<main>` holds the
+ * results — one shape, so a snapshot is judged the same however the page was reached. The links are
+ * relative, so a snapshot has to resolve them against the request URL, and the `<script>` carries
+ * a marker no snapshot may repeat — script text is markup, not the page's text.
+ */
+function serveSearch(res: ServerResponse, term: string) {
+  const safe = escapeHtml(term)
+  res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+  res.end(`<!doctype html><html><head><title>Search: ${safe}</title></head>
+<body>
+<main>
+<h1>Results for ${safe}</h1>
+<ul>
+<li><a href="/r/one/comments/1/first-result">First result about ${safe}</a></li>
+<li><a href="/r/two/comments/2/second-result">Second result about ${safe}</a></li>
+</ul>
+<script>window.__marker = ${JSON.stringify(SCRIPT_MARKER)};</script>
+</main>
+</body></html>`)
+}
+
 function servePage(res: ServerResponse) {
   const auth = control.pageStateAuth
   res.writeHead(200, { 'content-type': 'text/html' })
   res.end(`<!doctype html><html><head><title>Fixture Orders</title><link rel="stylesheet" href="/app.css"></head>
 <body>
+<form id="search" action="/search/?q="><input name="q" id="q"><button type="submit">Search</button></form>
+<form id="find" method="get" action="/find/"><input name="q" id="find-q"><button type="submit">Find</button></form>
+<main>
 <h1>Orders</h1>
 <button id="create">Create order</button>
 <button id="list">List orders</button>
 <button id="del">Delete order</button>
 <button id="gql">Create issue</button>
 <pre id="out"></pre>
+</main>
 <script>
 ${auth ? `window.__token = ${JSON.stringify(PAGE_TOKEN)}; localStorage.setItem('csrf', ${JSON.stringify(CSRF_VALUE)});` : ''}
 const opts = () => (${auth}
@@ -197,6 +243,17 @@ document.getElementById('del').onclick = async () => {
 document.getElementById('gql').onclick = async () => {
   const o = opts();
   show(await (await fetch('/graphql', { method: 'POST', ...o, body: JSON.stringify({ operationName: 'CreateIssue', query: 'mutation CreateIssue($title:String!){createIssue(title:$title){id title state}}', variables: { title: 'login bug' } }) })).json());
+};
+// A soft navigation: the form never submits, the router fetches the route as HTML, swaps <main>
+// out of the reply and pushes the new URL. No document is ever unloaded.
+document.getElementById('search').onsubmit = async (e) => {
+  e.preventDefault();
+  const q = document.getElementById('q').value;
+  const target = '/search/?q=' + encodeURIComponent(q);
+  const html = await (await fetch(target, { credentials: 'include' })).text();
+  const incoming = new DOMParser().parseFromString(html, 'text/html').querySelector('main');
+  document.querySelector('main').replaceWith(document.importNode(incoming, true));
+  history.pushState({}, '', target);
 };
 // Background polling, for AC-CAP-003.3 — no gesture precedes these.
 setInterval(() => fetch('/api/poll', opts()).catch(() => {}), 1000);

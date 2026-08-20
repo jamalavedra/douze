@@ -137,5 +137,12 @@ export function stability(schema: JsonSchema): number {
   const properties = (schema['properties'] as Record<string, unknown> | undefined) ?? {}
   const total = Object.keys(properties).length
   if (total === 0) return 1
-  return ((schema['required'] as string[] | undefined) ?? []).length / total
+  const required = new Set((schema['required'] as string[] | undefined) ?? [])
+  // A parameter carrying a `default` held one value across every observation, which is as fixed as
+  // a shape gets. It is optional only so a caller need not repeat the site's own URL decoration
+  // (`siteDefaults` in engine.ts), and counting it as unstable would penalise the tool for that.
+  const held = Object.entries(properties).filter(
+    ([key, property]) => required.has(key) || (isPlainObject(property) && 'default' in property),
+  )
+  return held.length / total
 }

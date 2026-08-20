@@ -1,12 +1,22 @@
 // First, and before any schema is built: see the file for why.
 import './zod-config.js'
-import { MAX_NOTE_CHARS, NOISE_HOSTS, type CaptureSession, type Exchange, type NoiseConfig } from '@douze/shared'
+import {
+  MAX_NOTE_CHARS,
+  NOISE_HOSTS,
+  isDocumentSnapshot,
+  isNoiseHost,
+  type CaptureSession,
+  type DocumentSnapshot,
+  type Exchange,
+  type NoiseConfig,
+} from '@douze/shared'
 import type {
   CaptureBatch,
   ConnectCommand,
   ConnectState,
   DataCommand,
   DataState,
+  FlushCommand,
   GestureEvent,
   PageEvent,
   PopupCommand,
@@ -28,11 +38,20 @@ import {
   type ExposeLists,
   type RelayPairing,
 } from './attach.js'
+import { isDocumentDraft, snapshotDocument } from './document.js'
 import { importHar } from './har.js'
-import { installOracle } from './oracle.js'
-import { RECONCILE_GRACE_MS, Reconciler, admits, decodeBody, finalize, type ExchangeDraft } from './pipeline.js'
+import { installOracle, type Navigation } from './oracle.js'
+import {
+  RECONCILE_GRACE_MS,
+  Reconciler,
+  admits,
+  attribute,
+  decodeBody,
+  finalize,
+  type ExchangeDraft,
+} from './pipeline.js'
 import { RecipeStore, type SurfaceTool } from './recipes.js'
-import { executeRelay } from './relay.js'
+import { executeRelay, tabLoaded } from './relay.js'
 import { ReviewSession } from './review-session.js'
 import { CaptureStore } from './store.js'
 
@@ -70,6 +89,18 @@ let noise: NoiseConfig = { hosts: NOISE_HOSTS }
 const pendingRequests = new Map<string, { event: RequestEvent; gesture?: GestureEvent }>()
 const lastGesture = new Map<number, GestureEvent>()
 const reconciler = new Reconciler()
+/**
+ * REQ-010 — extractions that have been sent to a tab and have not come back.
+ *
+ * A document only reaches `emit` when the tab answers, and `stopSession` nulls `recording` — so a
+ * read still being extracted when Done was pressed emitted into the guard at the top of `emit`
+ * and was lost with nothing said. Stop waits these out, bounded, before it queues the stop.
+ */
+const extracting = new Set<Promise<unknown>>()
+function track(work: Promise<unknown>): void {
+  extracting.add(work)
+  void work.catch(() => undefined).finally(() => extracting.delete(work))
+}
 
 // --- state ----------------------------------------------------------------
 
@@ -312,7 +343,12 @@ const withoutQuery = (url: string): string => {
 
 function emit(draft: ExchangeDraft): void {
   if (!recording) return
-  if (!admits(draft, noise)) {
+  // A snapshot is admitted on its shape: `admits` asks the shared filter, which knows only content
+  // types, and `text/html` is not one it takes (CON-003 keeps it that way for HAR import). The
+  // noise list still applies — it lives inside `shouldCapture`, so skipping that check would have
+  // started recording documents from the very hosts AC-CAP-004.1 exists to drop.
+  const document = isDocumentSnapshot(draft.response_body) && !isNoiseHost(draft.url, noise)
+  if (!document && !admits(draft, noise)) {
     // The one drop with no trace anywhere: the counter does not move, no badge changes, nothing
     // reaches the review page, and the user is left with "I made a request and Douze ignored it".
     // The store's own refusal has said why since T-001; this is the same courtesy one step
@@ -374,6 +410,110 @@ function route(draft: ExchangeDraft): void {
   }, RECONCILE_GRACE_MS + 50)
 }
 
+/**
+ * `work`, or `fallback()` if it has not settled within `ms`.
+ *
+ * An injection into a frozen or discarded tab never settles at all — the promise is simply
+ * abandoned (w3c/webextensions#527) — and both the read waiting on it and the Done waiting on the
+ * read have to end regardless. The timer is cleared either way: a worker that stays alive for an
+ * abandoned 10-second wait is the thing this is meant to avoid.
+ */
+function within<T>(work: Promise<T>, ms: number, fallback: () => T | Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const bound = new Promise<T>((resolve) => {
+    timer = setTimeout(() => resolve(fallback()), ms)
+  })
+  return Promise.race([work, bound]).finally(() => clearTimeout(timer))
+}
+
+/**
+ * Why an extraction failed, capped. Chromium's own diagnostics are specific and worth having —
+ * "No frame with ID 0", "Frame with ID 0 was removed." — and they are the browser's text, not the
+ * page's. The cap is for the ones that are not: an error thrown inside the injected function
+ * carries whatever it was given, and no log line is worth a document in the console.
+ */
+const reason = (error: unknown): string => String((error as Error)?.message ?? error).slice(0, 200)
+
+/**
+ * REQ-001 — a page-rendered read, turned into something an assistant can act on. The extraction
+ * runs in a tab because the worker has no DOMParser (CON-002); `null` reads the page the tab shows
+ * (REQ-013). What comes back is the snapshot; the markup never goes anywhere else.
+ */
+async function snapshotIn(tabId: number, html: string | null, url: string): Promise<DocumentSnapshot> {
+  const injection = chrome.scripting.executeScript({ target: { tabId }, args: [html, url], func: snapshotDocument })
+  const [injected] = await within(injection, 10_000, () => Promise.reject(new Error('the tab never answered the injection')))
+  const snapshot = injected?.result
+  if (!isDocumentSnapshot(snapshot)) throw new Error('the tab returned no snapshot')
+  return snapshot
+}
+
+/** A fetched document: the body is replaced by its snapshot, or the draft is dropped (RISK-003). */
+async function snapshotInTab(tabId: number, draft: ExchangeDraft): Promise<void> {
+  try {
+    const snapshot = await snapshotIn(tabId, draft.response_body as string, draft.url)
+    // The header is the response's own size; the snapshot's length is only what we kept of it.
+    // `ingest` already took the honest one where the server sent it, so it stands here.
+    const size = draft.response_size ?? JSON.stringify(snapshot).length
+    route({ ...draft, response_body: snapshot, response_size: size, body_missing: false })
+  } catch (error) {
+    // Method, origin and path, and the reason — never the markup and never the query string. The
+    // reason is the browser's account of why the injection did not run, which is the only thing
+    // that separates "the tab navigated away" from a bug in the extractor.
+    console.debug(`Douze could not read ${draft.method} ${withoutQuery(draft.url)} (${reason(error)})`)
+  }
+}
+
+/**
+ * REQ-012 — a classic server-rendered page, read the same way a fetched one is. The oracle has the
+ * method, the request URL, the status and the headers; the body only ever existed as the document
+ * the browser then built, which is why the snapshot is taken from the tab and not from a response.
+ *
+ * The gesture is the whole filter. Every session begins with a reload of the recorded tab, and a
+ * user types URLs and presses Back throughout one — none of those are reads worth a tool, and none
+ * of them have a gesture behind them. No reconciler either: nothing else observes a navigation.
+ */
+async function onNavigation(seen: Navigation): Promise<void> {
+  // The wrong-tab return says nothing on purpose: it fires for every navigation in every other
+  // tab the user has open, and a log that prints on every one of those is a log nobody reads.
+  if (!recording || seen.tabId !== recording.tabId) return
+  const gesture = lastGesture.get(seen.tabId)
+  if (!gesture || 'background' in attribute(seen.startedAt, gesture)) {
+    // This one is the recorded tab, so it is a page the user is looking at — usually the session's
+    // own reload or a typed URL, but it is also exactly how a real read goes missing. `emit` and
+    // `snapshotInTab` both say when they drop one; this is the same courtesy for the third path.
+    console.debug(`Douze could not read GET ${withoutQuery(seen.url)} (no gesture accounts for it)`)
+    return
+  }
+  try {
+    await tabLoaded(seen.tabId)
+    const snapshot = await snapshotIn(seen.tabId, null, seen.finalUrl)
+    const contentType = seen.responseHeaders['content-type']
+    // As in `ingest`: where the server declared a size, that is the response's real one, and the
+    // snapshot's length is only what we kept of the document the browser built from it.
+    const declared = Number(seen.responseHeaders['content-length'])
+    emit({
+      method: 'GET',
+      url: seen.url,
+      started_at: seen.startedAt,
+      duration_ms: seen.durationMs,
+      // A navigation's request headers are the browser's own — cookies, `accept`, `user-agent` —
+      // and `onSendHeaders` hands them over without any of them. Replay sends none either.
+      request_headers: {},
+      status: seen.status,
+      response_headers: seen.responseHeaders,
+      response_body: snapshot,
+      ...(contentType === undefined ? {} : { response_content_type: contentType }),
+      response_size: Number.isFinite(declared) && declared > 0 ? declared : JSON.stringify(snapshot).length,
+      body_missing: false,
+      source: 'web_request',
+      tab_id: seen.tabId,
+      gesture,
+    })
+  } catch (error) {
+    console.debug(`Douze could not read GET ${withoutQuery(seen.url)} (${reason(error)})`)
+  }
+}
+
 const headerValue = (headers: Record<string, string>, name: string): string | undefined => {
   const match = Object.keys(headers).find((key) => key.toLowerCase() === name)
   return match === undefined ? undefined : headers[match]
@@ -412,7 +552,7 @@ function ingest(batch: PageEvent[], tabId: number, pageOrigin?: string): void {
     // For a body we cut short, the header is the honest size; ours is only what we kept.
     const declaredSize = Number(event.headers['content-length'])
     const size = Number.isFinite(declaredSize) && declaredSize > 0 ? declaredSize : responseBody.size
-    route({
+    const draft: ExchangeDraft = {
       // The frame's own origin, established by the message handler before ingest is reached, so a
       // page cannot claim to be somebody else.
       ...(pageOrigin === undefined ? {} : { page_origin: pageOrigin }),
@@ -433,7 +573,11 @@ function ingest(batch: PageEvent[], tabId: number, pageOrigin?: string): void {
       source: 'main_world',
       tab_id: tabId,
       ...(gesture === undefined ? {} : { gesture }),
-    })
+    }
+    // A document answer takes the long way round: it has to reach a DOM before it is worth
+    // storing, and it must never reach the store as markup.
+    if (isDocumentDraft(draft)) track(snapshotInTab(tabId, draft))
+    else route(draft)
   }
 }
 
@@ -517,17 +661,21 @@ async function startSession(
   return status()
 }
 
-/**
- * AC-CAP-001.4 — stopping reports the count retained after filtering.
- *
- * ponytail: a draft still inside the reconciler's RECONCILE_GRACE_MS window is dropped, so the
- * last request or two of a session can be lost if the user presses Done the instant it fires.
- * Drain the reconciler here if that ever costs anyone a tool.
- */
+/** AC-CAP-001.4 — stopping reports the count retained after filtering. */
 async function stopSession(): Promise<PopupStatus> {
   const stopping = recording
   if (stopping) {
     const { captures } = await openStores()
+    // REQ-010 — two buffers stand between a request and the store: the bridge's 250 ms batch and
+    // the reconciler's grace window. Pressing Done the instant a request completes used to drop
+    // it from both. Ask the page for its buffer first (it may be gone — tab closed or navigated),
+    // then drain the reconciler, so both land ahead of the queued stop below.
+    await chrome.tabs.sendMessage(stopping.tabId, { type: 'douze:flush' } satisfies FlushCommand).catch(() => {})
+    for (const draft of reconciler.flush()) emit(draft)
+    // Then the third buffer: a document sent to the tab for extraction and not yet back. Those
+    // emit when the tab answers, and `recording` is still set until below, so they land. Bounded
+    // at two seconds because a tab that will never answer must not hold Done open.
+    await within(Promise.all(extracting), 2000, () => [])
     // Behind the write queue, so `retained` counts the exchanges still being written when the
     // user pressed Done rather than only those that had already landed.
     await sequence(() => captures.stopSession(stopping.session.id))
@@ -1056,6 +1204,11 @@ chrome.runtime.onMessage.addListener((message: Inbound, sender, sendResponse) =>
     if (tabId === undefined) return undefined
     void hydrated.then(() => {
       if (!recording || !recording.session.origins.includes(sender.origin ?? '')) return
+      // REQ-009 — one tab is being recorded, and the oracle has said so since `installOracle`.
+      // This path had only the origin to go on, so a second tab the user happened to have open
+      // on the same site poured its traffic into the recording — and picked up the gestures made
+      // in the tab that is actually being watched.
+      if (tabId !== recording.tabId) return
       ingest(message.batch.slice(0, 200), tabId, sender.origin)
     })
     return undefined
@@ -1114,6 +1267,9 @@ chrome.runtime.onMessage.addListener((message: Inbound, sender, sendResponse) =>
 installOracle({
   isRecording: (tabId) => recording !== null && tabId === recording.tabId,
   onObserved: (draft) => route(draft),
+  // Tracked for the same reason a fetched document is: this extraction also runs in a tab, and a
+  // Done pressed while it is out lands in `emit` after the session is gone.
+  onNavigation: (seen) => track(onNavigation(seen)),
 })
 
 // Dynamic registrations are wiped on every extension update and reload.

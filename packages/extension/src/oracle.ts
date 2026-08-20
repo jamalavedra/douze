@@ -37,10 +37,23 @@ function decodeRequestBody(details: chrome.webRequest.OnBeforeRequestDetails): u
   }
 }
 
+/** REQ-012/015 — `url` is what replay re-issues; `finalUrl` is where the server landed. */
+export interface Navigation {
+  tabId: number
+  url: string
+  finalUrl: string
+  status: number
+  responseHeaders: Record<string, string>
+  startedAt: number
+  durationMs: number
+}
+
 export interface OracleHandlers {
   /** Synchronous gate: globals die with the worker, so this reads cached session state. */
   isRecording: (tabId: number) => boolean
   onObserved: (draft: ExchangeDraft) => void
+  /** A page the recorded tab loaded. No draft yet: its body is the document, read from the tab. */
+  onNavigation: (navigation: Navigation) => void
 }
 
 /**
@@ -52,8 +65,7 @@ export interface OracleHandlers {
  *     server-rendered dashboard's every write was invisible to both capture paths at once.
  *
  * `other` joins them because Chrome files a few worker-initiated requests under it. The two
- * navigation types are filtered by method below rather than excluded here: every page load in a
- * recorded tab is a `main_frame` GET, and recording those would bury the session in HTML.
+ * navigation types are filtered by method below rather than excluded here.
  */
 export const WATCHED: `${chrome.webRequest.ResourceType}`[] = [
   'xmlhttprequest',
@@ -64,9 +76,17 @@ export const WATCHED: `${chrome.webRequest.ResourceType}`[] = [
 ]
 const NAVIGATION = new Set(['main_frame', 'sub_frame'])
 
-/** A navigation is worth recording only when it changes something — a form POST, not a page load. */
+/**
+ * A navigation is worth *observing as an exchange* only when it changes something — a form POST.
+ * A page load has no observable body here, so it takes the `onNavigation` path instead (REQ-012)
+ * and is read from the loaded document; a sub-frame load is out of scope either way.
+ */
 export const worthWatching = (type: string, method: string): boolean =>
   !NAVIGATION.has(type) || method.toUpperCase() !== 'GET'
+
+/** REQ-012 — the page the user is looking at, and the only navigation Douze reads. */
+const isPageLoad = (type: string, method: string): boolean =>
+  type === 'main_frame' && method.toUpperCase() === 'GET'
 
 export function installOracle(handlers: OracleHandlers): void {
   if (!chrome.webRequest) return
@@ -75,7 +95,11 @@ export function installOracle(handlers: OracleHandlers): void {
   chrome.webRequest.onBeforeRequest.addListener(
     (details) => {
       if (!handlers.isRecording(details.tabId)) return
-      if (!worthWatching(details.type, details.method)) return
+      if (!worthWatching(details.type, details.method) && !isPageLoad(details.type, details.method)) return
+      // A redirect fires this again for the next leg under the same request id. The first leg is
+      // the request — the URL replay re-issues and the method the user's form used — and a 302
+      // that turns a POST into a GET of the result page must not rewrite either (REQ-015).
+      if (inflight.has(details.requestId)) return
       // A navigation POST is nearly always a form the user typed into, and most often a login.
       // Redaction is key-name matching, which cannot recognise a human password by its value, so
       // the body is dropped rather than filtered — no field-name list to keep ahead of `passwd`
@@ -110,6 +134,20 @@ export function installOracle(handlers: OracleHandlers): void {
       if (!seen || !handlers.isRecording(details.tabId)) return
       const responseHeaders = headersToRecord(details.responseHeaders)
       const contentType = responseHeaders['content-type']
+      if (isPageLoad(details.type, seen.method)) {
+        handlers.onNavigation({
+          tabId: details.tabId,
+          // REQ-015 — what was asked for, and where it ended up: a search form commonly 302s to a
+          // canonical result page, and replay has to re-issue the request, not its destination.
+          url: seen.url,
+          finalUrl: details.url,
+          status: details.statusCode,
+          responseHeaders,
+          startedAt: seen.startedAt,
+          durationMs: Math.max(0, details.timeStamp - seen.startedAt),
+        })
+        return
+      }
       handlers.onObserved({
         method: seen.method,
         url: seen.url,

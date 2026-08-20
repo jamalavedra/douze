@@ -82,6 +82,16 @@ export interface CaptureBatch {
   batch: PageEvent[]
 }
 
+/**
+ * Service worker → content script, the only command that travels that way. The bridge holds
+ * events for up to 250 ms, so a session stopping asks for what is buffered rather than counting
+ * a request that completed just before Done as one that never happened. It answers when the
+ * buffer is empty.
+ */
+export interface FlushCommand {
+  type: 'douze:flush'
+}
+
 /** Popup → service worker. */
 export type PopupCommand =
   | { type: 'douze:start'; name: string; origins: string[]; tabId?: number }

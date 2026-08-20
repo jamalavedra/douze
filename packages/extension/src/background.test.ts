@@ -3,6 +3,7 @@ import { Recipe, codeKey, mintNonce, mintSalt, proof, secretHashKey, sha256Hex }
 import type { RelayPairing } from './attach.js'
 import { DISPATCHERS } from './guards.js'
 import type { ConnectState, DataState, PageEvent, ReviewState } from './messages.js'
+import { RECONCILE_GRACE_MS } from './pipeline.js'
 import { RecipeStore } from './recipes.js'
 import { ReviewSession } from './review-session.js'
 import { CaptureStore } from './store.js'
@@ -92,6 +93,10 @@ interface FakeChrome {
   local: Map<string, unknown>
   alarms: string[]
   notifications: { id: string; title: string; message: string }[]
+  /** T-001.5 — the oracle's own listeners, so a test can drive `chrome.webRequest` traffic. */
+  webRequest: { onBeforeRequest: FakeEvent; onCompleted: FakeEvent }
+  /** REQ-012 — a test says when a navigated tab finished loading, which is when it is readable. */
+  tabsUpdated: FakeEvent
   /** Swapped by a test that needs a specific response, or a slow one. */
   inject: (url: string) => Promise<Injected>
   /** T-015.10 — the host permission the connect page asks for. Cleared to refuse it. */
@@ -119,6 +124,8 @@ function installChrome(): FakeChrome {
     local,
     alarms: [],
     notifications: [],
+    webRequest: { onBeforeRequest: fakeEvent(), onCompleted: fakeEvent() },
+    tabsUpdated: fakeEvent(),
     inject: async (url: string) => ({
       status: 200,
       headers: { 'content-type': 'application/json' },
@@ -163,6 +170,7 @@ function installChrome(): FakeChrome {
     },
     tabs: {
       onRemoved: fakeEvent(),
+      onUpdated: state.tabsUpdated,
       query: async () => [{ id: 7, url: 'https://app.test/orders' }],
       reload: async (tabId: number) => {
         state.reloaded.push(tabId)
@@ -170,6 +178,9 @@ function installChrome(): FakeChrome {
       create: async ({ url }: { url: string }) => {
         state.created.push(url)
       },
+      // `douze:flush` is the only message that goes this way. No content script is running here,
+      // which is the same shape as a tab the user closed before pressing Done.
+      sendMessage: async () => undefined,
     },
     scripting: {
       registerContentScripts: async (scripts: Array<Record<string, unknown>>) => {
@@ -179,12 +190,17 @@ function installChrome(): FakeChrome {
       unregisterContentScripts: async () => undefined,
       // The one injection `executeRelay` makes for a cookie-authenticated tool: the ISOLATED-world
       // fetch. `args[0]` is the URL it was told to call.
-      executeScript: async ({ args }: { args?: unknown[] }) => [{ result: await state.inject(String(args?.[0] ?? '')) }],
+      executeScript: async ({ args }: { args?: unknown[] }) => {
+        const first = args?.[0]
+        // `issueRequest` takes one call object; the credential reader takes a list of expressions.
+        const url = first !== null && typeof first === 'object' && 'url' in first ? String((first as { url: unknown }).url) : String(first ?? '')
+        return [{ result: await state.inject(url) }]
+      },
     },
     webRequest: {
-      onBeforeRequest: fakeEvent(),
+      onBeforeRequest: state.webRequest.onBeforeRequest,
       onSendHeaders: fakeEvent(),
-      onCompleted: fakeEvent(),
+      onCompleted: state.webRequest.onCompleted,
       onErrorOccurred: fakeEvent(),
     },
   }
@@ -1865,6 +1881,422 @@ describe('a correction made before anything has been ticked (WO-016)', () => {
     }
     expect(saved.error).toBeUndefined()
     expect(saved.tools).toEqual(['create_order'])
+  })
+})
+
+/**
+ * REQ-009 — one tab is recorded, and the oracle has been scoped to it since `installOracle`. The
+ * message path had only the origin to go on, so a second tab the user happened to have open on
+ * the same site poured its traffic into the recording.
+ */
+describe('a second tab on the recorded origin', () => {
+  it('moves neither the count nor the store', async () => {
+    const id = await douze().startSession('Shop', ['https://app.test'], { tabId: 7 })
+    await capture(exchangeEvents('r1', 'GET', 'https://app.test/api/orders'))
+    await sendFrom(contentScript('https://app.test', 9), {
+      type: 'douze:capture',
+      batch: exchangeEvents('r2', 'GET', 'https://app.test/api/other'),
+    })
+    await settle()
+
+    const { exchanges } = await douze().recorded(id)
+    expect(exchanges.map((exchange) => (exchange as { url: string }).url)).toEqual([
+      'https://app.test/api/orders',
+    ])
+    expect(douze().badgeCount()).toBe(1)
+  })
+})
+
+/**
+ * REQ-010 — an oracle observation waits out `RECONCILE_GRACE_MS` for a body-bearing capture of the
+ * same request. Pressing Done inside that window dropped it: the timeout that would have emitted
+ * it fires after the session is already gone.
+ */
+describe('a request still inside the reconciler when Done is pressed', () => {
+  it('is drained into the store rather than lost', async () => {
+    const id = await douze().startSession('Shop', ['https://app.test'], { tabId: 7 })
+    const at = Date.now()
+    fake.webRequest.onBeforeRequest.emit({
+      requestId: 'w1',
+      tabId: 7,
+      type: 'xmlhttprequest',
+      method: 'GET',
+      url: 'https://app.test/api/late',
+      timeStamp: at,
+    })
+    fake.webRequest.onCompleted.emit({
+      requestId: 'w1',
+      tabId: 7,
+      timeStamp: at + 20,
+      statusCode: 200,
+      responseHeaders: [{ name: 'content-type', value: 'application/json' }],
+    })
+
+    // No wait at all: the grace window is still open, which is the case that used to lose it.
+    expect(await douze().stopSession()).toEqual({ retained: 1 })
+    const detail = await (await openCaptures()).session(id)
+    expect(detail?.exchanges.map((exchange) => [exchange.url, exchange.source, exchange.body_missing])).toEqual([
+      ['https://app.test/api/late', 'web_request', true],
+    ])
+  })
+})
+
+/**
+ * REQ-001 — the search that produced no tool at all. A soft navigation asks for its route with a
+ * `fetch` and the site answers `text/html`; `emit` dropped it on the content type, so the session
+ * kept a styling call and lost the read the user had actually performed.
+ */
+describe('a read the site answered with a document (REQ-001)', () => {
+  const HTML =
+    '<html><head><title>Results</title></head><body><main><h1>Lamps</h1>' +
+    '<a href="/p/1">Brass lamp</a></main><script>var tracking = 1</script></body></html>'
+
+  const SNAPSHOT = {
+    url: 'https://app.test/search/?q=lamp',
+    title: 'Results',
+    text: 'Lamps Brass lamp',
+    links: [{ label: 'Brass lamp', url: 'https://app.test/p/1' }],
+  }
+
+  /** What the MAIN-world interceptor batches for a route fetched as a document. */
+  const documentEvents = (id: string, url: string): PageEvent[] => [
+    { type: 'request', id, kind: 'fetch', url, method: 'GET', headers: {}, body: null, t: 1000 } as PageEvent,
+    {
+      type: 'response',
+      id,
+      status: 200,
+      url,
+      headers: { 'content-type': 'text/html; charset=utf-8' },
+      body: { text: HTML },
+      t: 1050,
+    },
+  ]
+
+  /** The tab the extractor is injected into: the worker has no DOMParser of its own (CON-002). */
+  const extractsInTheTab = (answer: () => Promise<unknown>): void => {
+    const scripting = (globals['chrome'] as { scripting: Record<string, unknown> }).scripting
+    scripting['executeScript'] = async (): Promise<unknown[]> => [{ result: await answer() }]
+  }
+
+  it('stores the snapshot the tab extracted, and never the markup', async () => {
+    const id = await douze().startSession('Shop', ['https://app.test'], { tabId: 7 })
+    extractsInTheTab(async () => SNAPSHOT)
+    await capture(documentEvents('d1', 'https://app.test/search/?q=lamp'))
+    await settle()
+
+    const detail = await (await openCaptures()).session(id)
+    expect(detail?.exchanges).toHaveLength(1)
+    expect(detail?.exchanges[0]?.response_body).toEqual(SNAPSHOT)
+    expect(detail?.exchanges[0]?.body_missing).toBe(false)
+    // REQ-005 — the HTML existed in the worker between ingest and extraction and nowhere else.
+    expect(JSON.stringify(detail?.exchanges)).not.toContain('<main>')
+    expect(JSON.stringify(detail?.exchanges)).not.toContain('tracking')
+    expect(douze().badgeCount()).toBe(1)
+  })
+
+  /**
+   * AC-CAP-004.1 — the noise list lives inside `shouldCapture`, which the snapshot branch of
+   * `emit` skips: a document from a tracker host would otherwise be the one request type Douze
+   * started keeping from the hosts it exists to ignore.
+   */
+  it('drops a document fetched from a noise host', async () => {
+    const id = await douze().startSession('Shop', ['https://app.test'], { tabId: 7 })
+    extractsInTheTab(async () => SNAPSHOT)
+    await capture(documentEvents('d1', 'https://hotjar.com/search/?q=lamp'))
+    await settle()
+
+    expect((await (await openCaptures()).session(id))?.exchanges).toEqual([])
+    expect(douze().badgeCount()).toBe(0)
+  })
+
+  /**
+   * RISK-003 — the tab navigated away, or refused the injection. A half-made exchange is worse
+   * than none, so the draft is dropped and the count stays where it was.
+   */
+  it('stores nothing when the tab could not run the extractor', async () => {
+    const id = await douze().startSession('Shop', ['https://app.test'], { tabId: 7 })
+    await capture(exchangeEvents('r1', 'GET', 'https://app.test/api/orders'))
+    await settle()
+    expect(douze().badgeCount()).toBe(1)
+
+    const debug = vi.spyOn(console, 'debug').mockImplementation(() => undefined)
+    extractsInTheTab(async () => {
+      throw new Error('Frame with ID 0 was removed')
+    })
+    await capture(documentEvents('d1', 'https://app.test/search/?q=lamp'))
+    await settle()
+
+    expect(douze().badgeCount()).toBe(1)
+    expect((await (await openCaptures()).session(id))?.exchanges).toHaveLength(1)
+    // The courtesy line says which read was lost, and carries no markup and no query string.
+    const said = debug.mock.calls.flat().join(' ')
+    expect(said).toContain('https://app.test/search/')
+    expect(said).not.toContain('<main>')
+    expect(said).not.toContain('q=lamp')
+    debug.mockRestore()
+  })
+
+  /**
+   * The oracle sees the same request and has no body for it. Admitting it would put an empty
+   * document exchange beside the real one and hand inference a second candidate for one read.
+   */
+  it('still drops the bodiless view the oracle has of the same document', async () => {
+    const id = await douze().startSession('Shop', ['https://app.test'], { tabId: 7 })
+    const webRequest = (globals['chrome'] as { webRequest: Record<string, FakeEvent> }).webRequest
+    webRequest['onBeforeRequest']?.emit({
+      requestId: 'o1',
+      tabId: 7,
+      type: 'xmlhttprequest',
+      method: 'GET',
+      url: 'https://app.test/search/?q=lamp',
+      timeStamp: 1000,
+    })
+    webRequest['onCompleted']?.emit({
+      requestId: 'o1',
+      tabId: 7,
+      statusCode: 200,
+      timeStamp: 1050,
+      responseHeaders: [{ name: 'content-type', value: 'text/html' }],
+    })
+    // Waited out rather than faked: the oracle's draft is deferred for the grace window, and what
+    // this test is about is what happens when that window ends.
+    await new Promise((resolve) => setTimeout(resolve, RECONCILE_GRACE_MS + 100))
+
+    expect((await (await openCaptures()).session(id))?.exchanges).toEqual([])
+    expect(douze().badgeCount()).toBe(0)
+  })
+
+  /**
+   * REQ-010 — the extraction runs in a tab and only reaches the store when the tab answers.
+   * Pressing Done in that window used to lose the read: the session was already gone by the time
+   * the snapshot came back, and the drop happened inside a guard that says nothing.
+   */
+  it('stores a read the tab was still extracting when Done was pressed', async () => {
+    const id = await douze().startSession('Shop', ['https://app.test'], { tabId: 7 })
+    let answer = (): void => undefined
+    const held = new Promise<void>((resolve) => {
+      answer = resolve
+    })
+    extractsInTheTab(async () => {
+      await held
+      return SNAPSHOT
+    })
+    await capture(documentEvents('d1', 'https://app.test/search/?q=lamp'))
+    await settle()
+
+    const stopping = douze().stopSession()
+    // Long enough for a stop that does not wait to have finished entirely; the tab answers after.
+    await settle()
+    answer()
+
+    expect(await stopping).toEqual({ retained: 1 })
+    const detail = await (await openCaptures()).session(id)
+    expect(detail?.exchanges[0]?.response_body).toEqual(SNAPSHOT)
+  })
+
+  /** The other half of REQ-010's bound: a frozen tab never answers, and Done has to return. */
+  it('does not hold Done open for a tab that never answers', async () => {
+    await douze().startSession('Shop', ['https://app.test'], { tabId: 7 })
+    extractsInTheTab(() => new Promise<never>(() => undefined))
+    await capture(documentEvents('d1', 'https://app.test/search/?q=lamp'))
+    await settle()
+
+    vi.useFakeTimers()
+    try {
+      let returned = false
+      const stopping = douze()
+        .stopSession()
+        .then((retained) => {
+          returned = true
+          return retained
+        })
+      await vi.advanceTimersByTimeAsync(1500)
+      expect(returned).toBe(false)
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(await stopping).toEqual({ retained: 0 })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  /**
+   * The reason Chromium gives is the browser's own text — "No frame with ID 0", "Frame with ID 0
+   * was removed." — and it is the only thing separating a tab that navigated away from a bug in
+   * the extractor. The document it was about still must not reach the log.
+   */
+  it('says why the tab refused the extractor, in the words the browser gave', async () => {
+    await douze().startSession('Shop', ['https://app.test'], { tabId: 7 })
+    const debug = vi.spyOn(console, 'debug').mockImplementation(() => undefined)
+    extractsInTheTab(async () => {
+      throw new Error('Tab containing frame with ID 0 was removed.')
+    })
+    await capture(documentEvents('d1', 'https://app.test/search/?q=lamp'))
+    await settle()
+
+    const said = debug.mock.calls.flat().join(' ')
+    expect(said).toContain('Tab containing frame with ID 0 was removed.')
+    expect(said).toContain('https://app.test/search/')
+    expect(said).not.toContain('<main>')
+    expect(said).not.toContain('q=lamp')
+    debug.mockRestore()
+  })
+
+  /**
+   * A document is stored as its snapshot, but the size the site answered with is the response's
+   * own. Replacing it with the snapshot's length reports a page as a fraction of what it was.
+   */
+  it('keeps the size the server declared rather than the snapshot length', async () => {
+    const id = await douze().startSession('Shop', ['https://app.test'], { tabId: 7 })
+    extractsInTheTab(async () => SNAPSHOT)
+    const url = 'https://app.test/search/?q=lamp'
+    await capture([
+      { type: 'request', id: 'd1', kind: 'fetch', url, method: 'GET', headers: {}, body: null, t: 1000 } as PageEvent,
+      {
+        type: 'response',
+        id: 'd1',
+        status: 200,
+        url,
+        // The site cut nothing short; this is simply the page's own size, which is the one the
+        // review page shows and the one the snapshot's length would have replaced.
+        headers: { 'content-type': 'text/html; charset=utf-8', 'content-length': '48213' },
+        body: { text: HTML },
+        t: 1050,
+      },
+    ])
+    await settle()
+
+    const detail = await (await openCaptures()).session(id)
+    expect(detail?.exchanges[0]?.response_size).toBe(48213)
+  })
+})
+
+/**
+ * REQ-012 — the other half of the sample. Wikipedia, Stack Overflow and Hacker News answer a
+ * search by replacing the document, and a recording of one kept nothing at all: there is no fetch
+ * for the interceptor to patch, and the oracle's view of a page load has no body in it.
+ */
+describe('a search the site answered by navigating (REQ-012)', () => {
+  const SNAPSHOT = {
+    url: 'https://app.test/results/lamp/',
+    title: 'Results',
+    text: 'Lamps Brass lamp',
+    links: [{ label: 'Brass lamp', url: 'https://app.test/p/1' }],
+  }
+
+  /** The submit that caused the navigation, sent on its own as the bridge now sends it (REQ-014). */
+  const submitted = (at: number): PageEvent[] => [
+    { type: 'gesture', accessible_name: 'Search', role: 'form', route: '/', title: 'Shop', t: at },
+  ]
+
+  /** The tab the extractor is injected into. `args[0]` is `null`: it reads its own document. */
+  const readsItsOwnDocument = (answer: () => Promise<unknown>): unknown[] => {
+    const seen: unknown[] = []
+    const scripting = (globals['chrome'] as { scripting: Record<string, unknown> }).scripting
+    scripting['executeScript'] = async ({ args }: { args?: unknown[] }): Promise<unknown[]> => {
+      seen.push(args)
+      return [{ result: await answer() }]
+    }
+    return seen
+  }
+
+  /** One page load through the oracle, landing somewhere else than it asked (REQ-015). */
+  const navigate = (at: number): void => {
+    fake.webRequest.onBeforeRequest.emit({
+      requestId: 'n1',
+      tabId: 7,
+      type: 'main_frame',
+      method: 'GET',
+      url: 'https://app.test/find/?q=lamp',
+      timeStamp: at,
+    })
+    fake.webRequest.onCompleted.emit({
+      requestId: 'n1',
+      tabId: 7,
+      type: 'main_frame',
+      method: 'GET',
+      url: 'https://app.test/results/lamp/',
+      timeStamp: at + 40,
+      statusCode: 200,
+      responseHeaders: [
+        { name: 'content-type', value: 'text/html; charset=utf-8' },
+        { name: 'content-length', value: '31500' },
+      ],
+    })
+    // The document is only readable once the tab says so; the listener is already waiting.
+    fake.tabsUpdated.emit(7, { status: 'complete' })
+  }
+
+  it('stores the loaded page as a snapshot under the URL that was requested', async () => {
+    const id = await douze().startSession('Shop', ['https://app.test'], { tabId: 7 })
+    const injections = readsItsOwnDocument(async () => SNAPSHOT)
+    const at = Date.now()
+    await capture(submitted(at))
+    navigate(at + 5)
+    await settle()
+
+    expect(injections).toEqual([[null, 'https://app.test/results/lamp/']])
+    const detail = await (await openCaptures()).session(id)
+    expect(detail?.exchanges).toHaveLength(1)
+    // REQ-015 — replay re-issues the request, so that is the exchange's URL; where the server
+    // landed lives inside the snapshot.
+    expect(detail?.exchanges[0]?.url).toBe('https://app.test/find/?q=lamp')
+    expect(detail?.exchanges[0]?.response_body).toEqual(SNAPSHOT)
+    expect(detail?.exchanges[0]?.background).toBe(false)
+    // The page the server sent, not the snapshot we kept of it.
+    expect(detail?.exchanges[0]?.response_size).toBe(31500)
+    expect(douze().badgeCount()).toBe(1)
+  })
+
+  it('ignores a page load no gesture accounts for', async () => {
+    const id = await douze().startSession('Shop', ['https://app.test'], { tabId: 7 })
+    readsItsOwnDocument(async () => SNAPSHOT)
+    const at = Date.now()
+    // Five seconds stale: this is the shape of the `startSession` reload, a typed URL and Back —
+    // page loads that happen during a recording and are nobody's read.
+    await capture(submitted(at - 5000))
+    navigate(at)
+    await settle()
+
+    expect((await (await openCaptures()).session(id))?.exchanges).toEqual([])
+    expect(douze().badgeCount()).toBe(0)
+  })
+
+  it('stores nothing when the tab could not run the extractor', async () => {
+    const id = await douze().startSession('Shop', ['https://app.test'], { tabId: 7 })
+    const debug = vi.spyOn(console, 'debug').mockImplementation(() => undefined)
+    readsItsOwnDocument(async () => {
+      throw new Error('Frame with ID 0 was removed')
+    })
+    const at = Date.now()
+    await capture(submitted(at))
+    navigate(at + 5)
+    await settle()
+
+    expect((await (await openCaptures()).session(id))?.exchanges).toEqual([])
+    expect(douze().badgeCount()).toBe(0)
+    const said = debug.mock.calls.flat().join(' ')
+    expect(said).toContain('https://app.test/find/')
+    expect(said).not.toContain('q=lamp')
+    debug.mockRestore()
+  })
+
+  /**
+   * The gesture filter is right to drop these, but it dropped them in silence — so a read the
+   * user did perform, whose gesture never arrived, looked exactly like nothing having happened.
+   */
+  it('says which page load no gesture accounted for', async () => {
+    const id = await douze().startSession('Shop', ['https://app.test'], { tabId: 7 })
+    const debug = vi.spyOn(console, 'debug').mockImplementation(() => undefined)
+    readsItsOwnDocument(async () => SNAPSHOT)
+    navigate(Date.now())
+    await settle()
+
+    expect((await (await openCaptures()).session(id))?.exchanges).toEqual([])
+    const said = debug.mock.calls.flat().join(' ')
+    expect(said).toContain('GET https://app.test/find/')
+    expect(said).toContain('no gesture accounts for it')
+    expect(said).not.toContain('q=lamp')
+    debug.mockRestore()
   })
 })
 

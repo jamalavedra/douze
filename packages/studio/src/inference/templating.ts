@@ -21,7 +21,13 @@ export interface EndpointGroup {
 }
 
 export function pathSegments(url: string): string[] {
-  return new URL(url).pathname.split('/').filter((s) => s.length > 0)
+  const pathname = new URL(url).pathname
+  const segments = pathname.split('/').filter((s) => s.length > 0)
+  // A trailing slash is part of the route: `/search/` and `/search` are two URLs to a server, and
+  // the one it does not serve answers 404 or redirects — which replay refuses to follow. Kept as
+  // an empty last segment, so it survives templating and can never read as an identifier.
+  if (segments.length > 0 && pathname.endsWith('/')) segments.push('')
+  return segments
 }
 
 export function queryParams(url: string): Record<string, string> {

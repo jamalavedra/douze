@@ -1,4 +1,12 @@
-import type { CredentialSource, RelayRequest, RelayResponse } from '@douze/shared'
+import {
+  CREDENTIAL_HEADERS,
+  isDocumentSnapshot,
+  isHtmlContentType,
+  type CredentialSource,
+  type RelayRequest,
+  type RelayResponse,
+} from '@douze/shared'
+import { snapshotDocument } from './document.js'
 
 /**
  * ADR-004 / REQ-EXE-001 — execute through the browser instead of extracting credentials.
@@ -165,22 +173,30 @@ export interface InjectedResult {
  * Injected into the ISOLATED world of a tab on the target origin. Self-contained: it may not
  * close over anything in this module.
  */
-export async function issueRequest(
-  url: string,
-  method: string,
-  headers: Record<string, string>,
-  body: string | null,
-  timeoutMs: number,
-  credentials: RequestCredentials = 'include',
-): Promise<InjectedResult> {
+export interface InjectedCall {
+  url: string
+  method: string
+  headers: Record<string, string>
+  body: string | null
+  timeoutMs: number
+  credentials?: RequestCredentials
+  redirect?: RequestRedirect
+}
+
+export async function issueRequest(call: InjectedCall): Promise<InjectedResult> {
+  const { url, method, headers, body, timeoutMs } = call
+  const credentials = call.credentials ?? 'include'
+  const redirect = call.redirect ?? 'error'
   try {
     const res = await fetch(url, {
       method,
       headers,
       credentials,
-      // Never follow a redirect: fetch can forward custom credentials such as `x-api-key` before
-      // the caller gets a chance to inspect the destination.
-      redirect: 'error',
+      // `'error'` unless the caller established that cookies are the only credential in play
+      // (REQ-016): fetch forwards a custom header such as `x-api-key` across a hop, to whoever the
+      // redirect names, before anyone here gets to inspect the destination. Cookies do not travel
+      // that way, and `executeRelay` still refuses a landing off the recipe's origin.
+      redirect,
       // A hung target must not hold the relay open to the MV3 five-minute per-call ceiling.
       signal: AbortSignal.timeout(timeoutMs),
       ...(body === null ? {} : { body }),
@@ -323,22 +339,25 @@ async function findTab(origin: string, excludeTabId?: number): Promise<chrome.ta
   })
 }
 
-async function openExecutorTab(origin: string): Promise<chrome.tabs.Tab> {
-  const tab = await chrome.tabs.create({ url: origin, active: false })
-  await new Promise<void>((resolve) => {
-    const done = (tabId: number, info: chrome.tabs.OnUpdatedInfo): void => {
-      if (tabId === tab.id && info.status === 'complete') {
-        chrome.tabs.onUpdated.removeListener(done)
-        resolve()
-      }
+/** Resolves when the tab reports `complete` — or after 15 s, so a tab that never finishes loading hangs nothing. */
+export function tabLoaded(tabId: number): Promise<void> {
+  return new Promise((resolve) => {
+    const done = (id: number, info: chrome.tabs.OnUpdatedInfo): void => {
+      if (id === tabId && info.status === 'complete') finish()
     }
-    chrome.tabs.onUpdated.addListener(done)
-    // Never hang the relay on a tab that refuses to finish loading.
-    setTimeout(() => {
+    const timer = setTimeout(finish, 15_000)
+    function finish(): void {
+      clearTimeout(timer)
       chrome.tabs.onUpdated.removeListener(done)
       resolve()
-    }, 15_000)
+    }
+    chrome.tabs.onUpdated.addListener(done)
   })
+}
+
+async function openExecutorTab(origin: string): Promise<chrome.tabs.Tab> {
+  const tab = await chrome.tabs.create({ url: origin, active: false })
+  if (tab.id !== undefined) await tabLoaded(tab.id)
   return tab
 }
 
@@ -485,10 +504,21 @@ export async function executeRelay(request: RelayRequest, deps: RelayDeps): Prom
           ? request.body
           : JSON.stringify(request.body)
 
+    /**
+     * REQ-016 — a request whose only credential is the cookie jar may follow a redirect. The
+     * browser does not send cookies to another origin, and `landedOrigin` below still refuses a
+     * landing that left the recipe's. A server-rendered search commonly answers `302` with the
+     * canonical result page, which `'error'` turns into a failed tool call rather than a result.
+     * Anything read from page state — a header under any name, a token in the URL — keeps `'error'`.
+     */
+    const cookieOnly =
+      pageState.length === 0 && !Object.keys(headers).some((name) => CREDENTIAL_HEADERS.includes(name.toLowerCase()))
+    const redirect: RequestRedirect = cookieOnly ? 'follow' : 'error'
+
     const [injected] = await chrome.scripting.executeScript({
       target: { tabId },
       world: 'ISOLATED',
-      args: [url, request.method, headers, body, request.timeout_ms, credentialsMode],
+      args: [{ url, method: request.method, headers, body, timeoutMs: request.timeout_ms, credentials: credentialsMode, redirect }],
       func: issueRequest,
     })
     const result = injected?.result as InjectedResult | undefined
@@ -497,8 +527,10 @@ export async function executeRelay(request: RelayRequest, deps: RelayDeps): Prom
 
     const loginRedirect = isLoginRedirect(url, result.url)
 
-    // `issueRequest` refuses every redirect before credentials can cross a hop. Keep this check as
-    // defense in depth: an old or replaced executor result still cannot leave the recipe origin.
+    // Where a redirect was allowed at all (REQ-016), this is what bounds it: a cookie-only request
+    // may follow one, but not off the origin its recipe was recorded on. For every other request
+    // `issueRequest` already refused the hop, and this stays as defense in depth — an old or
+    // replaced executor result cannot leave the recipe origin either.
     const landedOrigin = originOf(result.url)
     if (landedOrigin !== request.origin) {
       // Still worth telling the user their session expired if that is what this was — pointed at
@@ -518,7 +550,26 @@ export async function executeRelay(request: RelayRequest, deps: RelayDeps): Prom
       deps.notifyExpired(request.origin, loginUrlFor(request.origin, result.url))
     }
 
-    const responseBody = parseBody(result.body, result.headers['content-type'])
+    /**
+     * REQ-007 — a document reply is snapshotted in the executor tab by the same extractor capture
+     * uses, so a page-rendered read answers with the page's text and links rather than with its
+     * markup. It runs after the origin check above: markup from anywhere but the recipe's own
+     * origin has already been refused, and never reaches a DOM.
+     */
+    const contentType = result.headers['content-type']
+    let responseBody = parseBody(result.body, contentType)
+    if (result.status < 400 && isHtmlContentType(contentType)) {
+      const [extracted] = await chrome.scripting.executeScript({
+        target: { tabId },
+        args: [result.body, result.url],
+        func: snapshotDocument,
+      })
+      const snapshot = extracted?.result
+      // Never fall back to the raw HTML: half a megabyte of markup is not an answer, and the
+      // caller is better served by being told the page could not be read.
+      if (!isDocumentSnapshot(snapshot)) return fail(`Douze could not read the page ${result.url} returned.`)
+      responseBody = snapshot
+    }
     return {
       id: request.id,
       ok: result.status >= 200 && result.status < 400 && !loginRedirect,

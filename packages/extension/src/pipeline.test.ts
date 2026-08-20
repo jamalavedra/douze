@@ -52,6 +52,22 @@ describe('decodeBody', () => {
     expect(decodeBody({ text: 'x'.repeat(10), truncated: true }).missing).toBe('too_large')
   })
 
+  it('keeps the markup of a truncated document, still reporting it as cut short', () => {
+    const html = '<html><body><h1>Orders</h1>'
+    expect(decodeBody({ text: html, truncated: true }, 'text/html; charset=utf-8')).toEqual({
+      value: html,
+      missing: 'too_large',
+      size: html.length,
+    })
+  })
+
+  it('drops the text of a truncated JSON body, which would parse into a shape the site never sent', () => {
+    expect(decodeBody({ text: '{"orders":[{"id"', truncated: true }, 'application/json')).toEqual({
+      missing: 'too_large',
+      size: 16,
+    })
+  })
+
   it('treats an absent body as absent, not missing', () => {
     expect(decodeBody(null)).toEqual({})
   })
@@ -278,5 +294,27 @@ describe('Reconciler (T-002.6)', () => {
     expect(r.due(RECONCILE_GRACE_MS + 1)).toHaveLength(1)
     expect(r.due(RECONCILE_GRACE_MS + 2)).toHaveLength(0)
     expect(r.pending).toBe(0)
+  })
+
+  /**
+   * REQ-010 — the session is ending, so there is no later `due()` and the grace window no longer
+   * buys anything. The matching rule is the one `due()` uses: a draft the interceptor already
+   * captured stays suppressed.
+   */
+  it('hands back every unaccounted deferred draft on flush, and empties', () => {
+    const r = new Reconciler()
+    const late = draft({ url: 'https://app.example/api/late', source: 'web_request' })
+    r.accept(late, 0)
+    expect(r.accept(draft({ url: 'https://app.example/api/seen', started_at: 1_000 }), 0)).toHaveLength(1)
+    r.accept(draft({ url: 'https://app.example/api/seen', source: 'web_request', started_at: 1_000 }), 0)
+
+    expect(r.flush().map((d) => d.url)).toEqual(['https://app.example/api/late'])
+    expect(r.pending).toBe(0)
+    expect(r.flush()).toEqual([])
+
+    // The credits went with them: the next session starts owing nothing to this one, so a draft
+    // that would have been suppressed by a stale credit is emitted.
+    r.accept(draft({ url: 'https://app.example/api/seen', source: 'web_request', started_at: 1_000 }), 0)
+    expect(r.flush().map((d) => d.url)).toEqual(['https://app.example/api/seen'])
   })
 })
