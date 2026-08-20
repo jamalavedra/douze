@@ -5,6 +5,7 @@ import {
   type UiProvenance,
   defaultNoise,
   defaultRedaction,
+  isHtmlContentType,
   redactBody,
   redactHeaders,
   redactRoute,
@@ -37,7 +38,19 @@ const JSONISH = /json|graphql/i
 export function decodeBody(body: CapturedBody | null | undefined, contentType?: string): DecodedBody {
   if (!body) return {}
   if (body.binary !== undefined) return { missing: 'not_utf8', size: body.binary }
-  if (body.truncated) return { missing: 'too_large', ...(body.text === undefined ? {} : { size: body.text.length }) }
+  if (body.truncated) {
+    const kept = body.text === undefined ? {} : { size: body.text.length }
+    /**
+     * Partial HTML still parses into a snapshot, so a document cut short keeps the text it has;
+     * partial JSON does not, and half an object would hand inference a schema for a shape the
+     * site never returns. `missing` stays set either way, so `body_missing` and
+     * `body_missing_reason` describe the body honestly whether or not the text came through.
+     */
+    if (body.text !== undefined && isHtmlContentType(contentType)) {
+      return { value: body.text, missing: 'too_large', ...kept }
+    }
+    return { missing: 'too_large', ...kept }
+  }
   if (body.text === undefined) return {}
   if (contentType && JSONISH.test(contentType)) {
     try {
@@ -241,16 +254,7 @@ export class Reconciler {
 
     const out: ExchangeDraft[] = []
     for (const entry of ready) {
-      const credits = this.credits.get(entry.key)
-      // Same underlying request => same start instant, allowing for observation jitter between
-      // the two paths. A genuinely separate call to the same URL starts at a different time.
-      const index = credits?.findIndex((at) => Math.abs(at - entry.draft.started_at) <= SAME_REQUEST_MS) ?? -1
-      if (credits && index >= 0) {
-        credits.splice(index, 1)
-        if (credits.length === 0) this.credits.delete(entry.key)
-        continue
-      }
-      out.push(entry.draft)
+      if (!this.claim(entry.key, entry.draft.started_at)) out.push(entry.draft)
     }
 
     for (const [key, times] of this.credits) {
@@ -259,6 +263,34 @@ export class Reconciler {
       else this.credits.set(key, fresh)
     }
     return out
+  }
+
+  /**
+   * REQ-010 — everything still deferred, whether or not its grace window has elapsed, because the
+   * session is ending and no later `due()` will run. Same matching rule: a draft a MAIN-world
+   * capture already accounted for stays suppressed. The reconciler is left empty, so the next
+   * session starts with no credit from this one.
+   */
+  flush(): ExchangeDraft[] {
+    const out: ExchangeDraft[] = []
+    for (const entry of this.deferred) {
+      if (!this.claim(entry.key, entry.draft.started_at)) out.push(entry.draft)
+    }
+    this.deferred = []
+    this.credits.clear()
+    return out
+  }
+
+  /** Consumes the credit the MAIN-world capture of this same request banked, if there is one. */
+  private claim(key: string, startedAt: number): boolean {
+    const credits = this.credits.get(key)
+    // Same underlying request => same start instant, allowing for observation jitter between
+    // the two paths. A genuinely separate call to the same URL starts at a different time.
+    const index = credits?.findIndex((at) => Math.abs(at - startedAt) <= SAME_REQUEST_MS) ?? -1
+    if (!credits || index < 0) return false
+    credits.splice(index, 1)
+    if (credits.length === 0) this.credits.delete(key)
+    return true
   }
 
   get pending(): number {

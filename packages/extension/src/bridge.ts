@@ -5,7 +5,7 @@
  *
  * Imports here must stay type-only — this file is injected as a classic content script.
  */
-import type { CaptureBatch, GestureEvent, PageEvent } from './messages.js'
+import type { CaptureBatch, FlushCommand, GestureEvent, PageEvent } from './messages.js'
 
 ;(() => {
   const BUFFER: PageEvent[] = []
@@ -45,6 +45,19 @@ import type { CaptureBatch, GestureEvent, PageEvent } from './messages.js'
     }
     if (BUFFER.length) schedule()
   }
+
+  // The session is stopping: there is no later batch to ride, so empty the buffer now and only
+  // then answer. A batch timer still pending finds nothing left and does nothing.
+  chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) => {
+    if ((message as FlushCommand | null)?.type !== 'douze:flush') return undefined
+    void (async () => {
+      do {
+        await flush()
+      } while (BUFFER.length)
+      sendResponse()
+    })()
+    return true
+  })
 
   // --- provenance (REQ-CAP-003) ---------------------------------------------
 
@@ -111,8 +124,12 @@ import type { CaptureBatch, GestureEvent, PageEvent } from './messages.js'
       title: document.title,
       t: Date.now(),
     }
-    BUFFER.push(gesture)
-    schedule()
+    // REQ-014 — its own message, now. A form submit unloads this page well before the 250 ms
+    // batch fires, and the navigation that follows has to find its gesture already in the worker
+    // or it is attributed to nothing and ignored. Gestures are rare next to requests, so the
+    // batching this skips was never saving much here.
+    // Dropped rather than retried, exactly as `flush` drops: a retry is a worker wake loop.
+    void chrome.runtime.sendMessage({ type: 'douze:capture', batch: [gesture] } satisfies CaptureBatch).catch(() => undefined)
   }
 
   document.addEventListener(

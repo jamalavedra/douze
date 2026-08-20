@@ -15,7 +15,7 @@
     "lint": "oxlint packages e2e fixtures",
     "test": "pnpm -r test",
     "e2e": "playwright test",
-    "verify:e2e": "playwright test e2e/journey.spec.ts e2e/relay.spec.ts e2e/guards.spec.ts e2e/bridge.spec.ts e2e/artifacts.spec.ts e2e/review-consent.spec.ts"
+    "verify:e2e": "playwright test e2e/journey.spec.ts e2e/relay.spec.ts e2e/guards.spec.ts e2e/bridge.spec.ts e2e/artifacts.spec.ts e2e/review-consent.spec.ts e2e/document.spec.ts e2e/recording-completeness.spec.ts e2e/navigation.spec.ts"
   },
   "devDependencies": {
     "@playwright/test": "1.62.0",
