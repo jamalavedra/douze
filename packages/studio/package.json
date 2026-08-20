@@ -15,7 +15,7 @@
     "@douze/shared": "workspace:*"
   },
   "devDependencies": {
-    "@types/node": "26.1.2",
+    "@types/node": "26.2.0",
     "esbuild": "0.28.1"
   }
 }
