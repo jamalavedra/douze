@@ -158,9 +158,13 @@ export async function launchHelium(extensionPath = EXTENSION, options: { profile
   mkdirSync(userDataDir, { recursive: true })
   const context = await chromium.launchPersistentContext(userDataDir, {
     executablePath: HELIUM,
-    // MV3 service workers do not run under old headless.
+    // Playwright's own `headless: true` asks for OLD headless, which runs no MV3 service worker
+    // and so has no extension at all. New headless does — verified on Helium 0.15.5 (Chromium
+    // 151) — so it is asked for by flag instead. `DOUZE_HEADED=1` puts the window back when a
+    // failure is easier to watch than to read.
     headless: false,
     args: [
+      ...(process.env['DOUZE_HEADED'] === '1' ? [] : ['--headless=new']),
       `--disable-extensions-except=${extensionPath}`,
       `--load-extension=${extensionPath}`,
       '--no-first-run',
