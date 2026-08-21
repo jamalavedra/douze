@@ -15,7 +15,7 @@
     "zod": "4.4.3"
   },
   "devDependencies": {
-    "@types/chrome": "0.2.2",
+    "@types/chrome": "0.2.6",
     "vite": "8.1.5"
   }
 }
